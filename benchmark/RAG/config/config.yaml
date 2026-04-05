@@ -32,6 +32,16 @@ execution:
   ingest_mode: "per_file"
   # Instruction for retrieval, empty by default
   retrieval_instruction: ""  
+  # Whether to use VikingBot for agentic RAG (false means standard RAG)
+  use_vikingbot: false
+
+# ===========VikingBot Configuration============
+# Configuration for VikingBot agentic RAG mode
+vikingbot:
+  # Maximum number of iterations for VikingBot agent loop
+  max_iterations: 10
+  # Whether to log tool calls made by VikingBot
+  log_tool_calls: true
 
 # ===========Path Configuration============
 # All paths support {dataset_name} placeholder, which will be automatically replaced with the current dataset name

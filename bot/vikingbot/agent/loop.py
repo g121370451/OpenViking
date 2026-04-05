@@ -176,6 +176,7 @@ class AgentLoop:
             send_callback=self.bus.publish_outbound,
             subagent_manager=self.subagents,
             cron_service=self.cron_service,
+            include_web_tools=not self._eval,
         )
 
     async def run(self) -> None:
@@ -536,6 +537,7 @@ class AgentLoop:
                 tools_used_names = [tool["tool_name"] for tool in tools_used]
             else:
                 tools_used_names = []
+                tools_used = []
             return OutboundMessage(
                 session_key=msg.session_key,
                 content=final_content,
@@ -543,7 +545,8 @@ class AgentLoop:
                 token_usage=token_usage,
                 time_cost=time_cost,
                 iteration=iteration,
-                tools_used_names=tools_used_names
+                tools_used_names=tools_used_names,
+                tools_used=tools_used
             )
         finally:
             long_running_notified = True

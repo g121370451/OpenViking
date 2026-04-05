@@ -36,6 +36,7 @@ def register_default_tools(
     include_cron_tool: bool = True,
     include_image_tool: bool = True,
     include_viking_tools: bool = True,
+    include_web_tools: bool = True,
 ) -> None:
     """
     Register default tools to a tool registry.
@@ -79,10 +80,11 @@ def register_default_tools(
     )
 
     # Web tools
-    registry.register(
-        WebSearchTool(backend="auto", brave_api_key=brave_api_key, exa_api_key=exa_api_key, tavily_api_key=tavily_api_key)
-    )
-    registry.register(WebFetchTool())
+    if include_web_tools:
+        registry.register(
+            WebSearchTool(backend="auto", brave_api_key=brave_api_key, exa_api_key=exa_api_key, tavily_api_key=tavily_api_key)
+        )
+        registry.register(WebFetchTool())
 
     # Open Viking tools
     if include_viking_tools:

@@ -38,7 +38,7 @@ def llm_grader(
     # -------------------------
     # 1) Route by dataset
     # -------------------------
-    if "locomo" in dataset_name_lower:
+    if "locomo_0or4" in dataset_name_lower:
         prompt_type = "Locomo_0or4"
 
         system_prompt = """
@@ -95,6 +95,8 @@ Important Notes:
 - Do NOT penalize for additional relevant information that doesn't contradict the gold answers. Examples of acceptable extra information: titles ("King Padella" vs "Padella"), locations ("Paflagonia" vs "the capital of Paflagonia"), or additional context that supports the answer.
 - Only penalize for actual incorrect information, missing key facts, or contradictions.
 - Ignore minor differences in capitalization (e.g., "CRIM TARTARY" vs "Crim Tartary") or punctuation (e.g., with or without a period at the end).
+- For time related questions, the gold answer will be a specific date, month, year, etc. The generated answer might be much longer or use relative time references (like "last Tuesday" or "next month"), but you should be generous with your grading - as long as it refers to the same date or time period as the gold answer, it should be counted as correct. Even if the format differs (e.g., "May 7th" vs "7 May"), consider it correct if it's the same date.
+
 
 Question: {question}
 Gold Answers: {gold_answer_str}
@@ -121,7 +123,7 @@ Respond ONLY with a JSON object: {{"score": 0 to 4, "reasoning": "string"}}
         reasoning = result.get("reasoning", "No reasoning provided.")
 
         # Clamp score by dataset
-        if "locomo" in dataset_name_lower:
+        if "locomo_0or4" in dataset_name_lower:
             # LoCoMo only allows 0 or 4
             score = 4 if score == 4 else 0
         else:
@@ -152,7 +154,7 @@ Respond ONLY with a JSON object: {{"score": 0 to 4, "reasoning": "string"}}
                 score = 0
 
         # Dataset-specific clamp
-        if "locomo" in dataset_name_lower:
+        if "locomo_0or4" in dataset_name_lower:
             score = 4 if score == 4 else 0
         else:
             score = max(0, min(4, score))

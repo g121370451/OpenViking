@@ -18,13 +18,38 @@ sys.path.append(str(Path(__file__).parent))
 
 from base import BaseAdapter, StandardDoc, StandardSample, StandardQA
 
-QA_PROMPT = """Based on the financial document excerpts above, answer the following question accurately and concisely.
-If the answer involves a numerical value, include the unit (e.g., USD millions, %, etc.).
+CATEGORY_INSTRUCTIONS = {
+    "domain-relevant": """Answer the financial question based on the document.
+- Use ONLY facts from the context
+- Follow ALL constraints in the question exactly (time period, entity, segment, units, exclusions like excluding M&A/FX)
+- If the question includes an explicit fallback instruction (e.g., "If ... then ..."), follow it VERBATIM when applicable
+- If the question is Yes/No: answer "Yes" or "No" in FINAL, and include one supporting metric/phrase in EVIDENCE
+- Do NOT guess. If the context is insufficient, follow any explicit fallback in the question; otherwise respond with 'Insufficient information'
+- Output format:
+  FINAL: <answer>
+  EVIDENCE: <one short supporting phrase/number from context>""",
+    
+    "metrics-generated": """Calculate the financial metric based on the document.
+- Use ONLY numbers from the context
+- Follow ALL constraints in the question exactly (time period, entity, segment, units, exclusions like excluding M&A/FX)
+- Include units (e.g., USD millions, %), keep the same unit/scale as the context
+- Do NOT guess. If the context is insufficient, follow any explicit fallback in the question; otherwise respond with 'Insufficient information'
+- Rounding: only if the question explicitly requests rounding; otherwise keep context precision
+- Output format:
+  FINAL: <value> <unit>
+  EVIDENCE: <one-line calculation OR the exact source numbers from context>""",
+    
+    "novel-generated": """Answer the financial question based on the document.
+- Use ONLY facts from the context
+- Follow ALL constraints in the question exactly (time period, entity, segment, units, exclusions like excluding M&A/FX)
+- If numerical, include units (e.g., USD millions, %), keep the same unit/scale as the context
+- Do NOT guess. If the context is insufficient, follow any explicit fallback in the question; otherwise respond with 'Insufficient information'
+- Output format:
+  FINAL: <one sentence max>
+  EVIDENCE: <one short supporting phrase/number from context>"""
+}
 
-Question: {}
-Answer:"""
-
-MISSING_RULE = "If the provided context does not contain sufficient information to answer the question, respond with 'Insufficient information'."
+MISSING_RULE = "If the context does not contain sufficient information, follow any explicit fallback instruction in the question; otherwise respond with 'Insufficient information'."
 
 
 class FinanceBenchAdapter(BaseAdapter):
@@ -121,7 +146,29 @@ class FinanceBenchAdapter(BaseAdapter):
 
     def build_prompt(self, qa: StandardQA, context_blocks: List[str]) -> tuple[str, Dict[str, Any]]:
         context_text = "\n\n".join(context_blocks)
-        full_prompt = f"{context_text}\n\n{MISSING_RULE}\n\n{QA_PROMPT.format(qa.question)}"
+        
+        category = qa.category
+        category_instruction = CATEGORY_INSTRUCTIONS.get(category, "")
+        
+        if category_instruction:
+            full_prompt = f"""{context_text}
+
+{category_instruction}
+
+{MISSING_RULE}
+
+Question: {qa.question}
+
+Answer:"""
+        else:
+            full_prompt = f"""{context_text}
+
+{MISSING_RULE}
+
+Question: {qa.question}
+
+Answer:"""
+        
         meta = {
             "question_type": qa.category,
             "financebench_id": qa.metadata.get("financebench_id"),

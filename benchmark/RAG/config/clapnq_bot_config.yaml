@@ -1,28 +1,34 @@
 project_name: "RAG_Benchmark"
 
 # ===========Modify Configuration================
-dataset_name: "Locomo" 
+dataset_name: "ClapNQ" 
 
 adapter:
-  module: "src.adapters.locomo_adapter"  
-  class_name: "LocomoAdapter"     
+  module: "src.adapters.clapnq_adapter"  
+  class_name: "ClapNQAdapter"     
 
 execution:
-  max_workers: 10
-  ingest_workers: 5
-  retrieval_topk: 5
+  max_workers: 8
+  ingest_workers: 8
+  retrieval_topk: 1
   max_queries: null
   skip_ingestion: true
   ingest_mode: "directory"
   retrieval_instruction: ""  
+  use_vikingbot: true
 # ==================================  
 
+# ===========VikingBot Configuration============
+vikingbot:
+  max_iterations: 10
+  log_tool_calls: true
+
 paths:
-  dataset_path: "datasets/{dataset_name}/locomo10.json"
+  dataset_path: "datasets/{dataset_name}/clapnq_dev_answerable.jsonl"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
   vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_test_top_{retrieval_topk}_1_8_per_query"
-  log_file: "Output/{dataset_name}/experiment_test_top_{retrieval_topk}_1_8_per_query/benchmark.log"
+  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}"
+  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}/benchmark.log"
 
 
 llm:

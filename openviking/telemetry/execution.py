@@ -56,7 +56,7 @@ def attach_telemetry_payload(
     result: Any,
     telemetry_payload: Optional[dict[str, Any]],
 ) -> Any:
-    """Attach a telemetry payload to a dict result."""
+    """Attach a telemetry payload to a result."""
     if telemetry_payload is None:
         return result
 
@@ -69,6 +69,8 @@ def attach_telemetry_payload(
         result["telemetry"] = telemetry_payload
         return result
 
+    # For dataclass or other objects, set as an attribute
+    setattr(result, "telemetry", telemetry_payload)
     return result
 
 
