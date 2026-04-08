@@ -404,7 +404,7 @@ Question: {question}"""
             env = _build_vikingbot_env(ov_conf_path, self.max_iterations)
 
             # Use CLI mode only for thread safety in multi-threaded environments
-            cmd = ["vikingbot", "chat", "-m", input_msg, "-e", "-c", ov_conf_path]
+            cmd = ["vikingbot", "chat", "-m", input_msg, "-s", session_id, "-e", "-c", ov_conf_path]
             logger.debug(f"Running command: {' '.join(cmd)}")
             logger.debug(f"Using config file: {ov_conf_path}")
             result = subprocess.run(
