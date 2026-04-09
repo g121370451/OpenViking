@@ -338,23 +338,127 @@ class BenchmarkPipeline:
             enhanced_query = qa.question
         
         dataset_name = self.config.get('dataset_name', '')
-        
-        topk = int(self.config['execution']['retrieval_topk'])
-        candidate_k = topk * 3
-        retrieve_res = self.db.retrieve(query=enhanced_query, topk=candidate_k)
+        topk = self.config['execution']['retrieval_topk']
+        target_uris = None
+        def resolve_child(parent_uri: str, raw_child: str) -> str:
+            import hashlib
+            def sanitize_for_path(text: str, max_length: int = 50) -> str:
+                safe = re.sub(
+                    r"[^\w\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u3400-\u4dbf\U00020000-\U0002a6df\s-]",
+                    "",
+                    text,
+                )
+                safe = re.sub(r"\s+", "_", safe)
+                safe = safe.strip("_")
+                if not safe:
+                    return "section"
+                if len(safe) > max_length:
+                    hash_suffix = hashlib.sha256(text.encode()).hexdigest()[:8]
+                    return f"{safe[: max_length - 9]}_{hash_suffix}"
+                return safe
 
-        if isinstance(retrieve_res, tuple) and len(retrieve_res) == 2:
-            search_res, retrieval_embedding_tokens = retrieve_res
+            raw = str(raw_child)
+            try:
+                from openviking_cli.utils.uri import VikingURI
+                child = VikingURI.sanitize_segment(raw)
+            except Exception:
+                child = raw
+            child_alt = sanitize_for_path(raw)
+            prefix = "viking://resources/"
+            rel = parent_uri[len(prefix):] if parent_uri.startswith(prefix) else ""
+            base_dir = Path(self.db.store_path) / "viking" / "default" / "resources"
+            parent_dir = base_dir / rel if rel else base_dir
+            if (parent_dir / child).exists():
+                return f"{parent_uri}/{child}"
+            if child_alt != child and (parent_dir / child_alt).exists():
+                return f"{parent_uri}/{child_alt}"
+            if not parent_dir.exists():
+                return f"{parent_uri}/{child}"
+            candidates = []
+            for p in parent_dir.iterdir():
+                if not p.is_dir():
+                    continue
+                name = p.name
+                if name == child:
+                    return f"{parent_uri}/{name}"
+                if name == child_alt:
+                    return f"{parent_uri}/{name}"
+                for base in (child, child_alt):
+                    if not base:
+                        continue
+                    if name.startswith(base + "_"):
+                        suffix = name[len(base) + 1:]
+                        if suffix.isdigit():
+                            candidates.append((0, int(suffix), name))
+                        elif re.fullmatch(r"[0-9a-f]{8}", suffix, flags=re.IGNORECASE):
+                            candidates.append((1, 0, name))
+            if candidates:
+                candidates.sort(key=lambda x: (x[0], x[1]))
+                return f"{parent_uri}/{candidates[0][2]}"
+            return f"{parent_uri}/{child}"
+
+        if dataset_name == 'FinanceBench':
+            target_uris = [resolve_child("viking://resources/pdfs", task['sample_id'])]
+        elif dataset_name == 'SyllabusQA':
+            target_uris = [resolve_child("viking://resources/SyllabusQA_processed_docs", f"{task['sample_id']}_doc")]
+        elif dataset_name == 'Locomo':
+            target_uris = [resolve_child("viking://resources/Locomo_processed_docs", f"{task['sample_id']}_doc")]
+        elif dataset_name == 'Qasper':
+            target_uris = [resolve_child("viking://resources/Qasper_processed_docs", f"{task['sample_id']}_doc")]
+        elif dataset_name == 'ClapNQ':
+            passages = (qa.metadata or {}).get('passages') or []
+            title = passages[0].get('title') if passages and isinstance(passages[0], dict) else None
+            if title:
+                target_uris = [resolve_child("viking://resources/ClapNQ_processed_docs", title)]
+        elif dataset_name == 'HotpotQA':
+            titles = (qa.metadata or {}).get('supporting_fact_titles') or []
+            if titles:
+                target_uris = [resolve_child("viking://resources/HotpotQA_processed_docs", f"{t}_doc") for t in titles if t]
+
+        retrieval_embedding_tokens = 0
+        candidate_k = max(15, topk)
+        if target_uris and len(target_uris) > 1:
+            merged = {}
+            for uri in target_uris:
+                rr = self.db.retrieve(query=enhanced_query, topk=candidate_k, target_uri=uri)
+                if isinstance(rr, tuple) and len(rr) == 2:
+                    sr, tok = rr
+                else:
+                    sr, tok = rr, 0
+                retrieval_embedding_tokens += tok
+                for r in getattr(sr, 'resources', []) or []:
+                    key = getattr(r, 'uri', None) or id(r)
+                    if key in merged:
+                        if getattr(r, 'score', 0) > getattr(merged[key], 'score', 0):
+                            merged[key] = r
+                    else:
+                        merged[key] = r
+            resources = list(merged.values())
+            resources.sort(key=lambda r: getattr(r, 'score', 0), reverse=True)
+            search_res = type('SearchRes', (), {})()
+            candidates = resources[:candidate_k]
+            l2_only = [
+                r for r in candidates
+                if getattr(r, 'level', 2) == 2
+                and not str(getattr(r, 'uri', '')).endswith(('/.abstract.md', '/.overview.md', '.abstract.md', '.overview.md'))
+            ]
+            search_res.resources = l2_only[:topk]
         else:
-            search_res = retrieve_res
-            retrieval_embedding_tokens = 0
-
-        candidates = (getattr(search_res, 'resources', []) or [])[:candidate_k]
-        l2_only = [
-            r for r in candidates
-            if getattr(r, 'level', 2) == 2
-            and not str(getattr(r, 'uri', '')).endswith(('/.abstract.md', '/.overview.md', '.abstract.md', '.overview.md'))
-        ][:topk]
+            target_uri = target_uris[0] if target_uris else "viking://resources"
+            rr = self.db.retrieve(query=enhanced_query, topk=candidate_k, target_uri=target_uri)
+            if isinstance(rr, tuple) and len(rr) == 2:
+                search_res, retrieval_embedding_tokens = rr
+            else:
+                search_res = rr
+            res_list = (getattr(search_res, 'resources', []) or [])[:candidate_k]
+            l2_only = [
+                r for r in res_list
+                if getattr(r, 'level', 2) == 2
+                and not str(getattr(r, 'uri', '')).endswith(('/.abstract.md', '/.overview.md', '.abstract.md', '.overview.md'))
+            ][:topk]
+            new_res = type('SearchRes', (), {})()
+            new_res.resources = l2_only
+            search_res = new_res
         
         latency = time.time() - t0
         
@@ -362,7 +466,7 @@ class BenchmarkPipeline:
         retrieved_uris = []
         context_blocks = []
         
-        for r in l2_only:
+        for r in search_res.resources:
             retrieved_uris.append(r.uri)
             content = self.db.read_resource(r.uri) if getattr(r, 'level', 2) == 2 else f"{getattr(r, 'abstract', '')}\n{getattr(r, 'overview', '')}"
             retrieved_texts.append(content)
