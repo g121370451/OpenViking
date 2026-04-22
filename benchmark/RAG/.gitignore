@@ -38,6 +38,7 @@ wheels/
 env/
 ENV/
 
+
 # IDE
 .vscode/
 .idea/
@@ -51,3 +52,7 @@ ENV/
 # Temporary files
 *.tmp
 *.temp
+.debug/
+ovcli.conf
+*.backup
+*.backup_*

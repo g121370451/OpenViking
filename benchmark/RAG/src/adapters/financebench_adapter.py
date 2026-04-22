@@ -18,26 +18,11 @@ sys.path.append(str(Path(__file__).parent))
 
 from base import BaseAdapter, StandardDoc, StandardSample, StandardQA
 
-CATEGORY_INSTRUCTIONS = {
-    "domain-relevant": """Answer the financial question based on the document.
-- Use ONLY facts from the context
-- If numerical, include units (e.g., USD millions, %)
-- Provide concise, direct answer
-- Do NOT invent information""",
-    
-    "metrics-generated": """Calculate the financial metric based on the document.
-- Use ONLY numbers from the context
-- Show your calculations clearly
-- Round to appropriate decimal places
-- Include units (e.g., USD millions, %)
-- Do NOT invent numbers""",
-    
-    "novel-generated": """Answer the financial question based on the document.
-- Use ONLY facts from the context
-- If numerical, include units (e.g., USD millions, %)
-- Provide clear, complete answer
-- Do NOT invent information"""
-}
+QA_PROMPT = """Based on the financial document excerpts above, answer the following question accurately and concisely.
+If the answer involves a numerical value, include the unit (e.g., USD millions, %, etc.).
+
+Question: {}
+Answer:"""
 
 MISSING_RULE = "If the provided context does not contain sufficient information to answer the question, respond with 'Insufficient information'."
 
@@ -136,29 +121,7 @@ class FinanceBenchAdapter(BaseAdapter):
 
     def build_prompt(self, qa: StandardQA, context_blocks: List[str]) -> tuple[str, Dict[str, Any]]:
         context_text = "\n\n".join(context_blocks)
-        
-        category = qa.category
-        category_instruction = CATEGORY_INSTRUCTIONS.get(category, "")
-        
-        if category_instruction:
-            full_prompt = f"""{context_text}
-
-{category_instruction}
-
-{MISSING_RULE}
-
-Question: {qa.question}
-
-Answer:"""
-        else:
-            full_prompt = f"""{context_text}
-
-{MISSING_RULE}
-
-Question: {qa.question}
-
-Answer:"""
-        
+        full_prompt = f"{context_text}\n\n{MISSING_RULE}\n\n{QA_PROMPT.format(qa.question)}"
         meta = {
             "question_type": qa.category,
             "financebench_id": qa.metadata.get("financebench_id"),

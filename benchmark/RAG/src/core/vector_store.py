@@ -93,8 +93,11 @@ class VikingStoreWrapper:
         }
 
     def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources"):
-        """Execute retrieval"""
-        return self.client.find(query=query, limit=topk, target_uri=target_uri)
+        """Execute retrieval, only return L2 (leaf) results"""
+        search_res = self.client.find(query=query, limit=topk * 3, target_uri=target_uri)
+        if hasattr(search_res, 'resources'):
+            search_res.resources = [r for r in search_res.resources if r.level == 2][:topk]
+        return search_res
 
     def read_resource(self, uri: str) -> str:
         """Read resource content"""

@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import uuid
 import random
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +17,7 @@ from core.vector_store import VikingStoreWrapper
 from core.monitor import BenchmarkMonitor
 from core.metrics import MetricsCalculator
 from core.judge_util import llm_grader
+from vikingbot_runner import run_vikingbot_query
 
 
 class BenchmarkPipeline:
@@ -91,9 +93,12 @@ class BenchmarkPipeline:
         max_workers = self.config['execution']['max_workers']
         task_errors = []
         
+        use_vikingbot = self.config.get("execution", {}).get("use_vikingbot", False)
+        process_fn = self._process_vikingbot_task if use_vikingbot else self._process_generation_task
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_task = {
-                executor.submit(self._process_generation_task, task): task 
+                executor.submit(process_fn, task): task 
                 for task in tasks
             }
             
@@ -214,6 +219,71 @@ class BenchmarkPipeline:
             if max_queries is not None and global_idx >= max_queries:
                 break
         return tasks
+
+    def _process_vikingbot_task(self, task):
+        self.monitor.worker_start()
+        try:
+            qa = task['qa']
+            self.logger.info(f"[Query-{task['id']}] Using VikingBot for agentic RAG")
+
+            session_id = f"query_{uuid.uuid4().hex}"
+
+            restrict_to_qa_doc = bool(self.config.get("execution", {}).get("restrict_to_qa_doc", False))
+            allowed_target_uris = self._resolve_target_uris(task, qa) if restrict_to_qa_doc else None
+
+            vikingbot_result = run_vikingbot_query(
+                question=qa.question,
+                config=self.config,
+                session_id=session_id,
+                allowed_target_uris=allowed_target_uris,
+            )
+
+            ans = vikingbot_result.get("answer", "")
+            total_time_sec = vikingbot_result.get("total_time_sec", 0)
+            token_usage = vikingbot_result.get("token_usage", {})
+            tools_used_names = vikingbot_result.get("tools_used_names", [])
+            iterations_used = vikingbot_result.get("iterations_used", 0)
+
+            in_tokens = token_usage.get("input_tokens", 0)
+            out_tokens = token_usage.get("output_tokens", 0)
+            self.monitor.worker_end(tokens=in_tokens + out_tokens)
+
+            self.logger.info(f"[Query-{task['id']}] VikingBot | Iterations: {iterations_used} | Time: {total_time_sec:.1f}s")
+
+            return {
+                "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
+                "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
+                "retrieval": {"latency_sec": total_time_sec, "uris": []},
+                "llm": {"final_answer": ans},
+                "vikingbot": {
+                    "iterations_used": iterations_used,
+                    "tools_used_names": tools_used_names,
+                    "total_time_sec": total_time_sec,
+                    "debug_log": vikingbot_result.get("debug_log", ""),
+                    "session_id": vikingbot_result.get("session_id", ""),
+                },
+                "metrics": {"Recall": 0.0},
+                "token_usage": {
+                    "total_input_tokens": in_tokens,
+                    "llm_output_tokens": out_tokens,
+                    "retrieval_embedding_tokens": 0,
+                },
+            }
+        except Exception:
+            self.monitor.worker_end(success=False)
+            raise
+
+    def _resolve_target_uris(self, task, qa):
+        evidence = getattr(qa, 'evidence', []) or []
+        if not evidence:
+            return None
+        uris = []
+        for ev in evidence:
+            if isinstance(ev, str) and ev.startswith("viking://"):
+                parts = ev.rstrip("/").split("/")
+                if len(parts) >= 5:
+                    uris.append("/".join(parts[:5]))
+        return list(set(uris)) if uris else None
 
     def _process_generation_task(self, task):
         self.monitor.worker_start()
