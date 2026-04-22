@@ -38,7 +38,7 @@ def llm_grader(
     # -------------------------
     # 1) Route by dataset
     # -------------------------
-    if "locomo" in dataset_name_lower:
+    if "0or4" in dataset_name_lower:
         prompt_type = "Locomo_0or4"
 
         system_prompt = """
