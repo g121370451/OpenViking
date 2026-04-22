@@ -120,13 +120,7 @@ Respond ONLY with a JSON object: {{"score": 0 to 4, "reasoning": "string"}}
         score = int(result.get("score", 0))
         reasoning = result.get("reasoning", "No reasoning provided.")
 
-        # Clamp score by dataset
-        if "locomo" in dataset_name_lower:
-            # LoCoMo only allows 0 or 4
-            score = 4 if score == 4 else 0
-        else:
-            # Other datasets allow 0~4
-            score = max(0, min(4, score))
+        score = max(0, min(4, score))
 
     except Exception:
         # -------------------------
