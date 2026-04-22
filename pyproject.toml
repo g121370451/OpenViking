@@ -71,6 +71,10 @@ dependencies = [
     "loguru>=0.7.3",
     "cryptography>=42.0.0",
     "argon2-cffi>=23.0.0",
+    "langchain-core>=1.2.17",
+    "langchain-openai>=1.1.10",
+    "prompt-toolkit>=3.0.52",
+    "pydantic-settings>=2.13.1",
 ]
 
 [tool.uv.sources]

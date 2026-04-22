@@ -14,6 +14,7 @@ from vikingbot.agent.tools.ov_file import (
     VikingMultiReadTool,
     VikingMemoryCommitTool,
     VikingAddResourceTool,
+    VikingLinkTool,
 )
 from vikingbot.agent.tools.registry import ToolRegistry
 from vikingbot.agent.tools.shell import ExecTool
@@ -96,6 +97,8 @@ def register_default_tools(
         registry.register(VikingMemoryCommitTool())
         if not config.read_only:
             registry.register(VikingAddResourceTool())
+        # Link tool no longer registered for bot — linking happens post-answer in _process_message.
+        # Relations enhancement is handled inside VikingSearchTool via env vars.
 
 
 

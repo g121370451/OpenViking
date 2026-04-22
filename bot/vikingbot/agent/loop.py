@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -218,7 +219,7 @@ class AgentLoop:
         session_key: SessionKey,
         publish_events: bool = True,
         sender_id: str | None = None,
-    ) -> tuple[str | None, list[dict], dict[str, int], int]:
+    ) -> tuple[str | None, list[dict], dict[str, int], int, str]:
         """
         Run the core agent loop: call LLM, execute tools, repeat until done.
 
@@ -228,7 +229,7 @@ class AgentLoop:
             publish_events: Whether to publish ITERATION/REASONING/TOOL_CALL events to the bus
 
         Returns:
-            tuple of (final_content, tools_used)
+            tuple of (final_content, tools_used, token_usage, iteration, original_query)
         """
         iteration = 0
         final_content = None
@@ -239,6 +240,28 @@ class AgentLoop:
             "total_tokens": 0,
         }
 
+        # Extract original question from messages
+        import re as _re_q
+        original_query = ""
+        for msg in reversed(messages):
+            content = msg.get("content", "") if isinstance(msg, dict) else ""
+            if not isinstance(content, str):
+                continue
+            for pattern in [r"Here'?s the question:\s*(.+)", r"Question:\s*(.+)"]:
+                m = _re_q.search(pattern, content, _re_q.DOTALL)
+                if m:
+                    original_query = m.group(1).strip()
+                    break
+            if original_query:
+                break
+        if not original_query:
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and len(content) > 5:
+                        original_query = content
+                        break
+        logger.error(f"[RelationsDebug] origin_query is {original_query}");
         while iteration < self.max_iterations:
             iteration += 1
 
@@ -338,9 +361,18 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
 
+                    import re as _re
+                    relations_found = 0
+                    if tool_call.name == "openviking_search":
+                        rf_match = _re.search(r'<!-- relations_found:(\d+) -->', result or "")
+                        if rf_match:
+                            relations_found = int(rf_match.group(1))
+                        # logger.error(f"[RelationsDebug] tool=openviking_search, relations_found={relations_found}, result_tail='{(result or '')[-100:]}'")
+
                     tool_used_dict = {
                         "tool_name": tool_call.name,
                         "args": args_str,
+                        "reasoning": (response.content or response.reasoning_content or "")[:1000],
                         "result": result,
                         "duration": tool_execute_duration,
                         "execute_success": True
@@ -348,6 +380,8 @@ class AgentLoop:
                         else False,
                         "input_token": tool_call.tokens,
                         "output_token": cal_str_tokens(result, text_type="mixed"),
+                        "iteration": iteration,
+                        "relations_found": relations_found,
                     }
                     tools_used.append(tool_used_dict)
 
@@ -364,7 +398,7 @@ class AgentLoop:
             else:
                 final_content = "I've completed processing but have no response to give."
 
-        return final_content, tools_used, token_usage, iteration
+        return final_content, tools_used, token_usage, iteration, original_query
 
     @trace(
         name="process_message",
@@ -513,7 +547,7 @@ class AgentLoop:
             # logger.info(f"New messages: {messages}")
 
             # Run agent loop
-            final_content, tools_used, token_usage, iteration = await self._run_agent_loop(
+            final_content, tools_used, token_usage, iteration, original_query = await self._run_agent_loop(
                 messages=messages,
                 session_key=session_key,
                 publish_events=True,
@@ -523,6 +557,12 @@ class AgentLoop:
             # Log response preview
             preview = final_content[:300] + "..." if len(final_content) > 300 else final_content
             logger.info(f"Response to {msg.session_key}: {preview}")
+
+            # Post-answer linking: build relations between cross-iteration read URIs
+            enable_linking_val = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
+            # logger.error(f"[PostAnswerLink] Check: enable_linking={enable_linking_val}, tools_used_count={len(tools_used) if tools_used else 0}")
+            if enable_linking_val == "1" and tools_used:
+                await self._post_answer_link(tools_used, original_query, session_key)
 
             # Save to session (include tool names so consolidation sees what happened)
             session.add_message("user", msg.content, sender_id=msg.sender_id)
@@ -556,6 +596,93 @@ class AgentLoop:
             except asyncio.CancelledError:
                 pass
 
+    async def _post_answer_link(
+        self,
+        tools_used: list[dict],
+        original_question: str,
+        session_key: "SessionKey",
+    ) -> None:
+        """Build relations between documents read in different iterations."""
+        try:
+            read_tools = {"openviking_multi_read", "openviking_read"}
+            logger.info(f"[PostAnswerLink] origin query is {original_question}")
+            # Use original_question directly (extracted from messages in _run_agent_loop)
+            link_query = original_question
+
+            # Backup: collect all search queries for richer keywords (commented out)
+            # search_queries = []
+            # for tool in tools_used:
+            #     if tool.get("tool_name") == "openviking_search":
+            #         args = tool.get("args", "")
+            #         if isinstance(args, dict):
+            #             q = args.get("query", "")
+            #         elif isinstance(args, str):
+            #             import re as _re2
+            #             m = _re2.search(r'"query"\s*:\s*"([^"]*)"', args)
+            #             q = m.group(1) if m else ""
+            #         else:
+            #             q = ""
+            #         if q:
+            #             search_queries.append(q)
+            # link_query = " ".join(search_queries) if search_queries else original_question
+
+            # Collect all unique URIs from read tool calls
+            all_uris = []
+            for tool in tools_used:
+                if tool.get("tool_name") in read_tools and tool.get("execute_success"):
+                    uris = self._extract_uris_from_args(tool.get("args", ""))
+                    if uris:
+                        all_uris.extend(uris)
+
+            seen = set()
+            unique_uris = []
+            for u in all_uris:
+                if u not in seen:
+                    seen.add(u)
+                    unique_uris.append(u)
+
+            logger.info(f"[PostAnswerLink] Total unique URIs read: {len(unique_uris)}")
+
+            if len(unique_uris) < 2:
+                logger.info(f"[PostAnswerLink] Skipped: only {len(unique_uris)} unique URI(s), need >= 2")
+                return
+
+            from vikingbot.openviking_mount.ov_server import VikingClient
+            workspace_id = self.sandbox_manager.to_workspace_id(session_key) if self.sandbox_manager else None
+            client = await VikingClient.create(workspace_id)
+
+            linked = set()
+            for i in range(len(unique_uris)):
+                for j in range(i + 1, len(unique_uris)):
+                    u1, u2 = unique_uris[i], unique_uris[j]
+                    pair = (min(u1, u2), max(u1, u2))
+                    if pair in linked:
+                        continue
+                    linked.add(pair)
+                    try:
+                        logger.info(f"[PostAnswerLink] Linking: {u1} <-> {u2}")
+                        await client.link(u1, [u2], reason="co-referenced", query=link_query)
+                    except Exception as e:
+                        logger.warning(f"[PostAnswerLink] Link failed: {e}")
+
+            if linked:
+                logger.info(f"[PostAnswerLink] Created {len(linked)} relation(s)")
+        except Exception as e:
+            # logger.error(f"[PostAnswerLink] Failed: {e}")
+            logger.warning(f"Post-answer linking failed: {e}")
+
+    @staticmethod
+    def _extract_uris_from_args(args_raw) -> list[str]:
+        """Extract viking:// URIs from tool call args."""
+        import re
+        if isinstance(args_raw, dict):
+            args_str = json.dumps(args_raw)
+        elif isinstance(args_raw, str):
+            args_str = args_raw
+        else:
+            return []
+        return re.findall(r'viking://[^\s"\\,\]\}]+', args_str)
+
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """
         Process a system message (e.g., subagent announce).
@@ -573,7 +700,7 @@ class AgentLoop:
         )
 
         # Run agent loop (no events published)
-        final_content, tools_used, token_usage, iteration = await self._run_agent_loop(
+        final_content, tools_used, token_usage, iteration, _original_query = await self._run_agent_loop(
             messages=messages,
             session_key=msg.session_key,
             publish_events=False,

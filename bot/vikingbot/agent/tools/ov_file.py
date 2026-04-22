@@ -1,6 +1,7 @@
 """OpenViking file system tools: read, write, list, search resources."""
 
 import asyncio
+import os
 from abc import ABC
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -118,13 +119,69 @@ class VikingSearchTool(OVFileTool):
 
             if not results:
                 return f"No results found for query: {query}"
-            if isinstance(results, list):
-                result_strs = []
-                for i, result in enumerate(results, 1):
-                    result_strs.append(f"{i}. {str(result)}")
-                return "\n".join(result_strs)
+
+            # Normalize results to a list of resources
+            if isinstance(results, dict):
+                resources_list = results.get('resources', []) or []
+            elif isinstance(results, list):
+                resources_list = results
             else:
-                return str(results)
+                resources_list = []
+
+            if resources_list:
+                result_strs = []
+                for i, result in enumerate(resources_list, 1):
+                    result_strs.append(f"{i}. {str(result)}")
+                output = "\n".join(result_strs)
+            else:
+                output = str(results)
+
+            # Relations enhancement: append related docs based on filter_mode (independent of enable_linking)
+            filter_mode = os.environ.get("VIKINGBOT_RELATION_FILTER_MODE", "none")
+            relations_count = 0
+            if filter_mode != "none" and resources_list:
+                try:
+                    seen_uris = set()
+                    for r in resources_list:
+                        uri = r.get("uri", str(r)) if isinstance(r, dict) else str(r)
+                        seen_uris.add(uri)
+
+                    # Collect all raw relations from top 5 results
+                    raw_rels = []
+                    for r in resources_list[:5]:
+                        uri = r.get("uri", str(r)) if isinstance(r, dict) else str(r)
+                        try:
+                            rels = await search_client.relations(uri, query=query)
+                            for rel in rels:
+                                rel["_source_uri"] = uri
+                                raw_rels.append(rel)
+                        except Exception:
+                            continue
+
+                    # relations() 已通过 query 精确匹配，不需要额外 keyword 过滤
+                    # if filter_mode == "keyword" and raw_rels:
+                    #     from vikingbot.agent.tools.relation_utils import filter_relations_by_keyword
+                    #     raw_rels = filter_relations_by_keyword(raw_rels, query)
+
+                    related_items = []
+                    for rel in raw_rels:
+                        rel_uri = rel.get("uri", "") if isinstance(rel, dict) else str(rel)
+                        if rel_uri and rel_uri not in seen_uris:
+                            seen_uris.add(rel_uri)
+                            score = rel.get("score", "") if isinstance(rel, dict) else ""
+                            score_str = f" score={score}" if score else ""
+                            related_items.append(f"[via relations{score_str}] {rel_uri}")
+
+                    relations_count = len(related_items)
+                    if related_items:
+                        output += "\n\n--- Related documents (from relations) ---\n"
+                        for idx, item in enumerate(related_items, 1):
+                            output += f"{idx}. {item}\n"
+                except Exception as e:
+                    logger.debug(f"Relations enhancement failed, returning original results: {e}")
+
+            output += f"\n<!-- relations_found:{relations_count} -->"
+            return output
         except Exception as e:
             return f"Error searching Viking: {str(e)}"
 
@@ -702,3 +759,118 @@ class VikingMultiReadTool(OVFileTool):
         except Exception as e:
             logger.exception(f"Error in VikingMultiReadTool: {e}")
             return f"Error multi-reading Viking resources: {str(e)}"
+
+
+class VikingLinkTool(OVFileTool):
+    """Tool to create reference links between Viking resources."""
+
+    @property
+    def name(self) -> str:
+        return "openviking_link"
+
+    @property
+    def description(self) -> str:
+        return "Create a reference link between Viking resources. Use when you discover documents that are related (same topic, person, event, or continuation of a conversation). Links persist and help future queries discover related documents faster."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "from_uri": {
+                    "type": "string",
+                    "description": "Source Viking URI to link FROM",
+                },
+                "uris": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Target Viking URIs to link TO",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation of why these documents are related",
+                },
+            },
+            "required": ["from_uri", "uris", "reason"],
+        }
+
+    async def execute(
+        self, tool_context: "ToolContext", from_uri: str = "", uris: list[str] = None, reason: str = "", **kwargs: Any
+    ) -> str:
+        if not from_uri or not uris:
+            return "Error: from_uri and uris are required."
+        if not reason:
+            return "Error: reason is required for link creation."
+        try:
+            client = await self._get_client(tool_context)
+            # Promote leaf file URIs to parent directory to avoid
+            # .relations.json being created under a file path (Windows FS issue)
+            from_uri = self._to_dir_uri(from_uri)
+            uris = [self._to_dir_uri(u) for u in uris]
+            await client.link(from_uri, uris, reason=reason)
+            targets = ", ".join(uris)
+            return f"Linked: {from_uri} -> [{targets}] (reason: {reason})"
+        except Exception as e:
+            logger.exception(f"Error in VikingLinkTool: {e}")
+            return f"Error creating link: {str(e)}"
+
+    @staticmethod
+    def _to_dir_uri(uri: str) -> str:
+        """If URI points to a file (has extension), return its parent directory URI."""
+        if not uri:
+            return uri
+        last_segment = uri.rstrip("/").rsplit("/", 1)[-1]
+        # Any segment with a dot is treated as a file (including .abstract.md, .overview.md)
+        if "." in last_segment:
+            return uri.rstrip("/").rsplit("/", 1)[0]
+        return uri
+
+
+class VikingRelationsTool(OVFileTool):
+    """Tool to query existing reference links for a Viking resource."""
+
+    @property
+    def name(self) -> str:
+        return "openviking_relations"
+
+    @property
+    def description(self) -> str:
+        return "Query existing reference links for a Viking resource. Returns linked URIs and reasons. Use to discover related documents and follow graph edges during search."
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "uri": {
+                    "type": "string",
+                    "description": "The Viking URI to query relations for",
+                },
+            },
+            "required": ["uri"],
+        }
+
+    async def execute(
+        self, tool_context: "ToolContext", uri: str = "", **kwargs: Any
+    ) -> str:
+        if not uri:
+            return "Error: uri is required."
+        try:
+            client = await self._get_client(tool_context)
+            # Promote leaf file URI to parent directory (same as VikingLinkTool)
+            uri = VikingLinkTool._to_dir_uri(uri)
+            rels = await client.relations(uri)
+            if not rels:
+                return f"No relations found for {uri}"
+            lines = []
+            for r in rels:
+                rel_uri = r.get("uri", "")
+                rel_reason = r.get("reason", "")
+                if rel_reason:
+                    lines.append(f"- {rel_uri} (reason: {rel_reason})")
+                else:
+                    lines.append(f"- {rel_uri}")
+            return f"Relations for {uri} ({len(rels)}):\n" + "\n".join(lines)
+        except Exception as e:
+            logger.exception(f"Error in VikingRelationsTool: {e}")
+            return f"Error querying relations: {str(e)}"

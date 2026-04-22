@@ -1,6 +1,9 @@
 import asyncio
 import hashlib
+import json
+import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -18,6 +21,9 @@ class VikingClient:
         openviking_config = config.ov_server
         self.openviking_config = openviking_config
         self.ov_path = config.ov_data_path
+        workspace = config.storage_workspace or str(Path("~/.openviking/data").expanduser())
+        self._vikingfs_path = os.path.join(workspace, "viking")
+        logger.debug(f"[VikingClient] vikingfs_path={self._vikingfs_path}")
         if openviking_config.mode == "local":
             self.client = ov.AsyncHTTPClient(url=openviking_config.server_url)
             self.agent_id = "default"
@@ -343,6 +349,112 @@ class VikingClient:
     async def glob(self, pattern: str, uri: Optional[str] = None) -> Dict[str, Any]:
         """通过 glob 模式匹配文件"""
         return await self.client.glob(pattern, uri=uri)
+
+    def _uri_to_local_path(self, uri: str) -> str:
+        """viking://resources/x/y -> {vikingfs_path}/resources/x/y"""
+        if uri.startswith("viking://"):
+            rel = uri[len("viking://"):]
+        else:
+            rel = uri
+        return os.path.join(self._vikingfs_path, rel)
+
+    def _uri_to_parent_path(self, uri: str) -> str:
+        """返回 URI 对应条目的父目录本地路径"""
+        local_path = self._uri_to_local_path(uri)
+        # 如果本地路径是目录，直接返回；否则返回父目录
+        if os.path.isdir(local_path):
+            return local_path
+        return os.path.dirname(local_path)
+
+    def _append_relation(self, uri1: str, uri2: str, query: str) -> None:
+        """在 uri1 父目录的 .relations.jsonl 中追加一条记录（去重）"""
+        if not query:
+            logger.warning(f"[Link] Skipped: empty query for {uri1} -> {uri2}")
+            return
+        parent_dir = self._uri_to_parent_path(uri1)
+        os.makedirs(parent_dir, exist_ok=True)
+        jsonl_path = os.path.join(parent_dir, ".relations.jsonl")
+
+        key = (uri1, uri2, query)
+        # 读取已有记录检查去重
+        existing = set()
+        if os.path.exists(jsonl_path):
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        existing.add((rec.get("uri1", ""), rec.get("uri2", ""), rec.get("query_question", "")))
+                    except json.JSONDecodeError:
+                        continue
+
+        if key in existing:
+            logger.debug(f"[Link] Duplicate skipped: {uri1} -> {uri2} (query={query[:50]})")
+            return
+
+        record = {"uri1": uri1, "uri2": uri2, "query_question": query}
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info(f"[Link] Written to {jsonl_path}: {uri1} -> {uri2}")
+
+    async def link(self, from_uri: str, to_uris, reason: str = "", query: str = ""):
+        """基于 .relations.jsonl 的自定义链接实现"""
+        logger.info(f"[Link] Called: from={from_uri}, to={to_uris}, query={query[:80] if query else '(empty)'}")
+        if isinstance(to_uris, str):
+            to_uris = [to_uris]
+        for to_uri in to_uris:
+            if from_uri == to_uri:
+                continue
+            try:
+                # 在 from_uri 的父目录写入正向记录
+                self._append_relation(from_uri, to_uri, query)
+                # 在 to_uri 的父目录写入反向记录（支持双向查询）
+                self._append_relation(to_uri, from_uri, query)
+            except Exception as e:
+                logger.error(f"[Link] Failed to write relation {from_uri} <-> {to_uri}: {e}")
+
+    async def relations(self, uri: str, query: str = "") -> List:
+        """基于 .relations.jsonl 的自定义查询实现（双向匹配）"""
+        parent_dir = self._uri_to_parent_path(uri)
+        jsonl_path = os.path.join(parent_dir, ".relations.jsonl")
+        if not os.path.exists(jsonl_path):
+            return []
+
+        results = []
+        seen = set()
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                rec_query = rec.get("query_question", "")
+                if query and rec_query != query:
+                    continue
+
+                uri1 = rec.get("uri1", "")
+                uri2 = rec.get("uri2", "")
+                if uri1 == uri2:
+                    continue
+
+                if uri1 == uri:
+                    target = uri2
+                elif uri2 == uri:
+                    target = uri1
+                else:
+                    continue
+
+                if target not in seen:
+                    seen.add(target)
+                    results.append({"uri": target, "reason": rec_query})
+
+        return results
 
     async def commit(self, session_id: str, messages: list[dict[str, Any]], user_id: str = None):
         """提交会话"""

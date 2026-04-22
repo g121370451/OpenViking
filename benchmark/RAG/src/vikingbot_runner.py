@@ -109,11 +109,15 @@ def _stop_openviking_server() -> None:
     _OPENVIKING_SERVER_PROCESS = None
     _CURRENT_OV_CONF_PATH = None
     if proc and proc.poll() is None:
+        logger.info(f"[StopServer] Terminating openviking-server (PID={proc.pid})")
         proc.terminate()
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
+            logger.warning(f"[StopServer] Force killing openviking-server (PID={proc.pid})")
             proc.kill()
+    else:
+        logger.debug(f"[StopServer] No running server to stop (proc={proc}, alive={proc.poll() is not None if proc else 'N/A'})")
     
     # 额外的安全措施：杀死所有 openviking-server 进程
     try:
@@ -130,9 +134,6 @@ def _stop_openviking_server() -> None:
                 time.sleep(1)
     except Exception as e:
         logger.debug(f"Failed to kill all openviking-server processes: {e}")
-
-
-atexit.register(_stop_openviking_server)
 
 
 def _ensure_openviking_server(ov_conf_path: str) -> None:
@@ -154,8 +155,14 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         _stop_openviking_server()
         _CURRENT_OV_CONF_PATH = None
 
-        # 确保旧进程真的被终止
-        time.sleep(0.5)
+        # 等待旧进程释放端口
+        time.sleep(2)
+
+        # 确认端口已释放
+        for _ in range(10):
+            if not _healthcheck(health_url):
+                break
+            time.sleep(1)
 
         # 启动新服务器
         env = os.environ.copy()
@@ -180,55 +187,146 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         raise RuntimeError("openviking-server did not become healthy in time")
 
 
+def _clean_tool_calls(tools_used):
+    """Clean tool_calls: parse stringified args/reasoning into proper objects."""
+    if isinstance(tools_used, str):
+        try:
+            tools_used = json.loads(tools_used)
+        except (json.JSONDecodeError, TypeError):
+            return tools_used
+    if not isinstance(tools_used, list):
+        return tools_used
+    cleaned = []
+    for tc in tools_used:
+        if not isinstance(tc, dict):
+            cleaned.append(tc)
+            continue
+        entry = dict(tc)
+        # Parse args from string to dict
+        args_raw = entry.get("args", "")
+        if isinstance(args_raw, str):
+            args_raw = args_raw.replace("\n", " ").replace("\t", " ").strip()
+            if args_raw.startswith("{"):
+                try:
+                    entry["args"] = json.loads(args_raw)
+                except (json.JSONDecodeError, TypeError):
+                    entry["args"] = " ".join(args_raw.split())
+            else:
+                entry["args"] = " ".join(args_raw.split())
+        # Clean up whitespace in reasoning
+        reasoning = entry.get("reasoning", "")
+        if isinstance(reasoning, str):
+            entry["reasoning"] = " ".join(reasoning.split()).strip()
+        cleaned.append(entry)
+    return cleaned
+
+
+def _fix_malformed_tools_json(raw: str) -> list:
+    """
+    Fix common malformed JSON patterns in LLM-generated tool calls:
+    1. Any key whose value is "{ ... }" (object wrapped in quotes) → strip outer quotes
+    2. Any key whose string value contains unescaped inner quotes → remove them
+    3. Remove all \n and \\n from the raw string (both real newlines and escaped ones)
+    """
+    # Pre-clean: remove all newline variants and fix escaped single quotes
+    raw = raw.replace('\\n', ' ').replace('\n', ' ').replace('\r', ' ')
+    raw = raw.replace("\\'", "'")
+    raw = raw.replace("\'", "'")
+
+    all_keys = ['tool_name', 'args', 'reasoning', 'duration', 'execute_success', 'iteration']
+    key_alt = '|'.join(re.escape(k) for k in all_keys)
+    key_re = re.compile(r'"(' + key_alt + r')"\s*:')
+    boundary_re = re.compile(r'"\s*,\s*"(' + key_alt + r')"|"\s*,\s*\{|"\s*\}')
+
+    result = []
+    i = 0
+    length = len(raw)
+
+    while i < length:
+        # Check if we're at a known key
+        m = key_re.match(raw, i)
+        if m:
+            key_name = m.group(1)
+            result.append(raw[i:m.end()])
+            i = m.end()
+
+            # Skip whitespace after colon
+            while i < length and raw[i] in ' \t':
+                result.append(raw[i]); i += 1
+
+            if i >= length:
+                continue
+
+            # Case 1: value starts with " followed by { → object wrapped in quotes, strip outer "
+            if raw[i] == '"':
+                peek = i + 1
+                while peek < length and raw[peek] in ' \t\\':
+                    peek += 1
+                if peek < length and raw[peek] == '{':
+                    i += 1  # skip opening "
+                    stack, in_str, esc = 0, False, False
+                    while i < length:
+                        ch = raw[i]
+                        if ch == '\\' and not esc:
+                            esc = True
+                        else:
+                            if ch == '"' and not esc: in_str = not in_str
+                            if not in_str:
+                                if ch == '{': stack += 1
+                                elif ch == '}': stack -= 1
+                            esc = False
+                        result.append(ch); i += 1
+                        if stack == 0 and ch == '}':
+                            while i < length and raw[i] in ' \t':
+                                result.append(raw[i]); i += 1
+                            if i < length and raw[i] == '"': i += 1
+                            break
+                    continue
+
+                # Case 2: normal string value — find boundary, remove inner quotes
+                result.append('"'); i += 1
+                bm = boundary_re.search(raw, i)
+                if bm:
+                    inner = raw[i:bm.start()]
+                    result.append(inner.replace('\\"', '').replace('"', '').replace('\'', ''))
+                    result.append('"')
+                    i = bm.start() + 1
+                else:
+                    inner = raw[i:]
+                    result.append(inner.replace('\\"', '').replace('"', '').replace('\'', ''))
+                    i = length
+                continue
+
+            # Non-string value (number, bool, null) — just continue
+            continue
+
+        result.append(raw[i])
+        i += 1
+
+    fixed = ''.join(result)
+    data = json.loads(fixed)
+    if isinstance(data, str):
+        data = json.loads(data)
+    return data
+
+
 def _extract_json_payload(output: str) -> Optional[dict]:
     """
-    专门解析 VikingBot 输出的解析器
+    专门解析 VikingBot 输出的解析器。
+    从 stdout 中提取最外层的 JSON 对象（第一个 { 到最后一个 }）。
     """
     if not output:
         return None
-    
-    # 找到第一个 { 的位置
+
     first_brace_idx = output.find('{')
     if first_brace_idx == -1:
         return None
-    
-    # 截取从第一个 { 开始
-    content = output[first_brace_idx:]
-    
-    # 使用括号匹配找到完整的对象边界
-    brace_count = 0
-    end_idx = -1
-    in_string = False
-    escape_next = False
-    
-    for i in range(len(content)):
-        char = content[i]
-        
-        if escape_next:
-            escape_next = False
-            continue
-        
-        if char == '\\':
-            escape_next = True
-            continue
-        
-        if char == '"' and not escape_next:
-            in_string = not in_string
-            continue
-        
-        if not in_string:
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                    end_idx = i + 1
-                    break
-    
-    if end_idx == -1:
+
+    last_brace_idx = output.rfind('}')
+    if last_brace_idx == -1 or last_brace_idx <= first_brace_idx:
         return None
-    
-    obj_str = content[:end_idx]
+
+    obj_str = output[first_brace_idx:last_brace_idx + 1]
     
     result = {}
     
@@ -313,7 +411,15 @@ def _extract_json_payload(output: str) -> Optional[dict]:
                         bracket_count -= 1
                 idx += 1
             if bracket_count == 0:
-                result['tools_used'] = obj_str[start:idx]
+                tools_str = obj_str[start:idx]
+                # Try to parse as JSON list; if it fails, fix malformed JSON and retry
+                try:
+                    result['tools_used'] = json.loads(tools_str)
+                except (json.JSONDecodeError, TypeError):
+                    try:
+                        result['tools_used'] = _fix_malformed_tools_json(tools_str)
+                    except Exception:
+                        result['tools_used'] = tools_str
     
     if 'text' in result:
         return result
@@ -321,10 +427,18 @@ def _extract_json_payload(output: str) -> Optional[dict]:
     return None
 
 
-def _build_vikingbot_env(ov_conf_path: str, max_iterations: int) -> dict[str, str]:
+def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, relation_filter_mode: str = "none") -> dict[str, str]:
     env = os.environ.copy()
     env["OPENVIKING_CONFIG_FILE"] = ov_conf_path
-    env["NANOBOT_AGENTS__MAX_ITERATIONS"] = str(int(max_iterations))
+    env["NANOBOT_AGENTS__MAX_TOOL_ITERATIONS"] = str(int(max_iterations))
+
+    # Force UTF-8 encoding for vikingbot subprocess on Windows
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+
+    # Control whether link/relations tools are registered
+    env["VIKINGBOT_ENABLE_LINKING"] = "1" if enable_linking else "0"
+    env["VIKINGBOT_RELATION_FILTER_MODE"] = relation_filter_mode
     
     # 设置 ovcli.conf 的路径，和原始 ov.conf 在同一个目录（不是临时文件的目录）
     original_ov_conf_dir = os.path.dirname(_OV_CONF_PATH)
@@ -366,6 +480,8 @@ class VikingBotRunner:
         self.vikingbot_config = config.get('vikingbot', {})
         self.max_iterations = self.vikingbot_config.get('max_iterations', 10)
         self.log_tool_calls = self.vikingbot_config.get('log_tool_calls', True)
+        self.enable_linking = self.vikingbot_config.get('enable_linking', False)
+        self.relation_filter_mode = self.vikingbot_config.get('relation_filter_mode', 'none')
         # Get vector store path from config if available
         self.vector_store_path = config.get('paths', {}).get('vector_store')
     
@@ -398,10 +514,23 @@ class VikingBotRunner:
                 logger.info(f"Using vector store: {self.vector_store_path}")
             
             _ensure_openviking_server(ov_conf_path)
-            input_msg = f"""Answer this question as briefly as possible. Use only the information available in the database. Do not use web search or any external source. Always search in viking://resources/ path.
+            batch_read_hint = "When reading multiple resources, always batch them in a single openviking_multi_read call instead of reading one at a time."
+            search_hint = "You MUST use openviking_search to search in viking://resources/ path before answering. Always search and read the actual documents."
+            if self.enable_linking:
+                input_msg = f"""Answer this question as briefly as possible. Use only the information available in the database. Do not use web search or any external source.
+{search_hint}
+{batch_read_hint}
+
+During your search, when you find documents that are clearly related (same topic, same person, same event, or continuation of a conversation), use the openviking_link tool to connect them with a brief reason.
 
 Question: {question}"""
-            env = _build_vikingbot_env(ov_conf_path, self.max_iterations)
+            else:
+                input_msg = f"""Answer this question as briefly as possible. Use only the information available in the database. Do not use web search or any external source.
+{search_hint}
+{batch_read_hint}
+
+Question: {question}"""
+            env = _build_vikingbot_env(ov_conf_path, self.max_iterations, self.enable_linking, self.relation_filter_mode)
 
             # Use CLI mode only for thread safety in multi-threaded environments
             cmd = ["vikingbot", "chat", "-m", input_msg, "-s", session_id, "-e", "-c", ov_conf_path]
@@ -411,15 +540,17 @@ Question: {question}"""
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=True,
                 timeout=900,
-                env=env,
+                env=env
             )
             output = result.stdout.strip()
             stderr = result.stderr.strip()
             logger.debug(f"VikingBot stdout: {repr(output)}")
             if stderr:
-                logger.warning(f"VikingBot stderr: {repr(stderr)}")
+                logger.warning(f"VikingBot stderr:\n{stderr}")
             resp_json = _extract_json_payload(output)
             # If JSON extraction fails, use the raw output as answer
             if resp_json is None:
@@ -438,7 +569,7 @@ Question: {question}"""
                 total_time = float(resp_json.get("time_cost", time.time() - start_time))
                 iterations_used = int(resp_json.get("iteration", 0))
                 tools_used = resp_json.get("tools_used", [])
-                tool_calls = tools_used
+                tool_calls = _clean_tool_calls(tools_used)
             
             result_dict = {
                 "answer": answer,

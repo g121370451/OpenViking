@@ -58,7 +58,7 @@ def resolve_path(path_str, base_path):
 
 def main():
     parser = ArgumentParser(description="Run RAG Benchmark (Smart Path Handling)")
-    default_config_path = os.path.join(SCRIPT_DIR, "config/config.yaml")
+    default_config_path = os.path.join(SCRIPT_DIR, "config/hotpotqa_bot_config_build_links.yaml")
     
     parser.add_argument("--config", default=default_config_path, 
                         help=f"Path to config file. Default: {default_config_path}")
@@ -158,7 +158,7 @@ def main():
             logger.info("Stage: Evaluation (Judge -> Metrics)")
             pipeline.run_evaluation()
 
-        if args.step in ["all", "del"]:
+        if args.step in ["del"]:
             logger.info("Stage: Delete Vector Store")
             pipeline.run_deletion()
         

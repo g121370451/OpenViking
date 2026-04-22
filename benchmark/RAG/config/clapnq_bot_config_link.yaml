@@ -1,17 +1,17 @@
 project_name: "RAG_Benchmark"
 
 # ===========Modify Configuration================
-dataset_name: "FinanceBench" 
+dataset_name: "ClapNQ" 
 
 adapter:
-  module: "src.adapters.financebench_adapter"  
-  class_name: "FinanceBenchAdapter"     
+  module: "src.adapters.clapnq_adapter"  
+  class_name: "ClapNQAdapter"     
 
 execution:
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 1
-  max_queries: 50
+  max_queries: null
   skip_ingestion: true
   ingest_mode: "directory"
   retrieval_instruction: ""  
@@ -23,14 +23,12 @@ vikingbot:
   max_iterations: 50
   log_tool_calls: true
   enable_linking: false
-  relation_filter_mode: "none"
-
 paths:
-  dataset_path: "datasets/{dataset_name}/financebench_open_source.jsonl"
+  dataset_path: "datasets/{dataset_name}/clapnq_dev_answerable.jsonl"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
-  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}"
-  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}.log"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index_link"
+  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_link"
+  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_link/benchmark.log"
 
 
 llm:

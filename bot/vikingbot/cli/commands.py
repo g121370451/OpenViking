@@ -1,5 +1,17 @@
 """CLI commands for vikingbot."""
 
+import os
+import sys
+import io
+
+# Force UTF-8 on Windows: wrap stdout/stderr with UTF-8 TextIOWrapper
+# This must happen before any other module imports that might cache these streams
+if sys.platform == "win32":
+    if hasattr(sys.stdout, 'buffer'):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    if hasattr(sys.stderr, 'buffer'):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+
 import warnings
 # Ignore Pydantic V1 compatibility warning with Python 3.14+ from volcenginesdkarkruntime
 warnings.filterwarnings(
@@ -598,7 +610,7 @@ def chat(
     if logs:
         logger.add(sys.stderr, level="DEBUG")
     else:
-        logger.add(sys.stderr, level="ERROR")
+        logger.add(sys.stderr, level="INFO")
 
     session_manager = SessionManager(config.bot_data_path)
 

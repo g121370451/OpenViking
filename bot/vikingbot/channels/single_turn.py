@@ -96,13 +96,29 @@ class SingleTurnChannel(BaseChannel):
         if msg.is_normal_message:
             if self._eval:
                 content = msg.content.replace('"', "'") if msg.content else ""
+                # Slim down tools_used for eval output: drop result to avoid
+                # nested content breaking JSON parsing in vikingbot_runner
+                tools_used_slim = []
+                if msg.tools_used:
+                    for tc in msg.tools_used:
+                        if isinstance(tc, dict):
+                            tools_used_slim.append({
+                                "tool_name": tc.get("tool_name", ""),
+                                "args": tc.get("args", ""),
+                                "reasoning": tc.get("reasoning", ""),
+                                "duration": tc.get("duration", 0),
+                                "execute_success": tc.get("execute_success", True),
+                                "relations_found": tc.get("relations_found", 0),
+                            })
+                        else:
+                            tools_used_slim.append(tc)
                 output = {
                     "text": content,
                     "token_usage": msg.token_usage,
                     "time_cost": msg.time_cost,
                     "iteration": msg.iteration,
                     "tools_used_names": msg.tools_used_names,
-                    "tools_used": msg.tools_used,
+                    "tools_used": tools_used_slim,
                 }
                 msg.content = json.dumps(output, ensure_ascii=False)
             self._last_response = msg.content

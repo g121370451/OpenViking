@@ -182,9 +182,23 @@ class BenchmarkPipeline:
                         }
                     }
                 )
-            with open(self.generated_file, "w", encoding="utf-8") as f:
-                json.dump(save_data, f, indent=2, ensure_ascii=False)
-            
+            self.logger.info(f"[Save] Final write: {len(sorted_results)} results to {self.generated_file}")
+            try:
+                with open(self.generated_file, "w", encoding="utf-8") as f:
+                    json.dump(save_data, f, indent=2, ensure_ascii=False, default=str)
+                self.logger.info(f"[Save] Final write successful: {len(sorted_results)} results")
+            except Exception as e:
+                self.logger.error(f"[Save] Final write FAILED to {self.generated_file}: {e}")
+                self.logger.error(f"[Save] Data preview: dataset={dataset_name}, results_count={len(sorted_results)}")
+                # Log first result for debugging
+                if sorted_results:
+                    try:
+                        preview = json.dumps(sorted_results[0], ensure_ascii=False, default=str)[:500]
+                        self.logger.error(f"[Save] First result preview: {preview}")
+                    except Exception:
+                        self.logger.error(f"[Save] First result (raw): {sorted_results[0]}")
+                raise
+
             self.checkpoint_manager.delete_checkpoint()
         finally:
             # 确保在 generation 阶段结束后停止 ov 服务
@@ -199,8 +213,15 @@ class BenchmarkPipeline:
                 "summary": {"dataset": dataset_name, "total_queries": len(sorted_results)},
                 "results": sorted_results
             }
-            with open(self.generated_file, "w", encoding="utf-8") as f:
-                json.dump(save_data, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"[Save] Writing {len(sorted_results)} results to {self.generated_file}")
+            try:
+                with open(self.generated_file, "w", encoding="utf-8") as f:
+                    json.dump(save_data, f, indent=2, ensure_ascii=False, default=str)
+                self.logger.info(f"[Save] Successfully wrote {len(sorted_results)} results")
+            except Exception as e:
+                self.logger.error(f"[Save] Failed to write {self.generated_file}: {e}")
+                self.logger.error(f"[Save] Data preview: dataset={dataset_name}, results_count={len(sorted_results)}")
+                raise
 
     def run_evaluation(self):
         """Step 4: Evaluation"""
@@ -264,7 +285,7 @@ class BenchmarkPipeline:
             json.dump({"results": eval_records}, f, indent=2, ensure_ascii=False)
 
         if total > 0:
-            self._update_report({
+            report = {
                 "Dataset": self.config.get('dataset_name', 'Unknown_Dataset'),
                 "Total Queries Evaluated": total,
                 "Performance Metrics": {
@@ -273,7 +294,31 @@ class BenchmarkPipeline:
                     "Average Accuracy (Hit 0-4)": sum(r['metrics']['Accuracy'] for r in eval_records) / total,
                     "Average Accuracy (normalization)": (sum(r['metrics']['Accuracy'] for r in eval_records) / total)/4,
                 }
-            })
+            }
+
+            # Add vikingbot iteration metrics if available
+            vb_records = [r for r in eval_records if 'vikingbot' in r]
+            if vb_records:
+                iters_total = [r['vikingbot'].get('iterations_used', 0) for r in vb_records]
+                iters_retrieval = [r['vikingbot'].get('retrieval_iterations', r['vikingbot'].get('iterations_used', 0)) for r in vb_records]
+                iters_search = [r['vikingbot'].get('search_iterations', 0) for r in vb_records]
+                relations_hits_list = [r['vikingbot'].get('relations_hits', 0) for r in vb_records]
+                total_relations_list = [r['vikingbot'].get('total_relations_found', 0) for r in vb_records]
+                report["VikingBot Iteration Metrics"] = {
+                    "Average Total Iterations": sum(iters_total) / len(iters_total),
+                    "Average Retrieval Iterations (excl. link/relations)": sum(iters_retrieval) / len(iters_retrieval),
+                    "Average Search Iterations": sum(iters_search) / len(iters_search),
+                    "Min Retrieval Iterations": min(iters_retrieval),
+                    "Max Retrieval Iterations": max(iters_retrieval),
+                }
+                report["Relations Usage"] = {
+                    "Total Questions with Relations Hits": sum(1 for h in relations_hits_list if h > 0),
+                    "Total Relations Found": sum(total_relations_list),
+                    "Average Relations Found per Query": sum(total_relations_list) / len(total_relations_list),
+                    "Relations Hit Rate": sum(1 for h in relations_hits_list if h > 0) / len(relations_hits_list),
+                }
+
+            self._update_report(report)
         
         self.checkpoint_manager.delete_checkpoint()
     
@@ -336,59 +381,52 @@ class BenchmarkPipeline:
             enhanced_query = f"{retrieval_instruction} {qa.question}"
         else:
             enhanced_query = qa.question
-        
-        dataset_name = self.config.get('dataset_name', '')
-        
+
         topk = int(self.config['execution']['retrieval_topk'])
-        candidate_k = topk * 3
-        retrieve_res = self.db.retrieve(query=enhanced_query, topk=candidate_k)
 
-        if isinstance(retrieve_res, tuple) and len(retrieve_res) == 2:
-            search_res, retrieval_embedding_tokens = retrieve_res
-        else:
-            search_res = retrieve_res
-            retrieval_embedding_tokens = 0
+        # retrieve() now returns a unified dict from both store types
+        ret = self.db.retrieve(query=enhanced_query, topk=topk)
 
-        candidates = (getattr(search_res, 'resources', []) or [])[:candidate_k]
-        l2_only = [
-            r for r in candidates
-            if getattr(r, 'level', 2) == 2
-            and not str(getattr(r, 'uri', '')).endswith(('/.abstract.md', '/.overview.md', '.abstract.md', '.overview.md'))
-        ][:topk]
-        
         latency = time.time() - t0
-        
-        retrieved_texts = []
-        retrieved_uris = []
-        context_blocks = []
-        
-        for r in l2_only:
-            retrieved_uris.append(r.uri)
-            content = self.db.read_resource(r.uri) if getattr(r, 'level', 2) == 2 else f"{getattr(r, 'abstract', '')}\n{getattr(r, 'overview', '')}"
-            retrieved_texts.append(content)
-            clean = content[:8000]
-            context_blocks.append(clean)
-        
+
+        recall_texts = ret["recall_texts"]           # {uri: full_content}
+        context_blocks = ret["context_blocks"]       # [truncated, ...]
+        retrieved_uris = ret["retrieved_uris"]       # [uri, ...]
+        retrieval_tokens = ret["retrieval_tokens"]   # int
+        agentic_metadata = ret.get("agentic_metadata")  # None for standard RAG
+
+        retrieved_texts = list(recall_texts.values())
         recall = MetricsCalculator.check_recall(retrieved_texts, qa.evidence)
-        
+
         full_prompt, meta = self.adapter.build_prompt(qa, context_blocks)
-        
+
         ans_raw = self.llm.generate(full_prompt)
         ans = self.adapter.post_process_answer(qa, ans_raw, meta)
 
         in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
         out_tokens = self.db.count_tokens(ans)
-        self.monitor.worker_end(tokens=in_tokens + out_tokens + retrieval_embedding_tokens)
-        
+        self.monitor.worker_end(tokens=in_tokens + out_tokens + retrieval_tokens)
+
         self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Recall: {recall:.2f} | Latency: {latency:.2f}s")
 
-        return {
+        result = {
             "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
             "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
             "retrieval": {"latency_sec": latency, "uris": retrieved_uris},
             "llm": {"final_answer": ans},
-            "metrics": {"Recall": recall}, "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens, "retrieval_embedding_tokens": retrieval_embedding_tokens}
+            "metrics": {"Recall": recall},
+            "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens, "retrieval_embedding_tokens": retrieval_tokens}
         }
+
+        if agentic_metadata:
+            result["agentic_rag"] = {
+                "iterations_used": agentic_metadata.get("iterations_used", 0),
+                "tool_calls": agentic_metadata.get("tool_calls", []),
+                "recall_texts": recall_texts,
+            }
+            result["retrieval"]["mode"] = "agentic"
+
+        return result
     
     def _process_vikingbot_task(self, task, qa):
         self.logger.info(f"[Query-{task['id']}] Using VikingBot for agentic RAG")
@@ -410,17 +448,68 @@ class BenchmarkPipeline:
         out_tokens = int(vb_usage.get("completion_tokens", 0) or 0)
         
         self.monitor.worker_end(tokens=in_tokens + out_tokens)
-        
-        self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Latency: {total_time:.2f}s | Mode: Agentic RAG")
+
+        # Calculate retrieval-only iterations (excluding link/relations tool calls)
+        vb_meta = vikingbot_result.get('vikingbot', {})
+        total_iterations = vb_meta.get('iterations_used', 0)
+        tool_calls_raw = vb_meta.get('tool_calls', '')
+        link_tools = {'openviking_link', 'openviking_relations'}
+        retrieval_iterations = total_iterations
+        if tool_calls_raw:
+            try:
+                tc_list = json.loads(tool_calls_raw) if isinstance(tool_calls_raw, str) else tool_calls_raw
+                if isinstance(tc_list, list):
+                    link_only_iters = set()
+                    for tc in tc_list:
+                        name = tc.get('tool_name', '') if isinstance(tc, dict) else ''
+                        if name in link_tools:
+                            # Track which iterations had ONLY link tools
+                            link_only_iters.add(id(tc))  # placeholder, need iteration info
+                    # Count iterations where ALL tool calls are link-related
+                    # Group by iteration: tool_calls don't have iteration field,
+                    # so count how many individual link tool calls there are
+                    link_call_count = sum(1 for tc in tc_list if isinstance(tc, dict) and tc.get('tool_name', '') in link_tools)
+                    non_link_call_count = sum(1 for tc in tc_list if isinstance(tc, dict) and tc.get('tool_name', '') not in link_tools)
+                    # Estimate: subtract ratio of link calls from total iterations
+                    total_calls = len(tc_list) if tc_list else 1
+                    retrieval_iterations = max(1, round(total_iterations * non_link_call_count / total_calls))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        vb_meta_out = dict(vb_meta)
+        vb_meta_out['retrieval_iterations'] = retrieval_iterations
+
+        # Calculate search iterations and relations statistics
+        search_iterations = 0
+        relations_hits = 0
+        total_relations_found = 0
+        if tool_calls_raw:
+            try:
+                tc_list_for_stats = json.loads(tool_calls_raw) if isinstance(tool_calls_raw, str) else tool_calls_raw
+                if isinstance(tc_list_for_stats, list):
+                    for tc in tc_list_for_stats:
+                        if isinstance(tc, dict) and tc.get('tool_name') == 'openviking_search':
+                            search_iterations += 1
+                            rf = tc.get('relations_found', 0) or 0
+                            total_relations_found += rf
+                            if rf > 0:
+                                relations_hits += 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+        vb_meta_out['search_iterations'] = search_iterations
+        vb_meta_out['relations_hits'] = relations_hits
+        vb_meta_out['total_relations_found'] = total_relations_found
+
+        self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Latency: {total_time:.2f}s | Iters: {total_iterations} (retrieval: {retrieval_iterations}) | Mode: Agentic RAG")
 
         return {
             "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
             "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
             "retrieval": {"latency_sec": total_time, "uris": [], "mode": "agentic"},
             "llm": {"final_answer": ans},
-            "metrics": {"Recall": recall}, 
+            "metrics": {"Recall": recall},
             "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens},
-            "vikingbot": vikingbot_result.get('vikingbot', {})
+            "vikingbot": vb_meta_out
         }
 
     def _process_evaluation_task(self, item):

@@ -1,11 +1,13 @@
 project_name: "RAG_Benchmark"
 
 # ===========Modify Configuration================
-dataset_name: "HotpotQA" 
+# This config is for building relations ONLY.
+# Run this first, then run link_vector / link_keyword configs to evaluate.
+dataset_name: "HotpotQA"
 
 adapter:
-  module: "src.adapters.hotpotqa_adapter"  
-  class_name: "HotpotQAAdapter"     
+  module: "src.adapters.hotpotqa_adapter"
+  class_name: "HotpotQAAdapter"
 
 execution:
   max_workers: 10
@@ -14,22 +16,22 @@ execution:
   max_queries: null
   skip_ingestion: true
   ingest_mode: "directory"
-  retrieval_instruction: ""  
+  retrieval_instruction: ""
   use_vikingbot: true
-# ==================================  
+# ==================================
 
 # ===========VikingBot Configuration============
 vikingbot:
   max_iterations: 50
   log_tool_calls: true
-  enable_linking: false
+  enable_linking: true
   relation_filter_mode: "none"
 paths:
   dataset_path: "datasets/{dataset_name}/hotpot_qa_100.json"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
-  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}"
-  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}/benchmark.log"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index_link"
+  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_build_links"
+  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}/benchmark_build_links.log"
 
 
 llm:

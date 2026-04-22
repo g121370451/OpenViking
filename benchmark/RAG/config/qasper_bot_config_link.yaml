@@ -1,18 +1,18 @@
 project_name: "RAG_Benchmark"
 
 # ===========Modify Configuration================
-dataset_name: "SyllabusQA" 
+dataset_name: "Qasper" 
 
 adapter:
-  module: "src.adapters.syllabusqa_adapter"  
-  class_name: "SyllabusQAAdapter"     
+  module: "src.adapters.qasper_adapter"  
+  class_name: "QasperAdapter"     
 
 execution:
-  max_workers: 8
+  max_workers: 10
   ingest_workers: 8
-  retrieval_topk: 5
-  max_queries: null
-  skip_ingestion: false
+  retrieval_topk: 1
+  max_queries: 50
+  skip_ingestion: true
   ingest_mode: "directory"
   retrieval_instruction: ""  
   use_vikingbot: true
@@ -23,14 +23,13 @@ vikingbot:
   max_iterations: 10
   log_tool_calls: true
   enable_linking: false
-  relation_filter_mode: "none"
 
 paths:
-  dataset_path: "datasets/{dataset_name}"
+  dataset_path: "datasets/{dataset_name}/qasper_dev.json"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
-  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}"
-  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}/benchmark.log"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index_link"
+  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_link"
+  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_link/benchmark.log"
 
 
 llm:

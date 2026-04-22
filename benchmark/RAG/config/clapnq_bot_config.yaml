@@ -8,7 +8,7 @@ adapter:
   class_name: "ClapNQAdapter"     
 
 execution:
-  max_workers: 8
+  max_workers: 10
   ingest_workers: 8
   retrieval_topk: 1
   max_queries: null
@@ -20,8 +20,9 @@ execution:
 
 # ===========VikingBot Configuration============
 vikingbot:
-  max_iterations: 10
+  max_iterations: 50
   log_tool_calls: true
+  enable_linking: false
 
 paths:
   dataset_path: "datasets/{dataset_name}/clapnq_dev_answerable.jsonl"
@@ -35,4 +36,4 @@ llm:
   model: "doubao-seed-1-8-251228"
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
-  api_key: "YOUR_API_KEY"
+  api_key: "269f7ee6-212a-4f46-9472-978a55cdb625"

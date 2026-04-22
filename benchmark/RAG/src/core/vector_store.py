@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List
+from typing import List, Dict
 import sys
 from pathlib import Path
 
@@ -16,9 +16,9 @@ class VikingStoreWrapper:
         self.store_path = store_path
         if not os.path.exists(store_path):
             os.makedirs(store_path)
-        
+
         self.client = ov.SyncOpenViking(path=store_path)
-        
+
         try:
             self.enc = tiktoken.get_encoding("cl100k_base")
         except Exception as e:
@@ -35,14 +35,14 @@ class VikingStoreWrapper:
         total_input_tokens = 0
         total_output_tokens = 0
         total_embedding_tokens = 0
-        
+
         if not samples:
             return {
                 "time": time.time() - start_time,
                 "input_tokens": 0,
                 "output_tokens": 0
             }
-        
+
         if ingest_mode == "directory":
             doc_paths = [os.path.abspath(s.doc_path) for s in samples]
             common_ancestor = None
@@ -51,7 +51,6 @@ class VikingStoreWrapper:
                     common_ancestor = os.path.commonpath(doc_paths)
                 except ValueError:
                     common_ancestor = None
-            
             if common_ancestor:
                 result = self.client.add_resource(common_ancestor, wait=True, telemetry=True)
                 telemetry = result.get("telemetry", {})
@@ -92,13 +91,50 @@ class VikingStoreWrapper:
             "embedding_tokens": total_embedding_tokens
         }
 
-    def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources"):
-        """Execute retrieval with telemetry"""
-        search_res = self.client.find(query=query, limit=topk, target_uri=target_uri, telemetry=True)
-        retrieval_embedding_tokens = 0
+    def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources") -> Dict:
+        """Retrieve relevant documents: search, filter L2, read content.
+
+        Returns:
+            Dict with keys:
+              - recall_texts: {uri: full_content} for recall calculation
+              - context_blocks: [truncated_content, ...] for prompt building
+              - retrieved_uris: [uri, ...]
+              - retrieval_tokens: int (embedding tokens used)
+        """
+        candidate_k = topk * 3
+        search_res = self.client.find(query=query, limit=candidate_k, target_uri=target_uri, telemetry=True)
+
+        retrieval_tokens = 0
         if hasattr(search_res, 'telemetry') and search_res.telemetry:
-            retrieval_embedding_tokens = search_res.telemetry.get('summary', {}).get('tokens', {}).get('embedding', {}).get('total', 0)
-        return search_res, retrieval_embedding_tokens
+            retrieval_tokens = search_res.telemetry.get('summary', {}).get('tokens', {}).get('embedding', {}).get('total', 0)
+
+        # Filter to L2 detail chunks, exclude abstract/overview
+        candidates = (getattr(search_res, 'resources', []) or [])[:candidate_k]
+        l2_only = [
+            r for r in candidates
+            if getattr(r, 'level', 2) == 2
+            and not str(getattr(r, 'uri', '')).endswith(
+                ('/.abstract.md', '/.overview.md', '.abstract.md', '.overview.md')
+            )
+        ][:topk]
+
+        recall_texts = {}
+        context_blocks = []
+        retrieved_uris = []
+
+        for r in l2_only:
+            uri = r.uri
+            content = self.read_resource(uri)
+            retrieved_uris.append(uri)
+            recall_texts[uri] = content
+            context_blocks.append(content[:8000])
+
+        return {
+            "recall_texts": recall_texts,
+            "context_blocks": context_blocks,
+            "retrieved_uris": retrieved_uris,
+            "retrieval_tokens": retrieval_tokens,
+        }
 
     def read_resource(self, uri: str) -> str:
         """Read resource content"""
