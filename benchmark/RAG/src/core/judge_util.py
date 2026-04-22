@@ -144,12 +144,8 @@ Respond ONLY with a JSON object: {{"score": 0 to 4, "reasoning": "string"}}
                 score = int(match.group(1))
             else:
                 score = 0
-
-        # Dataset-specific clamp
-        if "locomo" in dataset_name_lower:
-            score = 4 if score == 4 else 0
-        else:
-            score = max(0, min(4, score))
+                
+        score = max(0, min(4, score))
 
     return {
         "score": score,
