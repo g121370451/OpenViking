@@ -65,6 +65,9 @@ def main():
     
     parser.add_argument("--step", choices=["all", "gen", "eval", "del"], default="all", 
                         help="Execution step: 'gen' (Retrieval+LLM), 'eval' (Judge), or 'all'")
+
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from checkpoint if available")
     
     args = parser.parse_args()
 
@@ -139,7 +142,8 @@ def main():
             config=config,
             adapter=adapter,
             vector_db=vector_store,
-            llm=llm_client
+            llm=llm_client,
+            resume=args.resume,
         )
 
         # --- E. Execute Tasks ---

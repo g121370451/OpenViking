@@ -4,10 +4,12 @@ import time
 import uuid
 import random
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from pathlib import Path
 import sys
+from typing import Set
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -17,17 +19,19 @@ from core.vector_store import VikingStoreWrapper
 from core.monitor import BenchmarkMonitor
 from core.metrics import MetricsCalculator
 from core.judge_util import llm_grader
+from core.checkpoint import CheckpointManager
 from vikingbot_runner import run_vikingbot_query
 
 
 class BenchmarkPipeline:
-    def __init__(self, config, adapter: BaseAdapter, vector_db: VikingStoreWrapper, llm):
+    def __init__(self, config, adapter: BaseAdapter, vector_db: VikingStoreWrapper, llm, resume: bool = False):
         self.config = config
         self.adapter = adapter
         self.db = vector_db
         self.llm = llm
         self.logger = get_logger()
         self.monitor = BenchmarkMonitor()
+        self.resume = resume
         
         self.output_dir = self.config['paths']['output_dir']
         if not os.path.exists(self.output_dir):
@@ -35,11 +39,47 @@ class BenchmarkPipeline:
         self.generated_file = os.path.join(self.output_dir, "generated_answers.json")
         self.eval_file = os.path.join(self.output_dir, "qa_eval_detailed_results.json")
         self.report_file = os.path.join(self.output_dir, "benchmark_metrics_report.json")
+
+        # Checkpoint + incremental saving for resume support.
+        self.checkpoint_manager = CheckpointManager(self.output_dir, self.config)
+        self._file_lock = threading.Lock()
+        self.save_frequency = 10
         
         self.metrics_summary = {
             "insertion": {"time": 0, "input_tokens": 0, "output_tokens": 0, "embedding_tokens": 0},
             "deletion": {"time": 0, "input_tokens": 0, "output_tokens": 0, "embedding_tokens": 0}
         }
+
+    def _get_record_input_tokens(self, record: dict) -> int:
+        usage = (record or {}).get("token_usage", {}) or {}
+        if "prompt_tokens" in usage:
+            return int(usage.get("prompt_tokens", 0) or 0)
+        return int(usage.get("total_input_tokens", 0) or 0)
+
+    def _get_record_output_tokens(self, record: dict) -> int:
+        usage = (record or {}).get("token_usage", {}) or {}
+        if "completion_tokens" in usage:
+            return int(usage.get("completion_tokens", 0) or 0)
+        return int(usage.get("llm_output_tokens", 0) or 0)
+
+    def _save_partial_results(self, results_map: dict):
+        # Persist partial generation results so we can resume safely after interruption.
+        with self._file_lock:
+            sorted_results = [results_map[i] for i in sorted(results_map.keys())]
+            dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
+            save_data = {
+                "summary": {"dataset": dataset_name, "total_queries": len(sorted_results)},
+                "results": sorted_results
+            }
+            with open(self.generated_file, "w", encoding="utf-8") as f:
+                json.dump(save_data, f, indent=2, ensure_ascii=False)
+
+    def _save_partial_eval_results(self, eval_results_map: dict):
+        # Persist partial evaluation results so we can resume safely after interruption.
+        with self._file_lock:
+            eval_records = list(eval_results_map.values())
+            with open(self.eval_file, "w", encoding="utf-8") as f:
+                json.dump({"results": eval_records}, f, indent=2, ensure_ascii=False)
 
     def run_generation(self):
         """Step 1: Data Preparation"""
@@ -91,35 +131,55 @@ class BenchmarkPipeline:
         tasks = self._prepare_tasks(samples)
         results_map = {}
         max_workers = self.config['execution']['max_workers']
-        task_errors = []
+
+        completed_tasks: Set[int] = set()
+        if self.resume:
+            completed_tasks = self.checkpoint_manager.get_completed_tasks("generation")
+            if completed_tasks:
+                self.logger.info(f"Resuming from checkpoint. {len(completed_tasks)} tasks already completed.")
+                if os.path.exists(self.generated_file):
+                    try:
+                        with open(self.generated_file, "r", encoding="utf-8") as f:
+                            saved_data = json.load(f)
+                        for result in saved_data.get("results", []):
+                            results_map[result["_global_index"]] = result
+                    except Exception as e:
+                        self.logger.warning(f"Failed to load previous generated results, continuing fresh: {e}")
+
+        remaining_tasks = [task for task in tasks if task["id"] not in completed_tasks]
+        self.logger.info(f"Total tasks: {len(tasks)}, Remaining: {len(remaining_tasks)}")
         
         use_vikingbot = self.config.get("execution", {}).get("use_vikingbot", False)
         process_fn = self._process_vikingbot_task if use_vikingbot else self._process_generation_task
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task = {
-                executor.submit(process_fn, task): task 
-                for task in tasks
-            }
-            
-            pbar = tqdm(total=len(tasks), desc="Generating Answers", unit="task")
-            for future in as_completed(future_to_task):
-                task = future_to_task[future]
-                try:
-                    res = future.result()
-                    results_map[res['_global_index']] = res
-                except Exception as e:
-                    self.logger.error(f"Generation failed for task {task['id']}: {e}")
-                    task_errors.append((task['id'], e))
-                pbar.set_postfix(self.monitor.get_status_dict())
-                pbar.update(1)
-            pbar.close()
+        if remaining_tasks:
+            initial_completed = len(completed_tasks)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_task = {
+                    executor.submit(process_fn, task): task
+                    for task in remaining_tasks
+                }
 
-        if task_errors:
-            first_id, first_err = task_errors[0]
-            raise RuntimeError(
-                f"Generation failed for {len(task_errors)} tasks; first failure task_id={first_id}: {type(first_err).__name__}: {first_err}"
-            ) from first_err
+                pbar = tqdm(total=len(tasks), desc="Generating Answers", unit="task", initial=len(completed_tasks))
+                for future in as_completed(future_to_task):
+                    task = future_to_task[future]
+                    try:
+                        res = future.result()
+                        results_map[res['_global_index']] = res
+                        completed_tasks.add(res['_global_index'])
+
+                        newly_completed = len(completed_tasks) - initial_completed
+                        if newly_completed % self.save_frequency == 0 or len(completed_tasks) == len(tasks):
+                            self.checkpoint_manager.update_completed_tasks("generation", completed_tasks, len(tasks))
+                            self._save_partial_results(results_map)
+                    except Exception as e:
+                        self.logger.error(f"Generation failed for task {task['id']}: {e}")
+                        self.monitor.worker_end(success=False)
+                    pbar.set_postfix(self.monitor.get_status_dict())
+                    pbar.update(1)
+                pbar.close()
+        else:
+            self.logger.info("All tasks already completed!")
 
         sorted_results = [results_map[i] for i in sorted(results_map.keys())]
         dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
@@ -132,13 +192,14 @@ class BenchmarkPipeline:
             self._update_report({
                     "Query Efficiency (Average Per Query)": {
                         "Average Retrieval Time (s)": sum(r['retrieval']['latency_sec'] for r in sorted_results) / total,
-                        "Average Input Tokens": sum(r['token_usage']['total_input_tokens'] for r in sorted_results) / total,
-                        "Average Output Tokens": sum(r['token_usage']['llm_output_tokens'] for r in sorted_results) / total,
+                        "Average Input Tokens": sum(self._get_record_input_tokens(r) for r in sorted_results) / total,
+                        "Average Output Tokens": sum(self._get_record_output_tokens(r) for r in sorted_results) / total,
                     }
                 }
             )
         with open(self.generated_file, "w", encoding="utf-8") as f:
             json.dump(save_data, f, indent=2, ensure_ascii=False)
+        self.checkpoint_manager.delete_checkpoint()
 
     def run_evaluation(self):
         """Step 4: Evaluation"""
@@ -152,24 +213,72 @@ class BenchmarkPipeline:
             data = json.load(f)
             items = data.get("results", [])
 
+        # Recompute generation-stage efficiency metrics from generated answers file.
+        # This keeps report consistent even if generation was resumed/partially updated.
+        total_items = len(items)
+        if total_items > 0:
+            avg_latency = sum((i.get("retrieval", {}) or {}).get("latency_sec", 0) for i in items) / total_items
+            avg_in_tokens = (
+                sum(self._get_record_input_tokens(i) for i in items) / total_items
+            )
+            avg_out_tokens = (
+                sum(self._get_record_output_tokens(i) for i in items) / total_items
+            )
+            self._update_report(
+                {
+                    "Query Efficiency (Average Per Query)": {
+                        "Average Retrieval Time (s)": avg_latency,
+                        "Average Input Tokens": avg_in_tokens,
+                        "Average Output Tokens": avg_out_tokens,
+                    }
+                }
+            )
+
         eval_items = items
         eval_results_map = {}
+
+        completed_eval_tasks: Set[int] = set()
+        if self.resume:
+            completed_eval_tasks = self.checkpoint_manager.get_completed_tasks("evaluation")
+            if completed_eval_tasks:
+                self.logger.info(f"Resuming from checkpoint. {len(completed_eval_tasks)} evaluations already completed.")
+                if os.path.exists(self.eval_file):
+                    try:
+                        with open(self.eval_file, "r", encoding="utf-8") as f:
+                            saved_eval_data = json.load(f)
+                        for result in saved_eval_data.get("results", []):
+                            eval_results_map[result["_global_index"]] = result
+                    except Exception as e:
+                        self.logger.warning(f"Failed to load previous eval results, continuing fresh: {e}")
+
+        remaining_eval_items = [item for item in eval_items if item["_global_index"] not in completed_eval_tasks]
+        self.logger.info(f"Total evaluations: {len(eval_items)}, Remaining: {len(remaining_eval_items)}")
         
-        with ThreadPoolExecutor(max_workers=self.config['execution']['max_workers']) as executor:
-            future_to_item = {
-                executor.submit(self._process_evaluation_task, item): item 
-                for item in eval_items
-            }
-            
-            pbar = tqdm(total=len(eval_items), desc="Evaluating", unit="item")
-            for future in as_completed(future_to_item):
-                try:
-                    res = future.result()
-                    eval_results_map[res['_global_index']] = res
-                except Exception as e:
-                    self.logger.error(f"Evaluation failed: {e}")
-                pbar.update(1)
-            pbar.close()
+        if remaining_eval_items:
+            initial_completed_eval = len(completed_eval_tasks)
+            with ThreadPoolExecutor(max_workers=self.config['execution']['max_workers']) as executor:
+                future_to_item = {
+                    executor.submit(self._process_evaluation_task, item): item
+                    for item in remaining_eval_items
+                }
+
+                pbar = tqdm(total=len(eval_items), desc="Evaluating", unit="item", initial=len(completed_eval_tasks))
+                for future in as_completed(future_to_item):
+                    try:
+                        res = future.result()
+                        eval_results_map[res['_global_index']] = res
+                        completed_eval_tasks.add(res['_global_index'])
+
+                        newly_completed_eval = len(completed_eval_tasks) - initial_completed_eval
+                        if newly_completed_eval % self.save_frequency == 0 or len(completed_eval_tasks) == len(eval_items):
+                            self.checkpoint_manager.update_completed_tasks("evaluation", completed_eval_tasks, len(eval_items))
+                            self._save_partial_eval_results(eval_results_map)
+                    except Exception as e:
+                        self.logger.error(f"Evaluation failed: {e}")
+                    pbar.update(1)
+                pbar.close()
+        else:
+            self.logger.info("All evaluations already completed!")
 
         eval_records = list(eval_results_map.values())
         total = len(eval_records)
@@ -188,6 +297,7 @@ class BenchmarkPipeline:
                     "Average Accuracy (normalization)": (sum(r['metrics']['Accuracy'] for r in eval_records) / total)/4,
                 }
             })
+        self.checkpoint_manager.delete_checkpoint()
 
     def run_deletion(self):
         """Step 5: Cleanup"""
@@ -244,9 +354,16 @@ class BenchmarkPipeline:
             tools_used_names = vikingbot_result.get("tools_used_names", [])
             iterations_used = vikingbot_result.get("iterations_used", 0)
 
-            in_tokens = token_usage.get("input_tokens", 0)
-            out_tokens = token_usage.get("output_tokens", 0)
-            self.monitor.worker_end(tokens=in_tokens + out_tokens)
+            # Align with current benchmark: VikingBot reports prompt/completion token usage.
+            # Keep backward compatibility if upstream ever returns input/output keys.
+            prompt_tokens = int(
+                token_usage.get("prompt_tokens", token_usage.get("input_tokens", 0)) or 0
+            )
+            completion_tokens = int(
+                token_usage.get("completion_tokens", token_usage.get("output_tokens", 0)) or 0
+            )
+            total_tokens = int(token_usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+            self.monitor.worker_end(tokens=prompt_tokens + completion_tokens)
 
             self.logger.info(f"[Query-{task['id']}] VikingBot | Iterations: {iterations_used} | Time: {total_time_sec:.1f}s")
 
@@ -264,9 +381,15 @@ class BenchmarkPipeline:
                 },
                 "metrics": {"Recall": 0.0},
                 "token_usage": {
-                    "total_input_tokens": in_tokens,
-                    "llm_output_tokens": out_tokens,
+                    # Keep legacy simple-RAG fields present for schema compatibility,
+                    # but set them to 0 for bot mode to avoid mixing semantics.
+                    "total_input_tokens": 0,
+                    "llm_output_tokens": 0,
                     "retrieval_embedding_tokens": 0,
+                    # VikingBot-native names aligned with vikingbot JSON output.
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
                 },
             }
         except Exception:

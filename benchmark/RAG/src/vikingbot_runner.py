@@ -26,6 +26,7 @@ logger = get_logger()
 _OV_CONF_PATH = str((Path(__file__).parent.parent / "ov.conf").resolve())
 _OPENVIKING_SERVER_PROCESS: Optional[subprocess.Popen] = None
 _CURRENT_OV_CONF_PATH: Optional[str] = None
+_OPENVIKING_SERVER_LOG_FH: Optional[Any] = None
 _SERVER_LOCK = threading.Lock()
 
 
@@ -44,11 +45,13 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str) -> s
     with open(original_conf_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
     
-    # Ensure root_api_key is a string (not null) for Pydantic validation
-    if 'server' not in config:
+    # NOTE: openviking-server rejects empty string root_api_key.
+    # If root_api_key is unset/empty, keep it absent so server can run in dev mode on localhost.
+    if 'server' not in config or config.get('server') is None:
         config['server'] = {}
-    if config['server'].get('root_api_key') is None:
-        config['server']['root_api_key'] = ""
+    if isinstance(config.get('server'), dict):
+        if not config['server'].get('root_api_key'):
+            config['server'].pop('root_api_key', None)
     
     # Update storage workspace to point to vector store
     if 'storage' not in config:
@@ -103,18 +106,25 @@ def _load_server_url_and_key(ov_conf_path: str) -> tuple[str, str]:
 
 
 def _stop_openviking_server() -> None:
-    global _OPENVIKING_SERVER_PROCESS, _CURRENT_OV_CONF_PATH
+    global _OPENVIKING_SERVER_PROCESS, _CURRENT_OV_CONF_PATH, _OPENVIKING_SERVER_LOG_FH
     proc = _OPENVIKING_SERVER_PROCESS
     # Only consider "killing all servers" if this runner started one in this process.
     started_by_us = bool(proc) or bool(_CURRENT_OV_CONF_PATH)
     _OPENVIKING_SERVER_PROCESS = None
     _CURRENT_OV_CONF_PATH = None
+    log_fh = _OPENVIKING_SERVER_LOG_FH
+    _OPENVIKING_SERVER_LOG_FH = None
     if proc and proc.poll() is None:
         proc.terminate()
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
+    if log_fh:
+        try:
+            log_fh.close()
+        except Exception:
+            pass
     
     # Optional safety measure: kill all openviking-server processes.
     #
@@ -148,7 +158,7 @@ atexit.register(_stop_openviking_server)
 
 
 def _ensure_openviking_server(ov_conf_path: str) -> None:
-    global _OPENVIKING_SERVER_PROCESS, _CURRENT_OV_CONF_PATH
+    global _OPENVIKING_SERVER_PROCESS, _CURRENT_OV_CONF_PATH, _OPENVIKING_SERVER_LOG_FH
 
     with _SERVER_LOCK:
         server_url, api_key = _load_server_url_and_key(ov_conf_path)
@@ -172,10 +182,20 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         # 启动新服务器
         env = os.environ.copy()
         env["OPENVIKING_CONFIG_FILE"] = ov_conf_path
+
+        # Persist server stdout/stderr for debugging. Previously it was DEVNULL, which hides root cause.
+        temp_dir = Path(__file__).parent.parent / ".temp"
+        temp_dir.mkdir(exist_ok=True)
+        server_log_path = str(temp_dir / "openviking-server.log")
+        try:
+            _OPENVIKING_SERVER_LOG_FH = open(server_log_path, "a", encoding="utf-8")
+        except Exception:
+            _OPENVIKING_SERVER_LOG_FH = None
+
         _OPENVIKING_SERVER_PROCESS = subprocess.Popen(
             ["openviking-server", "--config", ov_conf_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=_OPENVIKING_SERVER_LOG_FH or subprocess.DEVNULL,
+            stderr=_OPENVIKING_SERVER_LOG_FH or subprocess.DEVNULL,
             env=env,
         )
         _CURRENT_OV_CONF_PATH = ov_conf_path
