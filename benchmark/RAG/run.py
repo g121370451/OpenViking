@@ -1,9 +1,16 @@
 import os
 import sys
 import yaml
-import importlib 
+import importlib
 from argparse import ArgumentParser
 from pathlib import Path
+
+# Load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except ImportError:
+    pass
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -58,7 +65,7 @@ def resolve_path(path_str, base_path):
 
 def main():
     parser = ArgumentParser(description="Run RAG Benchmark (Smart Path Handling)")
-    default_config_path = os.path.join(SCRIPT_DIR, "config/hotpotqa_bot_config_build_links.yaml")
+    default_config_path = os.path.join(SCRIPT_DIR, "config/financebench_bot_config_relations_expansion.yaml ")
     
     parser.add_argument("--config", default=default_config_path, 
                         help=f"Path to config file. Default: {default_config_path}")
@@ -80,6 +87,15 @@ def main():
     except FileNotFoundError as e:
         print(f"[Error] {e}")
         return
+
+    # --- B2. Environment Variable Overrides ---
+    env_max_queries = os.environ.get("RAG_MAX_QUERIES")
+    if env_max_queries is not None:
+        try:
+            config.setdefault('execution', {})['max_queries'] = int(env_max_queries)
+            print(f"[Init] RAG_MAX_QUERIES={env_max_queries} (override from env)")
+        except ValueError:
+            print(f"[Warning] Invalid RAG_MAX_QUERIES value: {env_max_queries}, ignored")
 
     # --- C. Path Resolution ---
     print(f"[Init] Resolving paths relative to Project Root: {PROJECT_ROOT}")
@@ -124,12 +140,7 @@ def main():
             logger.error(f"Class '{class_name}' not found in module '{module_path}'. Please check your config 'adapter.class_name'. Error: {e}")
             raise e
         
-        # 2. Vector Store (only for gen/del steps)
-        vector_store = None
-        if args.step in ["all", "gen", "del"]:
-            vector_store = VikingStoreWrapper(store_path=config['paths']['vector_store'])
-        
-        # 3. LLM Client
+        # 2. LLM Client (created before vector store, may be needed for query expansion)
         llm_client = None
         if args.step in ["all", "gen", "eval"]:
             api_key = os.environ.get(
@@ -139,6 +150,23 @@ def main():
             if not api_key:
                 logger.warning("No API Key found in config or environment variables!")
             llm_client = LLMClientWrapper(config=config['llm'], api_key=api_key)
+
+        # 3. Vector Store (only for gen/del steps)
+        vector_store = None
+        if args.step in ["all", "gen", "del"]:
+            if config.get('execution', {}).get('use_relations', False):
+                from src.core.vector_store_with_relations import VikingStoreWithRelations
+                relations_topk = config['execution'].get('relations_topk', 0)
+                use_query_expansion = config['execution'].get('use_query_expansion', False)
+                vector_store = VikingStoreWithRelations(
+                    store_path=config['paths']['vector_store'],
+                    relations_topk=relations_topk,
+                    use_query_expansion=use_query_expansion,
+                    llm=llm_client if use_query_expansion else None,
+                )
+                logger.info(f"Using VikingStoreWithRelations (relations_topk={relations_topk}, query_expansion={use_query_expansion})")
+            else:
+                vector_store = VikingStoreWrapper(store_path=config['paths']['vector_store'])
 
         # 4. Pipeline
         pipeline = BenchmarkPipeline(

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from pathlib import Path
 import sys
-from typing import Set
+from typing import Set, List
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -45,6 +45,7 @@ class BenchmarkPipeline:
         self.checkpoint_manager = CheckpointManager(self.output_dir, self.config)
         self._file_lock = threading.Lock()
         self.save_frequency = 10
+        self._bot_contexts_cache = None  # lazy-loaded for use_bot_contexts mode
         
         self.metrics_summary = {
             "insertion": {"time": 0, "input_tokens": 0, "output_tokens": 0, "embedding_tokens": 0},
@@ -376,24 +377,50 @@ class BenchmarkPipeline:
     
     def _process_standard_rag_task(self, task, qa):
         t0 = time.time()
-        retrieval_instruction = self.config['execution'].get('retrieval_instruction', '')
-        if retrieval_instruction:
-            enhanced_query = f"{retrieval_instruction} {qa.question}"
-        else:
-            enhanced_query = qa.question
+        use_bot_contexts = self.config['execution'].get('use_bot_contexts', False)
 
-        topk = int(self.config['execution']['retrieval_topk'])
+        # Bot-contexts mode: use saved bot-read documents instead of vector retrieval
+        if use_bot_contexts:
+            if self._bot_contexts_cache is None:
+                with self._file_lock:
+                    if self._bot_contexts_cache is None:  # double-check
+                        self._bot_contexts_cache = self._load_bot_contexts()
+                        self.logger.info(f"Loaded bot contexts cache: {len(self._bot_contexts_cache)} questions")
 
-        # retrieve() now returns a unified dict from both store types
-        ret = self.db.retrieve(query=enhanced_query, topk=topk)
+            bot_ctx = self._bot_contexts_cache.get(qa.question, {})
+            if bot_ctx:
+                retrieved_uris = list(bot_ctx.keys())
+                context_blocks = list(bot_ctx.values())
+                recall_texts = dict(bot_ctx)
+                retrieval_tokens = 0
+                agentic_metadata = None
+                latency = time.time() - t0
+                self.logger.info(f"[Query-{task['id']}] Using {len(bot_ctx)} bot-read contexts")
+            else:
+                self.logger.warning(f"[Query-{task['id']}] No bot contexts found, falling back to retrieval")
+                use_bot_contexts = False  # fall through to normal retrieval
 
-        latency = time.time() - t0
+        # Normal retrieval mode
+        if not use_bot_contexts:
+            retrieval_instruction = self.config['execution'].get('retrieval_instruction', '')
+            if retrieval_instruction:
+                enhanced_query = f"{retrieval_instruction} {qa.question}"
+            else:
+                enhanced_query = qa.question
 
-        recall_texts = ret["recall_texts"]           # {uri: full_content}
-        context_blocks = ret["context_blocks"]       # [truncated, ...]
-        retrieved_uris = ret["retrieved_uris"]       # [uri, ...]
-        retrieval_tokens = ret["retrieval_tokens"]   # int
-        agentic_metadata = ret.get("agentic_metadata")  # None for standard RAG
+            topk = int(self.config['execution']['retrieval_topk'])
+
+            # retrieve() now returns a unified dict from both store types
+            # VikingStoreWithRelations handles query expansion internally
+            ret = self.db.retrieve(query=enhanced_query, topk=topk)
+
+            latency = time.time() - t0
+
+            recall_texts = ret["recall_texts"]           # {uri: full_content}
+            context_blocks = ret["context_blocks"]       # [truncated, ...]
+            retrieved_uris = ret["retrieved_uris"]       # [uri, ...]
+            retrieval_tokens = ret["retrieval_tokens"]   # int
+            agentic_metadata = ret.get("agentic_metadata")  # None for standard RAG
 
         retrieved_texts = list(recall_texts.values())
         recall = MetricsCalculator.check_recall(retrieved_texts, qa.evidence)
@@ -403,8 +430,25 @@ class BenchmarkPipeline:
         ans_raw = self.llm.generate(full_prompt)
         ans = self.adapter.post_process_answer(qa, ans_raw, meta)
 
+        # Generate refusal reason if enabled and answer is a refusal
+        refusal_reason = ""
+        use_refusal_reason = self.config['execution'].get('generate_refusal_reason', False)
+        if use_refusal_reason and MetricsCalculator.check_refusal(ans):
+            reason_prompt = (
+                "Based on the following context, briefly explain in one sentence "
+                "why the question cannot be answered.\n\n"
+                f"CONTEXT:\n{chr(10).join(context_blocks)}\n\n"
+                f"QUESTION: {qa.question}\n\n"
+                f"The system answered: \"{ans}\"\n\n"
+                "Reason why this question cannot be answered from the context:"
+            )
+            refusal_reason = self.llm.generate(reason_prompt).strip()
+
         in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
         out_tokens = self.db.count_tokens(ans)
+        if refusal_reason:
+            in_tokens += self.db.count_tokens(reason_prompt)
+            out_tokens += self.db.count_tokens(refusal_reason)
         self.monitor.worker_end(tokens=in_tokens + out_tokens + retrieval_tokens)
 
         self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Recall: {recall:.2f} | Latency: {latency:.2f}s")
@@ -417,6 +461,30 @@ class BenchmarkPipeline:
             "metrics": {"Recall": recall},
             "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens, "retrieval_embedding_tokens": retrieval_tokens}
         }
+
+        if use_bot_contexts and bot_ctx:
+            result["retrieval"]["mode"] = "bot_contexts"
+            result["retrieval"]["bot_contexts_count"] = len(bot_ctx)
+
+        # Query expansion stats (from VikingStoreWithRelations)
+        if not use_bot_contexts:
+            expanded_queries = ret.get("expanded_queries")
+            if expanded_queries is not None:
+                result["retrieval"]["expanded_queries"] = expanded_queries
+
+        # Relations enhancement stats (from VikingStoreWithRelations)
+        relations_uris = ret.get("relations_uris", []) if not use_bot_contexts else []
+        relations_found = ret.get("relations_found", 0) if not use_bot_contexts else 0
+        relations_added = ret.get("relations_added", 0) if not use_bot_contexts else 0
+        if relations_found > 0:
+            result["retrieval"]["relations_uris"] = relations_uris
+            result["retrieval"]["relations_found"] = relations_found
+            result["retrieval"]["relations_added"] = relations_added
+            self.logger.info(f"[Query-{task['id']}] Relations: found={relations_found}, added={relations_added}")
+
+        if refusal_reason:
+            result["retrieval"]["refusal_reason"] = refusal_reason
+            self.logger.info(f"[Query-{task['id']}] Refusal reason: {refusal_reason[:80]}...")
 
         if agentic_metadata:
             result["agentic_rag"] = {
@@ -502,6 +570,19 @@ class BenchmarkPipeline:
 
         self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Latency: {total_time:.2f}s | Iters: {total_iterations} (retrieval: {retrieval_iterations}) | Mode: Agentic RAG")
 
+        # Save bot-read contexts if configured
+        if self.config['execution'].get('export_bot_contexts', False):
+            tc_for_export = vb_meta_out.get('tool_calls', [])
+            if isinstance(tc_for_export, str):
+                try:
+                    tc_for_export = json.loads(tc_for_export)
+                except json.JSONDecodeError:
+                    tc_for_export = []
+            bot_contexts = self._extract_bot_read_contexts(tc_for_export)
+            if bot_contexts:
+                self._save_bot_contexts(qa.question, bot_contexts)
+                self.logger.info(f"[Query-{task['id']}] Saved {len(bot_contexts)} bot-read contexts")
+
         return {
             "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
             "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
@@ -511,6 +592,54 @@ class BenchmarkPipeline:
             "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens},
             "vikingbot": vb_meta_out
         }
+
+    # ===== Bot context export / standard RAG import =====
+
+    @staticmethod
+    def _extract_bot_read_contexts(tool_calls: list) -> dict:
+        """Parse openviking_multi_read tool calls, return {uri: content}."""
+        import re
+        contexts = {}
+        for tc in tool_calls:
+            if not isinstance(tc, dict) or tc.get("tool_name") != "openviking_multi_read":
+                continue
+            result = tc.get("result", "")
+            if not result:
+                continue
+            # Parse: --- START OF {uri} ---\n{content}\n--- END OF {uri} ---
+            pattern = r'--- START OF (viking://\S+) ---\n(.*?)\n--- END OF \1 ---'
+            for match in re.finditer(pattern, result, re.DOTALL):
+                uri = match.group(1)
+                content = match.group(2).strip()
+                if content and not content.startswith("ERROR"):
+                    contexts[uri] = content
+        return contexts
+
+    def _save_bot_contexts(self, question: str, contexts: dict):
+        """Append one question's bot-read contexts to JSONL file."""
+        bot_contexts_file = os.path.join(self.output_dir, "bot_read_contexts.jsonl")
+        record = {"question": question, "contexts": contexts}
+        with self._file_lock:
+            with open(bot_contexts_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _load_bot_contexts(self) -> dict:
+        """Load bot_read_contexts.jsonl into {question: {uri: content}}."""
+        bot_contexts_file = os.path.join(self.output_dir, "bot_read_contexts.jsonl")
+        if not os.path.exists(bot_contexts_file):
+            return {}
+        mapping = {}
+        with open(bot_contexts_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    mapping[rec["question"]] = rec.get("contexts", {})
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        return mapping
 
     def _process_evaluation_task(self, item):
         """

@@ -68,3 +68,4 @@ llm:
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   # API key (keep this secure, do not commit to code repositories)
   api_key: ""
+  api_key_env_var: "VOLCENGINE_API_KEY"

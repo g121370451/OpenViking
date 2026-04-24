@@ -570,7 +570,14 @@ Question: {question}"""
                 iterations_used = int(resp_json.get("iteration", 0))
                 tools_used = resp_json.get("tools_used", [])
                 tool_calls = _clean_tool_calls(tools_used)
-            
+
+                if iterations_used > 0 and not tool_calls:
+                    logger.warning(
+                        f"[ParseWarning] iterations_used={iterations_used} but tool_calls is empty. "
+                        f"tools_used raw type={type(tools_used).__name__}, "
+                        f"value={str(tools_used)[:300]}"
+                    )
+
             result_dict = {
                 "answer": answer,
                 "total_time_sec": total_time,

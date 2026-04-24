@@ -35,6 +35,15 @@ def _shutdown_loop():
     """Shutdown the shared loop on process exit."""
     global _loop, _loop_thread
     if _loop is not None and not _loop.is_closed() and _loop_thread is not None:
+        # Cancel all pending tasks before closing to avoid
+        # "Task was destroyed but it is pending!" warnings
+        pending = asyncio.all_tasks(_loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            _loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
         _loop.call_soon_threadsafe(_loop.stop)
         _loop_thread.join(timeout=5)
         _loop.close()

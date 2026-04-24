@@ -1,0 +1,40 @@
+project_name: "RAG_Benchmark"
+
+# ===========Modify Configuration================
+dataset_name: "Locomo"
+
+adapter:
+  module: "src.adapters.locomo_adapter"
+  class_name: "LocomoAdapter"
+
+execution:
+  max_workers: 10
+  ingest_workers: 8
+  retrieval_topk: 1
+  max_queries: 50
+  skip_ingestion: true
+  ingest_mode: "directory"
+  retrieval_instruction: ""
+  use_vikingbot: true
+  export_bot_contexts: true
+# ==================================
+
+# ===========VikingBot Configuration============
+vikingbot:
+  max_iterations: 50
+  log_tool_calls: true
+  enable_linking: false
+
+paths:
+  dataset_path: "datasets/{dataset_name}/locomo10.json"
+  doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
+  output_dir: "Output/{dataset_name}/experiment_bot_contexts"
+  log_file: "Output/{dataset_name}/experiment_bot_contexts/benchmark.log"
+
+llm:
+  model: "doubao-seed-1-8-251228"
+  temperature: 0
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: ""
+  api_key_env_var: "VOLCENGINE_API_KEY"
