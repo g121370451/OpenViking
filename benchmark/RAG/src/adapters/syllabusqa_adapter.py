@@ -331,7 +331,7 @@ class SyllabusQAAdapter(BaseAdapter):
                             evidence.append(step.strip())
                 
                 # Format question
-                formatted_question = question
+                formatted_question = f'Based on the syllabus "{syllabus_name}", {question}'
                 
                 qa_pairs.append(StandardQA(
                     question=formatted_question,
@@ -412,7 +412,7 @@ class SyllabusQAAdapter(BaseAdapter):
                             evidence.append(step.strip())
                 
                 # Format question
-                formatted_question = question
+                formatted_question = f'Based on the syllabus "{syllabus_name}", {question}'
                 
                 qa_pairs.append(StandardQA(
                     question=formatted_question,

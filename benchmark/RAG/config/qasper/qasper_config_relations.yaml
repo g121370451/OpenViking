@@ -10,7 +10,7 @@ adapter:
 execution:
   max_workers: 10
   ingest_workers: 8
-  retrieval_topk: 1
+  retrieval_topk: 5
   max_queries: 10
   skip_ingestion: true
   ingest_mode: "directory"
@@ -18,6 +18,7 @@ execution:
   use_vikingbot: false
   use_relations: true
   relations_topk: 0
+  generate_refusal_reason: true
 # ==================================
 
 paths:
@@ -31,5 +32,8 @@ llm:
   model: "doubao-seed-1-8-251228"
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
-  api_key: ""
-  api_key_env_var: "VOLCENGINE_API_KEY"
+  api_key: "${VOLCENGINE_API_KEY}"
+embedding:
+  model: "doubao-embedding-vision-250615"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"

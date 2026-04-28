@@ -136,10 +136,10 @@ class VikingSearchTool(OVFileTool):
             else:
                 output = str(results)
 
-            # Relations enhancement: append related docs based on filter_mode (independent of enable_linking)
-            filter_mode = os.environ.get("VIKINGBOT_RELATION_FILTER_MODE", "none")
+            # Relations enhancement: append related docs (keyword + vector dual matching)
             relations_count = 0
-            if filter_mode != "none" and resources_list:
+            use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
+            if use_relations and resources_list:
                 try:
                     seen_uris = set()
                     for r in resources_list:
@@ -157,11 +157,6 @@ class VikingSearchTool(OVFileTool):
                                 raw_rels.append(rel)
                         except Exception:
                             continue
-
-                    # relations() 已通过 query 精确匹配，不需要额外 keyword 过滤
-                    # if filter_mode == "keyword" and raw_rels:
-                    #     from vikingbot.agent.tools.relation_utils import filter_relations_by_keyword
-                    #     raw_rels = filter_relations_by_keyword(raw_rels, query)
 
                     related_items = []
                     for rel in raw_rels:

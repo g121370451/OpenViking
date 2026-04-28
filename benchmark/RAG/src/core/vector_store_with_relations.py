@@ -5,18 +5,64 @@ from typing import Dict, List
 
 from src.core.vector_store import VikingStoreWrapper
 
+# --- Relation matching utilities (inlined) ---
+
+_ENGLISH_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "it", "as", "be", "was", "were",
+    "been", "are", "am", "do", "did", "does", "has", "had", "have", "will",
+    "would", "could", "should", "may", "might", "shall", "can", "not", "no",
+    "nor", "so", "if", "then", "than", "that", "this", "these", "those",
+    "what", "which", "who", "whom", "how", "when", "where", "why",
+    "all", "each", "every", "both", "few", "more", "most", "other", "some",
+    "such", "only", "own", "same", "too", "very", "just", "about", "above",
+    "after", "again", "also", "any", "because", "before", "below", "between",
+    "during", "into", "its", "out", "over", "through", "under", "until",
+    "up", "down", "here", "there", "once", "further", "her", "his", "she",
+    "he", "him", "his", "her", "hers", "its", "they", "them", "their",
+    "theirs", "our", "ours", "your", "yours", "we", "you", "me", "my",
+    "myself", "yourself", "himself", "herself", "itself", "themselves",
+    "ourselves", "yourselves", "being", "having", "doing",
+})
+
+
+def _extract_keywords(text: str) -> set:
+    """Extract keywords from text via tokenize + stopword filtering."""
+    if not text:
+        return set()
+    tokens = text.lower().split()
+    result = set()
+    for t in tokens:
+        t = t.strip(".,;:!?\"'()[]{}—–-")
+        if len(t) <= 2 or t in _ENGLISH_STOPWORDS:
+            continue
+        result.add(t)
+    return result
+
+
+def _cosine_similarity(a: list, b: list) -> float:
+    """Compute cosine similarity between two vectors. Returns 0.0 on error."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
 
 class VikingStoreWithRelations(VikingStoreWrapper):
     """Standard RAG vector store enhanced with .relations.jsonl edges.
 
     Inherits VikingStoreWrapper and overrides retrieve():
     1. Vector search (via parent class)
-    2. For each result, query .relations.jsonl for related URIs
+    2. For each result, query .relations.jsonl for related URIs (keyword + vector)
     3. Read and append related documents to context
     """
 
     def __init__(self, store_path: str, relations_topk: int = 0,
-                 use_query_expansion: bool = False, llm=None):
+                 use_query_expansion: bool = False, llm=None, embedder=None):
         super().__init__(store_path)
         # 0 = unlimited, >0 = max additional docs from relations
         self.relations_topk = relations_topk
@@ -25,6 +71,7 @@ class VikingStoreWithRelations(VikingStoreWrapper):
         # Query expansion: LLM reformulates original question into multiple queries
         self.use_query_expansion = use_query_expansion
         self._llm = llm  # LLMClientWrapper instance, required if use_query_expansion
+        self._embedder = embedder  # VolcengineEmbedder instance, for vector matching
 
     def _uri_to_parent_path(self, uri: str) -> str:
         """viking://resources/dataset/file.md -> {vikingfs_path}/resources/dataset"""
@@ -37,12 +84,29 @@ class VikingStoreWithRelations(VikingStoreWrapper):
             return local_path
         return os.path.dirname(local_path)
 
+    def _embed_text(self, text: str):
+        """Generate embedding via embedder. Returns list of floats or None."""
+        if not self._embedder or not text:
+            return None
+        try:
+            return self._embedder.embed(text)
+        except Exception as e:
+            print(f"[Warning] Embedding failed: {e}")
+            return None
+
     def _query_relations(self, uri: str, query: str) -> List[str]:
-        """Read .relations.jsonl from uri's parent dir, bidirectional match."""
+        """Read .relations.jsonl from uri's parent dir, keyword + vector dual matching."""
         parent_dir = self._uri_to_parent_path(uri)
         jsonl_path = os.path.join(parent_dir, ".relations.jsonl")
         if not os.path.exists(jsonl_path):
             return []
+
+        # Pre-compute query embedding and keywords
+        query_embedding = None
+        query_keywords = set()
+        if query:
+            query_keywords = _extract_keywords(query)
+            query_embedding = self._embed_text(query)
 
         results = []
         seen = set()
@@ -56,23 +120,45 @@ class VikingStoreWithRelations(VikingStoreWrapper):
                 except json.JSONDecodeError:
                     continue
 
-                rec_query = rec.get("query_question", "")
-                if query and rec_query != query:
-                    continue
-
                 uri1 = rec.get("uri1", "")
                 uri2 = rec.get("uri2", "")
                 if uri1 == uri2:
                     continue
 
-                if uri1 == uri:
-                    target = uri2
-                elif uri2 == uri:
-                    target = uri1
-                else:
+                if uri1 != uri and uri2 != uri:
                     continue
 
-                if target not in seen:
+                target = uri2 if uri1 == uri else uri1
+                if target in seen:
+                    continue
+
+                rec_query = rec.get("query_question", "")
+
+                # No query context → accept all edges
+                if not query:
+                    seen.add(target)
+                    results.append(target)
+                    continue
+
+                # Path 1: Keyword matching (coverage check)
+                kw_matched = False
+                if query_keywords:
+                    rec_keywords = _extract_keywords(rec.get("query_question", ""))
+                    if rec_keywords:
+                        overlap = len(query_keywords & rec_keywords)
+                        if overlap / len(query_keywords) > 0.7:
+                            kw_matched = True
+
+                # Path 2: Vector matching (always executes independently)
+                vec_matched = False
+                if query_embedding:
+                    rec_embedding = rec.get("query_embedding")
+                    if rec_embedding:
+                        sim = _cosine_similarity(query_embedding, rec_embedding)
+                        if sim > 0.7:
+                            vec_matched = True
+
+                if kw_matched or vec_matched:
                     seen.add(target)
                     results.append(target)
 

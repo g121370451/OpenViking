@@ -14,6 +14,91 @@ from vikingbot.openviking_mount.user_apikey_manager import UserApiKeyManager
 
 viking_resource_prefix = "viking://resources/"
 
+# --- Relation matching utilities (inlined from deleted relation_utils.py) ---
+
+_ENGLISH_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "it", "as", "be", "was", "were",
+    "been", "are", "am", "do", "did", "does", "has", "had", "have", "will",
+    "would", "could", "should", "may", "might", "shall", "can", "not", "no",
+    "nor", "so", "if", "then", "than", "that", "this", "these", "those",
+    "what", "which", "who", "whom", "how", "when", "where", "why",
+    "all", "each", "every", "both", "few", "more", "most", "other", "some",
+    "such", "only", "own", "same", "too", "very", "just", "about", "above",
+    "after", "again", "also", "any", "because", "before", "below", "between",
+    "during", "into", "its", "out", "over", "through", "under", "until",
+    "up", "down", "here", "there", "once", "further", "her", "his", "she",
+    "he", "him", "his", "her", "hers", "its", "they", "them", "their",
+    "theirs", "our", "ours", "your", "yours", "we", "you", "me", "my",
+    "myself", "yourself", "himself", "herself", "itself", "themselves",
+    "ourselves", "yourselves", "being", "having", "doing",
+})
+
+
+def _extract_keywords(text: str) -> set:
+    """Extract keywords from text via tokenize + stopword filtering."""
+    if not text:
+        return set()
+    tokens = text.lower().split()
+    result = set()
+    for t in tokens:
+        t = t.strip(".,;:!?\"'()[]{}—–-")
+        if len(t) <= 2 or t in _ENGLISH_STOPWORDS:
+            continue
+        result.add(t)
+    return result
+
+
+def _cosine_similarity(a: list, b: list) -> float:
+    """Compute cosine similarity between two vectors. Returns 0.0 on error."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+# Module-level embedder cache for VikingClient
+_embedder_cache = None
+_embedder_tried = False
+
+
+def _get_embedder():
+    """Lazily initialize Volcengine embedder from environment variables."""
+    global _embedder_cache, _embedder_tried
+    if _embedder_tried:
+        return _embedder_cache
+    _embedder_tried = True
+
+    api_key = os.environ.get("VIKINGBOT_EMBEDDING_API_KEY", "")
+    logger.error(f"ov env is {os.environ}")
+    if not api_key:
+        logger.error("[VikingClient] Embedder not configured (VIKINGBOT_EMBEDDING_API_KEY not set)")
+        return None
+    try:
+        from volcenginesdkarkruntime import Ark
+        model = os.environ.get("VIKINGBOT_EMBEDDING_MODEL", "doubao-embedding-vision-250615")
+        base_url = os.environ.get("VIKINGBOT_EMBEDDING_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+        client = Ark(api_key=api_key, base_url=base_url)
+
+        class _Embedder:
+            def embed(self, text: str) -> list:
+                resp = client.multimodal_embeddings.create(
+                    input=[{"type": "text", "text": text}], model=model
+                )
+                return resp.data.embedding
+
+        _embedder_cache = _Embedder()
+        logger.info(f"[VikingClient] Embedder initialized: model={model}")
+    except Exception as e:
+        logger.error(f"[VikingClient] Failed to initialize embedder: {e}")
+        _embedder_cache = None
+
+    return _embedder_cache
+
 
 class VikingClient:
     def __init__(self, agent_id: Optional[str] = None):
@@ -366,7 +451,7 @@ class VikingClient:
             return local_path
         return os.path.dirname(local_path)
 
-    def _append_relation(self, uri1: str, uri2: str, query: str) -> None:
+    def _append_relation(self, uri1: str, uri2: str, query: str, reason: str = "") -> None:
         """在 uri1 父目录的 .relations.jsonl 中追加一条记录（去重）"""
         if not query:
             logger.warning(f"[Link] Skipped: empty query for {uri1} -> {uri2}")
@@ -394,7 +479,18 @@ class VikingClient:
             logger.debug(f"[Link] Duplicate skipped: {uri1} -> {uri2} (query={query[:50]})")
             return
 
-        record = {"uri1": uri1, "uri2": uri2, "query_question": query}
+        # Generate embedding for the query
+        query_embedding = None
+        embedder = _get_embedder()
+        if embedder and query:
+            try:
+                query_embedding = embedder.embed(query)
+            except Exception as e:
+                logger.warning(f"[Link] Embedding failed for query: {e}")
+
+        record = {"uri1": uri1, "uri2": uri2, "query_question": query, "reason": reason}
+        if query_embedding:
+            record["query_embedding"] = query_embedding
         with open(jsonl_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         logger.info(f"[Link] Written to {jsonl_path}: {uri1} -> {uri2}")
@@ -409,18 +505,30 @@ class VikingClient:
                 continue
             try:
                 # 在 from_uri 的父目录写入正向记录
-                self._append_relation(from_uri, to_uri, query)
+                self._append_relation(from_uri, to_uri, query, reason)
                 # 在 to_uri 的父目录写入反向记录（支持双向查询）
-                self._append_relation(to_uri, from_uri, query)
+                self._append_relation(to_uri, from_uri, query, reason)
             except Exception as e:
                 logger.error(f"[Link] Failed to write relation {from_uri} <-> {to_uri}: {e}")
 
     async def relations(self, uri: str, query: str = "") -> List:
-        """基于 .relations.jsonl 的自定义查询实现（双向匹配）"""
+        """基于 .relations.jsonl 的自定义查询实现（关键词 + 向量双路匹配）"""
         parent_dir = self._uri_to_parent_path(uri)
         jsonl_path = os.path.join(parent_dir, ".relations.jsonl")
         if not os.path.exists(jsonl_path):
             return []
+
+        # Pre-compute query embedding and keywords for matching
+        query_embedding = None
+        query_keywords = set()
+        if query:
+            query_keywords = _extract_keywords(query)
+            embedder = _get_embedder()
+            if embedder:
+                try:
+                    query_embedding = embedder.embed(query)
+                except Exception as e:
+                    logger.warning(f"[Relations] Embedding failed for query: {e}")
 
         results = []
         seen = set()
@@ -434,23 +542,45 @@ class VikingClient:
                 except json.JSONDecodeError:
                     continue
 
-                rec_query = rec.get("query_question", "")
-                if query and rec_query != query:
-                    continue
-
                 uri1 = rec.get("uri1", "")
                 uri2 = rec.get("uri2", "")
                 if uri1 == uri2:
                     continue
 
-                if uri1 == uri:
-                    target = uri2
-                elif uri2 == uri:
-                    target = uri1
-                else:
+                if uri1 != uri and uri2 != uri:
                     continue
 
-                if target not in seen:
+                target = uri2 if uri1 == uri else uri1
+                if target in seen:
+                    continue
+
+                rec_query = rec.get("query_question", "")
+
+                # Skip if no query context at all
+                if not query:
+                    seen.add(target)
+                    results.append({"uri": target, "reason": rec_query})
+                    continue
+
+                # Path 1: Keyword matching (coverage check)
+                kw_matched = False
+                if query_keywords:
+                    rec_keywords = _extract_keywords(rec.get("query_question", ""))
+                    if rec_keywords:
+                        overlap = len(query_keywords & rec_keywords)
+                        if overlap / len(query_keywords) > 0.7:
+                            kw_matched = True
+
+                # Path 2: Vector matching (always executes independently)
+                vec_matched = False
+                if query_embedding:
+                    rec_embedding = rec.get("query_embedding")
+                    if rec_embedding:
+                        sim = _cosine_similarity(query_embedding, rec_embedding)
+                        if sim > 0.7:
+                            vec_matched = True
+
+                if kw_matched or vec_matched:
                     seen.add(target)
                     results.append({"uri": target, "reason": rec_query})
 

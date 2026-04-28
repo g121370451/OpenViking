@@ -100,12 +100,47 @@ def _load_server_url_and_key(ov_conf_path: str) -> tuple[str, str]:
     host = server.get("host", "127.0.0.1")
     port = server.get("port", 1933)
     api_key = server.get("root_api_key", "") or ""
+    logger.info(f"port is http://{host}:{port}, {api_key}")
     return f"http://{host}:{port}", api_key
+
+
+
+def _kill_process_on_port(port: int) -> None:
+    """Kill any process listening on the given port (cross-platform)."""
+    try:
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=10
+            )
+            for line in result.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.strip().split()
+                    pid = parts[-1]
+                    if pid.isdigit() and pid != "0":
+                        logger.info(f"[StopServer] Killing process on port {port} (PID={pid})")
+                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=10)
+        else:
+            result = subprocess.run(
+                ["lsof", "-ti", f":{port}"], capture_output=True, text=True, timeout=10
+            )
+            for pid in result.stdout.strip().split():
+                if pid.isdigit():
+                    logger.info(f"[StopServer] Killing process on port {port} (PID={pid})")
+                    try:
+                        os.kill(int(pid), 9)
+                    except OSError:
+                        pass
+    except Exception as e:
+        logger.debug(f"[StopServer] Port cleanup failed for port {port}: {e}")
 
 
 def _stop_openviking_server() -> None:
     global _OPENVIKING_SERVER_PROCESS, _CURRENT_OV_CONF_PATH
     proc = _OPENVIKING_SERVER_PROCESS
+
+    # 保存 conf path 用于清理端口
+    conf_path = _CURRENT_OV_CONF_PATH
+
     _OPENVIKING_SERVER_PROCESS = None
     _CURRENT_OV_CONF_PATH = None
     if proc and proc.poll() is None:
@@ -118,8 +153,8 @@ def _stop_openviking_server() -> None:
             proc.kill()
     else:
         logger.debug(f"[StopServer] No running server to stop (proc={proc}, alive={proc.poll() is not None if proc else 'N/A'})")
-    
-    # 额外的安全措施：杀死所有 openviking-server 进程
+
+    # 额外的安全措施1：杀死所有 openviking-server 进程（仅 Linux/macOS）
     try:
         if sys.platform == "darwin" or sys.platform.startswith("linux"):
             # 使用 pgrep 和 pkill 在 macOS 和 Linux 上
@@ -134,6 +169,17 @@ def _stop_openviking_server() -> None:
                 time.sleep(1)
     except Exception as e:
         logger.debug(f"Failed to kill all openviking-server processes: {e}")
+
+    # 额外的安全措施2：基于端口杀残留进程（跨平台兜底）
+    try:
+        port = None
+        if conf_path and os.path.exists(conf_path):
+            with open(conf_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            port = data.get("server", {}).get("port", 1933)
+        _kill_process_on_port(port or 1933)
+    except Exception as e:
+        logger.debug(f"[StopServer] Port-based cleanup failed: {e}")
 
 
 def _ensure_openviking_server(ov_conf_path: str) -> None:
@@ -158,6 +204,11 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         # 等待旧进程释放端口
         time.sleep(2)
 
+        # 强制清理端口（兜底：杀死残留的openviking-server进程）
+        _, port = server_url.rsplit(":", 1)
+        _kill_process_on_port(int(port))
+        time.sleep(1)
+
         # 确认端口已释放
         for _ in range(10):
             if not _healthcheck(health_url):
@@ -176,13 +227,13 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         _CURRENT_OV_CONF_PATH = ov_conf_path
 
         # 等待服务器健康
-        deadline = time.time() + 20
+        deadline = time.time() + 40
         while time.time() < deadline:
             if _OPENVIKING_SERVER_PROCESS.poll() is not None:
                 raise RuntimeError("openviking-server exited unexpectedly")
             if _healthcheck(health_url):
                 return
-            time.sleep(0.3)
+            time.sleep(1)
 
         raise RuntimeError("openviking-server did not become healthy in time")
 
@@ -427,7 +478,7 @@ def _extract_json_payload(output: str) -> Optional[dict]:
     return None
 
 
-def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, relation_filter_mode: str = "none") -> dict[str, str]:
+def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, use_relations: bool = False, embedding_config: dict = None) -> dict[str, str]:
     env = os.environ.copy()
     env["OPENVIKING_CONFIG_FILE"] = ov_conf_path
     env["NANOBOT_AGENTS__MAX_TOOL_ITERATIONS"] = str(int(max_iterations))
@@ -438,7 +489,13 @@ def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking:
 
     # Control whether link/relations tools are registered
     env["VIKINGBOT_ENABLE_LINKING"] = "1" if enable_linking else "0"
-    env["VIKINGBOT_RELATION_FILTER_MODE"] = relation_filter_mode
+    env["VIKINGBOT_USE_RELATIONS"] = "1" if use_relations else "0"
+
+    # Embedding config for relations vector matching
+    if embedding_config:
+        env["VIKINGBOT_EMBEDDING_MODEL"] = embedding_config.get("model", "doubao-embedding-vision-250615")
+        env["VIKINGBOT_EMBEDDING_BASE_URL"] = embedding_config.get("base_url", "https://ark.cn-beijing.volces.com/api/v3")
+        env["VIKINGBOT_EMBEDDING_API_KEY"] = embedding_config.get("api_key", "")
     
     # 设置 ovcli.conf 的路径，和原始 ov.conf 在同一个目录（不是临时文件的目录）
     original_ov_conf_dir = os.path.dirname(_OV_CONF_PATH)
@@ -481,7 +538,8 @@ class VikingBotRunner:
         self.max_iterations = self.vikingbot_config.get('max_iterations', 10)
         self.log_tool_calls = self.vikingbot_config.get('log_tool_calls', True)
         self.enable_linking = self.vikingbot_config.get('enable_linking', False)
-        self.relation_filter_mode = self.vikingbot_config.get('relation_filter_mode', 'none')
+        self.use_relations = self.vikingbot_config.get('use_relations', False)
+        self.embedding_config = config.get('embedding', {})
         # Get vector store path from config if available
         self.vector_store_path = config.get('paths', {}).get('vector_store')
     
@@ -530,7 +588,7 @@ Question: {question}"""
 {batch_read_hint}
 
 Question: {question}"""
-            env = _build_vikingbot_env(ov_conf_path, self.max_iterations, self.enable_linking, self.relation_filter_mode)
+            env = _build_vikingbot_env(ov_conf_path, self.max_iterations, self.enable_linking, self.use_relations, self.embedding_config)
 
             # Use CLI mode only for thread safety in multi-threaded environments
             cmd = ["vikingbot", "chat", "-m", input_msg, "-s", session_id, "-e", "-c", ov_conf_path]

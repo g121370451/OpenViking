@@ -23,18 +23,21 @@ vikingbot:
   max_iterations: 50
   log_tool_calls: true
   enable_linking: false
-  relation_filter_mode: "vector"
+  use_relations: true
 paths:
   dataset_path: "datasets/{dataset_name}/clapnq_dev_answerable.jsonl"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
   vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_link_vector"
-  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}/benchmark_link_vector.log"
+  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_relations"
+  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}/benchmark_relations.log"
 
 
 llm:
   model: "doubao-seed-1-8-251228"
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
-  api_key: ""
-  api_key_env_var: "VOLCENGINE_API_KEY"
+  api_key: "${VOLCENGINE_API_KEY}"
+embedding:
+  model: "doubao-embedding-vision-250615"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"

@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import yaml
 import importlib
@@ -48,6 +49,23 @@ def load_config(config_path):
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
+def resolve_env_vars(obj):
+    """递归替换配置中的 ${VAR} 引用为环境变量值"""
+    if isinstance(obj, str):
+        def _replace(match):
+            var_name = match.group(1)
+            value = os.environ.get(var_name)
+            if value is None:
+                raise ValueError(f"环境变量 {var_name} 未设置，请检查 .env 文件")
+            return value
+        return re.sub(r'\$\{(\w+)\}', _replace, obj)
+    elif isinstance(obj, dict):
+        return {k: resolve_env_vars(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [resolve_env_vars(item) for item in obj]
+    return obj
+
+
 def resolve_path(path_str, base_path):
     """
     Convert relative path to absolute path based on base_path.
@@ -65,7 +83,7 @@ def resolve_path(path_str, base_path):
 
 def main():
     parser = ArgumentParser(description="Run RAG Benchmark (Smart Path Handling)")
-    default_config_path = os.path.join(SCRIPT_DIR, "config/financebench_bot_config_relations_expansion.yaml ")
+    default_config_path = os.path.join(SCRIPT_DIR, "config/locomo/locomo_bot_config_build_links.yaml")
     
     parser.add_argument("--config", default=default_config_path, 
                         help=f"Path to config file. Default: {default_config_path}")
@@ -87,6 +105,8 @@ def main():
     except FileNotFoundError as e:
         print(f"[Error] {e}")
         return
+
+    config = resolve_env_vars(config)
 
     # --- B2. Environment Variable Overrides ---
     env_max_queries = os.environ.get("RAG_MAX_QUERIES")
@@ -143,10 +163,7 @@ def main():
         # 2. LLM Client (created before vector store, may be needed for query expansion)
         llm_client = None
         if args.step in ["all", "gen", "eval"]:
-            api_key = os.environ.get(
-                config['llm'].get('api_key_env_var', ''), 
-                config['llm'].get('api_key')
-            )
+            api_key = config['llm'].get('api_key', '')
             if not api_key:
                 logger.warning("No API Key found in config or environment variables!")
             llm_client = LLMClientWrapper(config=config['llm'], api_key=api_key)
@@ -158,11 +175,28 @@ def main():
                 from src.core.vector_store_with_relations import VikingStoreWithRelations
                 relations_topk = config['execution'].get('relations_topk', 0)
                 use_query_expansion = config['execution'].get('use_query_expansion', False)
+
+                # Initialize embedder for vector matching in relations
+                embedder = None
+                embedding_cfg = config.get('embedding', {})
+                emb_api_key = embedding_cfg.get('api_key', '')
+                if emb_api_key:
+                    from src.core.embedder import VolcengineEmbedder
+                    embedder = VolcengineEmbedder(
+                        api_key=emb_api_key,
+                        base_url=embedding_cfg.get('base_url', 'https://ark.cn-beijing.volces.com/api/v3'),
+                        model=embedding_cfg.get('model', 'doubao-embedding-vision-250615'),
+                    )
+                    logger.info(f"Embedder initialized (model={embedding_cfg.get('model', 'doubao-embedding-vision-250615')})")
+                else:
+                    logger.warning("No embedding API key found, vector matching in relations will be disabled")
+
                 vector_store = VikingStoreWithRelations(
                     store_path=config['paths']['vector_store'],
                     relations_topk=relations_topk,
                     use_query_expansion=use_query_expansion,
                     llm=llm_client if use_query_expansion else None,
+                    embedder=embedder,
                 )
                 logger.info(f"Using VikingStoreWithRelations (relations_topk={relations_topk}, query_expansion={use_query_expansion})")
             else:

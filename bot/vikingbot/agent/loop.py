@@ -602,29 +602,10 @@ class AgentLoop:
         original_question: str,
         session_key: "SessionKey",
     ) -> None:
-        """Build relations between documents read in different iterations."""
+        """Build relations between documents read in different iterations (blind cross-product)."""
         try:
             read_tools = {"openviking_multi_read", "openviking_read"}
             logger.info(f"[PostAnswerLink] origin query is {original_question}")
-            # Use original_question directly (extracted from messages in _run_agent_loop)
-            link_query = original_question
-
-            # Backup: collect all search queries for richer keywords (commented out)
-            # search_queries = []
-            # for tool in tools_used:
-            #     if tool.get("tool_name") == "openviking_search":
-            #         args = tool.get("args", "")
-            #         if isinstance(args, dict):
-            #             q = args.get("query", "")
-            #         elif isinstance(args, str):
-            #             import re as _re2
-            #             m = _re2.search(r'"query"\s*:\s*"([^"]*)"', args)
-            #             q = m.group(1) if m else ""
-            #         else:
-            #             q = ""
-            #         if q:
-            #             search_queries.append(q)
-            # link_query = " ".join(search_queries) if search_queries else original_question
 
             # Collect all unique URIs from read tool calls
             all_uris = []
@@ -661,14 +642,13 @@ class AgentLoop:
                     linked.add(pair)
                     try:
                         logger.info(f"[PostAnswerLink] Linking: {u1} <-> {u2}")
-                        await client.link(u1, [u2], reason="co-referenced", query=link_query)
+                        await client.link(u1, [u2], reason="co-referenced", query=original_question)
                     except Exception as e:
                         logger.warning(f"[PostAnswerLink] Link failed: {e}")
 
             if linked:
                 logger.info(f"[PostAnswerLink] Created {len(linked)} relation(s)")
         except Exception as e:
-            # logger.error(f"[PostAnswerLink] Failed: {e}")
             logger.warning(f"Post-answer linking failed: {e}")
 
     @staticmethod

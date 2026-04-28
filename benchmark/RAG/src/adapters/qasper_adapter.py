@@ -171,7 +171,7 @@ class QasperAdapter(BaseAdapter):
                 raw_question = qa_item.get("question", "")
                 question_id = qa_item.get("question_id", "")
                 # Append paper title to question for easier retrieval
-                question = raw_question
+                question = f'Based on the paper "{paper_title}", {raw_question}'
                 
                 gold_answers = []
                 evidence_list = []

@@ -13,10 +13,11 @@ execution:
   ingest_workers: 8
   retrieval_topk: 5
   max_queries: null
-  skip_ingestion: false
+  skip_ingestion: true
   ingest_mode: "directory"
-  retrieval_instruction: ""  
-# ==================================  
+  retrieval_instruction: ""
+  generate_refusal_reason: true
+# ==================================
 
 paths:
   dataset_path: "datasets/{dataset_name}/hotpot_qa_100.json"
@@ -30,5 +31,4 @@ llm:
   model: "doubao-seed-1-8-251228"
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
-  api_key: ""
-  api_key_env_var: "VOLCENGINE_API_KEY"
+  api_key: "${VOLCENGINE_API_KEY}"
