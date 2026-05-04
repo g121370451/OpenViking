@@ -19,6 +19,7 @@ execution:
   use_relations: true
   relations_topk: 0
   generate_refusal_reason: true
+  link_strategy: blind
 # ==================================
 
 paths:

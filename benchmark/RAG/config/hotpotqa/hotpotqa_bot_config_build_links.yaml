@@ -25,6 +25,7 @@ vikingbot:
   max_iterations: 50
   log_tool_calls: true
   enable_linking: true
+  link_strategy: blind
 paths:
   dataset_path: "datasets/{dataset_name}/hotpot_qa_100.json"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"

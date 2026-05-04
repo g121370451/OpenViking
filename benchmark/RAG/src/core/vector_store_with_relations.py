@@ -53,16 +53,17 @@ def _cosine_similarity(a: list, b: list) -> float:
 
 
 class VikingStoreWithRelations(VikingStoreWrapper):
-    """Standard RAG vector store enhanced with .relations.jsonl edges.
+    """Standard RAG vector store enhanced with .relations_{strategy}.jsonl edges.
 
     Inherits VikingStoreWrapper and overrides retrieve():
     1. Vector search (via parent class)
-    2. For each result, query .relations.jsonl for related URIs (keyword + vector)
+    2. For each result, query .relations_{strategy}.jsonl for related URIs (keyword + vector)
     3. Read and append related documents to context
     """
 
     def __init__(self, store_path: str, relations_topk: int = 0,
-                 use_query_expansion: bool = False, llm=None, embedder=None):
+                 use_query_expansion: bool = False, llm=None, embedder=None,
+                 strategy: str = "blind"):
         super().__init__(store_path)
         # 0 = unlimited, >0 = max additional docs from relations
         self.relations_topk = relations_topk
@@ -72,6 +73,9 @@ class VikingStoreWithRelations(VikingStoreWrapper):
         self.use_query_expansion = use_query_expansion
         self._llm = llm  # LLMClientWrapper instance, required if use_query_expansion
         self._embedder = embedder  # VolcengineEmbedder instance, for vector matching
+        self._strategy = strategy
+        # Strategy-specific relations file name
+        self._relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
 
     def _uri_to_parent_path(self, uri: str) -> str:
         """viking://resources/dataset/file.md -> {vikingfs_path}/resources/dataset"""
@@ -94,10 +98,31 @@ class VikingStoreWithRelations(VikingStoreWrapper):
             print(f"[Warning] Embedding failed: {e}")
             return None
 
+    def _resolve_ref_question(self, parent_dir: str, question_id: str) -> dict | None:
+        """Look up question_id in .reference_questions.jsonl, returns {question, embedding} or None."""
+        ref_path = os.path.join(parent_dir, ".reference_questions.jsonl")
+        if not os.path.exists(ref_path):
+            return None
+        try:
+            with open(ref_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        if rec.get("id") == question_id:
+                            return {"question": rec.get("question", ""), "embedding": rec.get("embedding")}
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            return None
+        return None
+
     def _query_relations(self, uri: str, query: str) -> List[str]:
-        """Read .relations.jsonl from uri's parent dir, keyword + vector dual matching."""
+        """Read .relations_{strategy}.jsonl from uri's parent dir, keyword + vector dual matching."""
         parent_dir = self._uri_to_parent_path(uri)
-        jsonl_path = os.path.join(parent_dir, ".relations.jsonl")
+        jsonl_path = os.path.join(parent_dir, self._relations_filename)
         if not os.path.exists(jsonl_path):
             return []
 
@@ -108,7 +133,10 @@ class VikingStoreWithRelations(VikingStoreWrapper):
             query_keywords = _extract_keywords(query)
             query_embedding = self._embed_text(query)
 
-        results = []
+        # Cache for ReferenceStore lookups
+        ref_cache: dict[str, dict | None] = {}
+
+        results = []  # list of (uri, weight)
         seen = set()
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -132,18 +160,40 @@ class VikingStoreWithRelations(VikingStoreWrapper):
                 if target in seen:
                     continue
 
-                rec_query = rec.get("query_question", "")
+                rec_weight = rec.get("weight", 1.0)
+
+                # Resolve question text and embedding from record
+                rec_query = ""
+                rec_embedding = None
+                if "question_id" in rec:
+                    qid = rec["question_id"]
+                    if qid not in ref_cache:
+                        ref_cache[qid] = self._resolve_ref_question(parent_dir, qid)
+                    ref = ref_cache[qid]
+                    if ref:
+                        rec_query = ref.get("question", "")
+                        rec_embedding = ref.get("embedding")
+                else:
+                    rec_query = rec.get("query_question", "")
+                    rec_embedding = rec.get("query_embedding")
+
+                # Bot self-link (empty question_id) — always accepted
+                qid = rec.get("question_id", "")
+                if qid == "" and "question_id" in rec:
+                    seen.add(target)
+                    results.append((target, rec_weight))
+                    continue
 
                 # No query context → accept all edges
                 if not query:
                     seen.add(target)
-                    results.append(target)
+                    results.append((target, rec_weight))
                     continue
 
                 # Path 1: Keyword matching (coverage check)
                 kw_matched = False
-                if query_keywords:
-                    rec_keywords = _extract_keywords(rec.get("query_question", ""))
+                if query_keywords and rec_query:
+                    rec_keywords = _extract_keywords(rec_query)
                     if rec_keywords:
                         overlap = len(query_keywords & rec_keywords)
                         if overlap / len(query_keywords) > 0.7:
@@ -151,18 +201,18 @@ class VikingStoreWithRelations(VikingStoreWrapper):
 
                 # Path 2: Vector matching (always executes independently)
                 vec_matched = False
-                if query_embedding:
-                    rec_embedding = rec.get("query_embedding")
-                    if rec_embedding:
-                        sim = _cosine_similarity(query_embedding, rec_embedding)
-                        if sim > 0.7:
-                            vec_matched = True
+                if query_embedding and rec_embedding:
+                    sim = _cosine_similarity(query_embedding, rec_embedding)
+                    if sim > 0.7:
+                        vec_matched = True
 
                 if kw_matched or vec_matched:
                     seen.add(target)
-                    results.append(target)
+                    results.append((target, rec_weight))
 
-        return results
+        # Sort by weight descending
+        results.sort(key=lambda x: x[1], reverse=True)
+        return [uri for uri, _ in results]
 
     def _generate_search_queries(self, original_query: str) -> List[str]:
         """Use LLM to reformulate the question into multiple search queries."""

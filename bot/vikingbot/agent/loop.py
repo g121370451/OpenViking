@@ -22,6 +22,7 @@ from vikingbot.config import load_config
 from vikingbot.config.schema import BotMode, Config, SessionKey
 from vikingbot.hooks import HookContext
 from vikingbot.hooks.manager import hook_manager
+from vikingbot.agent.link_strategies import get_link_strategy
 from vikingbot.providers.base import LLMProvider
 from vikingbot.sandbox import SandboxManager
 from vikingbot.session.manager import SessionManager
@@ -363,11 +364,10 @@ class AgentLoop:
 
                     import re as _re
                     relations_found = 0
-                    if tool_call.name == "openviking_search":
+                    if tool_call.name in ("openviking_search", "openviking_multi_read"):
                         rf_match = _re.search(r'<!-- relations_found:(\d+) -->', result or "")
                         if rf_match:
                             relations_found = int(rf_match.group(1))
-                        # logger.error(f"[RelationsDebug] tool=openviking_search, relations_found={relations_found}, result_tail='{(result or '')[-100:]}'")
 
                     tool_used_dict = {
                         "tool_name": tool_call.name,
@@ -602,66 +602,27 @@ class AgentLoop:
         original_question: str,
         session_key: "SessionKey",
     ) -> None:
-        """Build relations between documents read in different iterations (blind cross-product)."""
+        """Build relations between documents read during this QA session."""
+        strategy_name = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
         try:
-            read_tools = {"openviking_multi_read", "openviking_read"}
-            logger.info(f"[PostAnswerLink] origin query is {original_question}")
-
-            # Collect all unique URIs from read tool calls
-            all_uris = []
-            for tool in tools_used:
-                if tool.get("tool_name") in read_tools and tool.get("execute_success"):
-                    uris = self._extract_uris_from_args(tool.get("args", ""))
-                    if uris:
-                        all_uris.extend(uris)
-
-            seen = set()
-            unique_uris = []
-            for u in all_uris:
-                if u not in seen:
-                    seen.add(u)
-                    unique_uris.append(u)
-
-            logger.info(f"[PostAnswerLink] Total unique URIs read: {len(unique_uris)}")
-
-            if len(unique_uris) < 2:
-                logger.info(f"[PostAnswerLink] Skipped: only {len(unique_uris)} unique URI(s), need >= 2")
-                return
+            strategy = get_link_strategy(strategy_name)
+            logger.info(f"[PostAnswerLink] Using strategy={strategy.name}, query={original_question[:100]}")
 
             from vikingbot.openviking_mount.ov_server import VikingClient
             workspace_id = self.sandbox_manager.to_workspace_id(session_key) if self.sandbox_manager else None
             client = await VikingClient.create(workspace_id)
 
-            linked = set()
-            for i in range(len(unique_uris)):
-                for j in range(i + 1, len(unique_uris)):
-                    u1, u2 = unique_uris[i], unique_uris[j]
-                    pair = (min(u1, u2), max(u1, u2))
-                    if pair in linked:
-                        continue
-                    linked.add(pair)
-                    try:
-                        logger.info(f"[PostAnswerLink] Linking: {u1} <-> {u2}")
-                        await client.link(u1, [u2], reason="co-referenced", query=original_question)
-                    except Exception as e:
-                        logger.warning(f"[PostAnswerLink] Link failed: {e}")
-
+            linked = await strategy.build_links(
+                tools_used=tools_used,
+                original_question=original_question,
+                client=client,
+                provider=self.provider,
+                model=self.model,
+            )
             if linked:
-                logger.info(f"[PostAnswerLink] Created {len(linked)} relation(s)")
+                logger.info(f"[PostAnswerLink] Strategy={strategy.name}, created {linked} relation(s)")
         except Exception as e:
             logger.warning(f"Post-answer linking failed: {e}")
-
-    @staticmethod
-    def _extract_uris_from_args(args_raw) -> list[str]:
-        """Extract viking:// URIs from tool call args."""
-        import re
-        if isinstance(args_raw, dict):
-            args_str = json.dumps(args_raw)
-        elif isinstance(args_raw, str):
-            args_str = args_raw
-        else:
-            return []
-        return re.findall(r'viking://[^\s"\\,\]\}]+', args_str)
 
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
         """

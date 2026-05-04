@@ -175,6 +175,7 @@ def main():
                 from src.core.vector_store_with_relations import VikingStoreWithRelations
                 relations_topk = config['execution'].get('relations_topk', 0)
                 use_query_expansion = config['execution'].get('use_query_expansion', False)
+                link_strategy = config['execution'].get('link_strategy', 'blind')
 
                 # Initialize embedder for vector matching in relations
                 embedder = None
@@ -197,8 +198,9 @@ def main():
                     use_query_expansion=use_query_expansion,
                     llm=llm_client if use_query_expansion else None,
                     embedder=embedder,
+                    strategy=link_strategy,
                 )
-                logger.info(f"Using VikingStoreWithRelations (relations_topk={relations_topk}, query_expansion={use_query_expansion})")
+                logger.info(f"Using VikingStoreWithRelations (relations_topk={relations_topk}, query_expansion={use_query_expansion}, link_strategy={link_strategy})")
             else:
                 vector_store = VikingStoreWrapper(store_path=config['paths']['vector_store'])
 

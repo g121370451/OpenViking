@@ -136,46 +136,6 @@ class VikingSearchTool(OVFileTool):
             else:
                 output = str(results)
 
-            # Relations enhancement: append related docs (keyword + vector dual matching)
-            relations_count = 0
-            use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
-            if use_relations and resources_list:
-                try:
-                    seen_uris = set()
-                    for r in resources_list:
-                        uri = r.get("uri", str(r)) if isinstance(r, dict) else str(r)
-                        seen_uris.add(uri)
-
-                    # Collect all raw relations from top 5 results
-                    raw_rels = []
-                    for r in resources_list[:5]:
-                        uri = r.get("uri", str(r)) if isinstance(r, dict) else str(r)
-                        try:
-                            rels = await search_client.relations(uri, query=query)
-                            for rel in rels:
-                                rel["_source_uri"] = uri
-                                raw_rels.append(rel)
-                        except Exception:
-                            continue
-
-                    related_items = []
-                    for rel in raw_rels:
-                        rel_uri = rel.get("uri", "") if isinstance(rel, dict) else str(rel)
-                        if rel_uri and rel_uri not in seen_uris:
-                            seen_uris.add(rel_uri)
-                            score = rel.get("score", "") if isinstance(rel, dict) else ""
-                            score_str = f" score={score}" if score else ""
-                            related_items.append(f"[via relations{score_str}] {rel_uri}")
-
-                    relations_count = len(related_items)
-                    if related_items:
-                        output += "\n\n--- Related documents (from relations) ---\n"
-                        for idx, item in enumerate(related_items, 1):
-                            output += f"{idx}. {item}\n"
-                except Exception as e:
-                    logger.debug(f"Relations enhancement failed, returning original results: {e}")
-
-            output += f"\n<!-- relations_found:{relations_count} -->"
             return output
         except Exception as e:
             return f"Error searching Viking: {str(e)}"
@@ -717,10 +677,33 @@ class VikingMultiReadTool(OVFileTool):
                 async with semaphore:
                     try:
                         content = await client.read_content(uri, level=level)
+                        relations_found = 0
+
+                        # Relations enhancement at read time
+                        use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
+                        if use_relations and content:
+                            link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
+                            try:
+                                rels = await client.relations(uri, strategy=link_strategy)
+                                for rel in rels[:3]:
+                                    rel_uri = rel.get("uri", "")
+                                    if not rel_uri or rel_uri == uri:
+                                        continue
+                                    try:
+                                        rel_content = await client.read_content(rel_uri, level=level)
+                                        if rel_content:
+                                            content += f"\n\n--- Related document: {rel_uri} ---\n{rel_content[:3000]}"
+                                            relations_found += 1
+                                    except Exception:
+                                        continue
+                            except Exception:
+                                pass
+
                         return {
                             "uri": uri,
                             "content": content,
                             "success": True,
+                            "relations_found": relations_found,
                         }
                     except Exception as e:
                         logger.warning(f"Error reading from {uri}: {e}")
@@ -735,6 +718,7 @@ class VikingMultiReadTool(OVFileTool):
             results = await asyncio.gather(*read_tasks)
 
             # 构建结果
+            total_relations = sum(r.get("relations_found", 0) for r in results)
             result_lines = [f"Multi-read results for {len(uris)} resources (level: {level}):"]
 
             for i, result in enumerate(results, 1):
@@ -749,7 +733,9 @@ class VikingMultiReadTool(OVFileTool):
                     result_lines.append(f"ERROR: {content}")
                 result_lines.append(f"--- END OF {uri} ---")
 
-            return "\n".join(result_lines)
+            output = "\n".join(result_lines)
+            output += f"\n<!-- relations_found:{total_relations} -->"
+            return output
 
         except Exception as e:
             logger.exception(f"Error in VikingMultiReadTool: {e}")
@@ -798,11 +784,8 @@ class VikingLinkTool(OVFileTool):
             return "Error: reason is required for link creation."
         try:
             client = await self._get_client(tool_context)
-            # Promote leaf file URIs to parent directory to avoid
-            # .relations.json being created under a file path (Windows FS issue)
-            from_uri = self._to_dir_uri(from_uri)
-            uris = [self._to_dir_uri(u) for u in uris]
-            await client.link(from_uri, uris, reason=reason)
+            link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
+            await client.link(from_uri, uris, reason=reason, strategy=link_strategy, weight=1.0)
             targets = ", ".join(uris)
             return f"Linked: {from_uri} -> [{targets}] (reason: {reason})"
         except Exception as e:
@@ -854,7 +837,8 @@ class VikingRelationsTool(OVFileTool):
             client = await self._get_client(tool_context)
             # Promote leaf file URI to parent directory (same as VikingLinkTool)
             uri = VikingLinkTool._to_dir_uri(uri)
-            rels = await client.relations(uri)
+            link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
+            rels = await client.relations(uri, strategy=link_strategy)
             if not rels:
                 return f"No relations found for {uri}"
             lines = []

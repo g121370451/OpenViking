@@ -24,6 +24,7 @@ vikingbot:
   log_tool_calls: true
   enable_linking: false
   use_relations: true
+  link_strategy: blind
 
 paths:
   dataset_path: "datasets/{dataset_name}"

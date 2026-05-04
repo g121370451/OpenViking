@@ -300,18 +300,27 @@ class BenchmarkPipeline:
             # Add vikingbot iteration metrics if available
             vb_records = [r for r in eval_records if 'vikingbot' in r]
             if vb_records:
-                iters_total = [r['vikingbot'].get('iterations_used', 0) for r in vb_records]
-                iters_retrieval = [r['vikingbot'].get('retrieval_iterations', r['vikingbot'].get('iterations_used', 0)) for r in vb_records]
-                iters_search = [r['vikingbot'].get('search_iterations', 0) for r in vb_records]
-                relations_hits_list = [r['vikingbot'].get('relations_hits', 0) for r in vb_records]
-                total_relations_list = [r['vikingbot'].get('total_relations_found', 0) for r in vb_records]
+                # 过滤 tc=0 的异常记录（JSON 解析失败），排除对迭代次数统计的干扰
+                vb_valid = [r for r in vb_records if r['vikingbot'].get('tool_calls')]
+                records_for_iters = vb_valid if vb_valid else vb_records  # fallback to all if all are tc=0
+
+                iters_total = [r['vikingbot'].get('iterations_used', 0) for r in records_for_iters]
+                iters_retrieval = [r['vikingbot'].get('retrieval_iterations', r['vikingbot'].get('iterations_used', 0)) for r in records_for_iters]
+                iters_search = [r['vikingbot'].get('search_iterations', 0) for r in records_for_iters]
+                iters_read = [r['vikingbot'].get('read_iterations', 0) for r in records_for_iters]
                 report["VikingBot Iteration Metrics"] = {
                     "Average Total Iterations": sum(iters_total) / len(iters_total),
                     "Average Retrieval Iterations (excl. link/relations)": sum(iters_retrieval) / len(iters_retrieval),
                     "Average Search Iterations": sum(iters_search) / len(iters_search),
+                    "Average Read Iterations": sum(iters_read) / len(iters_read),
                     "Min Retrieval Iterations": min(iters_retrieval),
                     "Max Retrieval Iterations": max(iters_retrieval),
+                    "Excluded Anomalous Records (tc=0)": len(vb_records) - len(vb_valid),
                 }
+
+                # Relations Usage 统计使用全量 vb_records
+                relations_hits_list = [r['vikingbot'].get('relations_hits', 0) for r in vb_records]
+                total_relations_list = [r['vikingbot'].get('total_relations_found', 0) for r in vb_records]
                 report["Relations Usage"] = {
                     "Total Questions with Relations Hits": sum(1 for h in relations_hits_list if h > 0),
                     "Total Relations Found": sum(total_relations_list),
@@ -547,8 +556,10 @@ class BenchmarkPipeline:
         vb_meta_out = dict(vb_meta)
         vb_meta_out['retrieval_iterations'] = retrieval_iterations
 
-        # Calculate search iterations and relations statistics
+        # Calculate search/read iterations and relations statistics
         search_iterations = 0
+        read_iterations = 0
+        read_tool_names = {"openviking_multi_read", "openviking_read"}
         relations_hits = 0
         total_relations_found = 0
         if tool_calls_raw:
@@ -556,15 +567,21 @@ class BenchmarkPipeline:
                 tc_list_for_stats = json.loads(tool_calls_raw) if isinstance(tool_calls_raw, str) else tool_calls_raw
                 if isinstance(tc_list_for_stats, list):
                     for tc in tc_list_for_stats:
-                        if isinstance(tc, dict) and tc.get('tool_name') == 'openviking_search':
+                        if not isinstance(tc, dict):
+                            continue
+                        tn = tc.get('tool_name', '')
+                        if tn == 'openviking_search':
                             search_iterations += 1
                             rf = tc.get('relations_found', 0) or 0
                             total_relations_found += rf
                             if rf > 0:
                                 relations_hits += 1
+                        elif tn in read_tool_names:
+                            read_iterations += 1
             except (json.JSONDecodeError, TypeError):
                 pass
         vb_meta_out['search_iterations'] = search_iterations
+        vb_meta_out['read_iterations'] = read_iterations
         vb_meta_out['relations_hits'] = relations_hits
         vb_meta_out['total_relations_found'] = total_relations_found
 

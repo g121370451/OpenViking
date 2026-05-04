@@ -20,6 +20,7 @@ execution:
   relations_topk: 0
   use_query_expansion: false
   generate_refusal_reason: true
+  link_strategy: blind
 # ==================================
 
 paths:

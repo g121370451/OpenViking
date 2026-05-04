@@ -1,5 +1,6 @@
 """Tool factory for centralized tool registration."""
 
+import os
 from typing import TYPE_CHECKING, Callable
 
 from vikingbot.agent.tools.cron import CronTool
@@ -97,8 +98,11 @@ def register_default_tools(
         registry.register(VikingMemoryCommitTool())
         if not config.read_only:
             registry.register(VikingAddResourceTool())
-        # Link tool no longer registered for bot — linking happens post-answer in _process_message.
-        # Relations enhancement is handled inside VikingSearchTool via env vars.
+        # Link tool registered for llm_review strategy — bot self-reviews and creates links during conversation.
+        _link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "")
+        _enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
+        if _link_strategy == "llm_review" and _enable_linking == "1":
+            registry.register(VikingLinkTool())
 
 
 

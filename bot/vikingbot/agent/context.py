@@ -265,6 +265,21 @@ If you have already found relevant documents and the answer is reasonably clear,
 
         # System prompt
         system_prompt = await self.build_system_prompt(session_key, current_message, history)
+
+        # Append linking instruction when bot self-review is enabled
+        import os as _os
+        _enable_linking = _os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
+        _link_strategy = _os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
+        if _enable_linking == "1" and _link_strategy == "llm_review":
+            system_prompt += (
+                "\n\n## Document Linking\n"
+                "After answering the question, review the documents you read. "
+                "If any pairs of documents are genuinely related (same topic, event, person, or provide complementary evidence), "
+                "use `openviking_link` to create links between them. "
+                "Provide a specific reason for each link explaining the relationship. "
+                "Do NOT link documents that merely share a single keyword or appear in the same search result.\n"
+            )
+
         messages.append({"role": "system", "content": system_prompt})
         # logger.debug(f"system_prompt: {system_prompt}")
 

@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from vikingbot.openviking_mount.reference_store import ReferenceStore
+
 import openviking as ov
 from vikingbot.config.loader import load_config
 from vikingbot.openviking_mount.user_apikey_manager import UserApiKeyManager
@@ -451,16 +453,27 @@ class VikingClient:
             return local_path
         return os.path.dirname(local_path)
 
-    def _append_relation(self, uri1: str, uri2: str, query: str, reason: str = "") -> None:
-        """在 uri1 父目录的 .relations.jsonl 中追加一条记录（去重）"""
-        if not query:
-            logger.warning(f"[Link] Skipped: empty query for {uri1} -> {uri2}")
-            return
+    def _append_relation(self, uri1: str, uri2: str, query: str, reason: str = "", strategy: str = "blind", weight: float = 1.0) -> None:
+        """在 uri1 父目录的策略 relations 文件中追加一条记录（去重）。"""
         parent_dir = self._uri_to_parent_path(uri1)
         os.makedirs(parent_dir, exist_ok=True)
-        jsonl_path = os.path.join(parent_dir, ".relations.jsonl")
 
-        key = (uri1, uri2, query)
+        # Determine relations file path based on strategy
+        if strategy == "blind":
+            relations_filename = ".relations.jsonl"
+        else:
+            relations_filename = f".relations_{strategy}.jsonl"
+        jsonl_path = os.path.join(parent_dir, relations_filename)
+
+        # Get or create question_id via ReferenceStore
+        if query:
+            ref_store = ReferenceStore(parent_dir)
+            embedder = _get_embedder()
+            question_id = ref_store.get_or_create(query, embedder=embedder)
+        else:
+            question_id = ""  # bot self-link without query context
+
+        key = (uri1, uri2, question_id)
         # 读取已有记录检查去重
         existing = set()
         if os.path.exists(jsonl_path):
@@ -471,33 +484,22 @@ class VikingClient:
                         continue
                     try:
                         rec = json.loads(line)
-                        existing.add((rec.get("uri1", ""), rec.get("uri2", ""), rec.get("query_question", "")))
+                        existing.add((rec.get("uri1", ""), rec.get("uri2", ""), rec.get("question_id", "")))
                     except json.JSONDecodeError:
                         continue
 
         if key in existing:
-            logger.debug(f"[Link] Duplicate skipped: {uri1} -> {uri2} (query={query[:50]})")
+            logger.debug(f"[Link] Duplicate skipped: {uri1} -> {uri2} (qid={question_id})")
             return
 
-        # Generate embedding for the query
-        query_embedding = None
-        embedder = _get_embedder()
-        if embedder and query:
-            try:
-                query_embedding = embedder.embed(query)
-            except Exception as e:
-                logger.warning(f"[Link] Embedding failed for query: {e}")
-
-        record = {"uri1": uri1, "uri2": uri2, "query_question": query, "reason": reason}
-        if query_embedding:
-            record["query_embedding"] = query_embedding
+        record = {"uri1": uri1, "uri2": uri2, "question_id": question_id, "reason": reason, "weight": weight}
         with open(jsonl_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        logger.info(f"[Link] Written to {jsonl_path}: {uri1} -> {uri2}")
+        logger.info(f"[Link] Written to {relations_filename}: {uri1} -> {uri2}")
 
-    async def link(self, from_uri: str, to_uris, reason: str = "", query: str = ""):
-        """基于 .relations.jsonl 的自定义链接实现"""
-        logger.info(f"[Link] Called: from={from_uri}, to={to_uris}, query={query[:80] if query else '(empty)'}")
+    async def link(self, from_uri: str, to_uris, reason: str = "", query: str = "", strategy: str = "blind", weight: float = 1.0):
+        """基于 .relations_{strategy}.jsonl 的自定义链接实现"""
+        logger.info(f"[Link] Called: from={from_uri}, to={to_uris}, strategy={strategy}, query={query[:80] if query else '(empty)'}")
         if isinstance(to_uris, str):
             to_uris = [to_uris]
         for to_uri in to_uris:
@@ -505,18 +507,29 @@ class VikingClient:
                 continue
             try:
                 # 在 from_uri 的父目录写入正向记录
-                self._append_relation(from_uri, to_uri, query, reason)
+                self._append_relation(from_uri, to_uri, query, reason, strategy=strategy, weight=weight)
                 # 在 to_uri 的父目录写入反向记录（支持双向查询）
-                self._append_relation(to_uri, from_uri, query, reason)
+                self._append_relation(to_uri, from_uri, query, reason, strategy=strategy, weight=weight)
             except Exception as e:
                 logger.error(f"[Link] Failed to write relation {from_uri} <-> {to_uri}: {e}")
 
-    async def relations(self, uri: str, query: str = "") -> List:
-        """基于 .relations.jsonl 的自定义查询实现（关键词 + 向量双路匹配）"""
+    async def relations(self, uri: str, query: str = "", strategy: str = "blind") -> List:
+        """基于 .relations_{strategy}.jsonl 的查询实现（关键词 + 向量双路匹配）。
+
+        通过 question_id 从 ReferenceStore 查回原始问题文本和向量进行匹配。
+        """
         parent_dir = self._uri_to_parent_path(uri)
-        jsonl_path = os.path.join(parent_dir, ".relations.jsonl")
+
+        # Determine relations file path
+        if strategy == "blind":
+            relations_filename = ".relations.jsonl"
+        else:
+            relations_filename = f".relations_{strategy}.jsonl"
+        jsonl_path = os.path.join(parent_dir, relations_filename)
         if not os.path.exists(jsonl_path):
             return []
+
+        ref_store = ReferenceStore(parent_dir)
 
         # Pre-compute query embedding and keywords for matching
         query_embedding = None
@@ -554,18 +567,30 @@ class VikingClient:
                 if target in seen:
                     continue
 
-                rec_query = rec.get("query_question", "")
+                # Resolve question_id → question text and embedding
+                question_id = rec.get("question_id", "")
+                ref = ref_store.get(question_id) if question_id else None
+                rec_query = ref.get("question", "") if ref else rec.get("query_question", "")
+                rec_embedding = ref.get("embedding") if ref else rec.get("query_embedding")
+
+                rec_weight = rec.get("weight", 1.0)
+
+                # Bot self-link (empty question_id) — always accepted
+                if question_id == "":
+                    seen.add(target)
+                    results.append({"uri": target, "reason": rec.get("reason", rec_query), "weight": rec_weight})
+                    continue
 
                 # Skip if no query context at all
                 if not query:
                     seen.add(target)
-                    results.append({"uri": target, "reason": rec_query})
+                    results.append({"uri": target, "reason": rec_query, "weight": rec_weight})
                     continue
 
                 # Path 1: Keyword matching (coverage check)
                 kw_matched = False
-                if query_keywords:
-                    rec_keywords = _extract_keywords(rec.get("query_question", ""))
+                if query_keywords and rec_query:
+                    rec_keywords = _extract_keywords(rec_query)
                     if rec_keywords:
                         overlap = len(query_keywords & rec_keywords)
                         if overlap / len(query_keywords) > 0.7:
@@ -573,17 +598,17 @@ class VikingClient:
 
                 # Path 2: Vector matching (always executes independently)
                 vec_matched = False
-                if query_embedding:
-                    rec_embedding = rec.get("query_embedding")
-                    if rec_embedding:
-                        sim = _cosine_similarity(query_embedding, rec_embedding)
-                        if sim > 0.7:
-                            vec_matched = True
+                if query_embedding and rec_embedding:
+                    sim = _cosine_similarity(query_embedding, rec_embedding)
+                    if sim > 0.7:
+                        vec_matched = True
 
                 if kw_matched or vec_matched:
                     seen.add(target)
-                    results.append({"uri": target, "reason": rec_query})
+                    results.append({"uri": target, "reason": rec.get("reason", rec_query), "weight": rec_weight})
 
+        # Sort by weight descending
+        results.sort(key=lambda x: x.get("weight", 1.0), reverse=True)
         return results
 
     async def commit(self, session_id: str, messages: list[dict[str, Any]], user_id: str = None):

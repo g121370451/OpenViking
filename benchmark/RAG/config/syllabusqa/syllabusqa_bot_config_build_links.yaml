@@ -24,6 +24,7 @@ vikingbot:
   max_iterations: 10
   log_tool_calls: true
   enable_linking: true
+  link_strategy: blind
 
 paths:
   dataset_path: "datasets/{dataset_name}"
