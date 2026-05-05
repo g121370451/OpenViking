@@ -25,6 +25,7 @@ vikingbot:
   enable_linking: false
   use_relations: true
   link_strategy: cross_iteration
+  enable_reasoning: false
 
 paths:
   dataset_path: "datasets/{dataset_name}/financebench_open_source.jsonl"

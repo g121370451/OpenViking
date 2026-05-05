@@ -50,23 +50,51 @@
 
 ## 二、Linking 策略改进
 
-### 2.21 CrossIterationLinkStrategy 同轮次低重叠链接
+Linking 后处理在 `_post_answer_link()` 中触发（`VIKINGBOT_ENABLE_LINKING=1`），根据 `VIKINGBOT_LINK_STRATEGY` 选择策略。三种策略的起点和终点如下：
 
-新增同轮次内 Jaccard 相似度检测：对同一迭代轮次内的文档对，当 Jaccard < 0.3 时建立链接（reason="same-iteration-low-overlap"），避免高重叠文档的冗余链接。
+| 策略 | 起点（sources） | 终点（targets） | 配对方式 |
+|---|---|---|---|
+| `blind` / `read_blind` | 所有 read/multi_read 的 URI | 所有 read/multi_read 的 URI | O(n²) 两两配对 |
+| `cross_iteration` | 跨轮次的 URI 对 + 同轮次低重叠 URI 对 | ← 对称 | 跨轮次 + Jaccard < 0.3 同轮次 |
+| `llm_review` | 所有 read/multi_read 的 URI | bot 通过 `openviking_link` 标记的有用 URI | source → target 两两配对 |
+
+### 2.1 BlindLinkStrategy（盲链接）
+
+所有 `openviking_read` / `openviking_multi_read` 成功读过的 URI 去重后，做 O(n²) 两两链接，weight 随 iteration distance 高斯衰减。reason=`"co-referenced"`。
+
+别名 `read_blind`，语义与 `blind` 完全一致（名称更直观）。
+
+**文件**: `bot/vikingbot/agent/link_strategies.py` → `BlindLinkStrategy.build_links()`
+
+### 2.2 CrossIterationLinkStrategy（跨轮次链接）
+
+两部分组成：
+
+1. **跨轮次链接**: 不同迭代轮次间的 URI 两两配对，weight 随 iteration distance 高斯衰减（峰值在 d=1，即相邻轮次）。reason=`"cross-iteration"`
+2. **同轮次低重叠链接**: 对同一迭代轮次内的文档对，计算 Jaccard 相似度，当 Jaccard < 0.3 时建立链接。reason=`"same-iteration-low-overlap"`
 
 **文件**: `bot/vikingbot/agent/link_strategies.py` → `CrossIterationLinkStrategy.build_links()`
 
-### 2.2 LLMReviewLinkStrategy Bot 自链接
+### 2.3 LLMReviewLinkStrategy（Bot 自链接 + 后处理配对）
 
-LLM Review 策略改为 **bot 自链接模式**：bot 在对话中使用 `openviking_link` 工具自己判断哪些文档需要链接，不再依赖后处理阶段。
+LLM Review 策略分为两个阶段：
 
-- `VikingLinkTool` 在 `link_strategy == "llm_review"` 且 `enable_linking == "1"` 时注册
-- 系统 prompt 中添加链接指导
+1. **对话中**: bot 使用 `openviking_link` 工具标记有用文档（指定 `from_uri` 和 `uris`）
+2. **后处理**: `build_links()` 收集所有 read/multi_read URI 作为**起点**，从 `openviking_link` 调用中提取所有有用 URI 作为**终点**，两两配对创建边（起点 ≠ 终点，pair 去重）。reason=`"bot-review"`
 
 **文件**:
-- `bot/vikingbot/agent/tools/factory.py` — 条件注册 `VikingLinkTool`
+- `bot/vikingbot/agent/tools/ov_file.py` → `VikingLinkTool` — 对话中 bot 实时标记有用文档
+- `bot/vikingbot/agent/link_strategies.py` → `LLMReviewLinkStrategy.build_links()` — 后处理 source→target 配对
+- `bot/vikingbot/agent/tools/factory.py` — `link_strategy == "llm_review"` 时注册 `VikingLinkTool`
 - `bot/vikingbot/agent/context.py` — 系统 prompt 添加链接指令
-- `bot/vikingbot/agent/link_strategies.py` — `LLMReviewLinkStrategy.build_links()` 从 `tools_used` 收集 bot 自己的 `openviking_link` 调用
+
+### 配置
+
+```yaml
+vikingbot:
+  enable_linking: true
+  link_strategy: blind          # 或 read_blind / cross_iteration / llm_review
+```
 
 ---
 

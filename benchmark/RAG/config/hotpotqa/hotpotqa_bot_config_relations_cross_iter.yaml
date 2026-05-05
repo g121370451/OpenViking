@@ -25,6 +25,7 @@ vikingbot:
   enable_linking: false
   use_relations: true
   link_strategy: cross_iteration
+  enable_reasoning: false
 paths:
   dataset_path: "datasets/{dataset_name}/hotpot_qa_100.json"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"

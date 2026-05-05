@@ -13,7 +13,6 @@ from vikingbot.agent.tools.ov_file import (
     VikingGrepTool,
     VikingGlobTool,
     VikingMultiReadTool,
-    VikingMemoryCommitTool,
     VikingAddResourceTool,
     VikingLinkTool,
 )
@@ -95,14 +94,8 @@ def register_default_tools(
         registry.register(VikingSearchTool())
         registry.register(VikingGrepTool())
         registry.register(VikingGlobTool())
-        registry.register(VikingMemoryCommitTool())
         if not config.read_only:
             registry.register(VikingAddResourceTool())
-        # Link tool registered for llm_review strategy — bot self-reviews and creates links during conversation.
-        _link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "")
-        _enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
-        if _link_strategy == "llm_review" and _enable_linking == "1":
-            registry.register(VikingLinkTool())
 
 
 

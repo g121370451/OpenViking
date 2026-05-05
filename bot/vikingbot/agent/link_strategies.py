@@ -265,7 +265,7 @@ class CrossIterationLinkStrategy(LinkStrategy):
 
 
 class LLMReviewLinkStrategy(LinkStrategy):
-    """Bot self-review: 收集 bot 自己调用的 openviking_link，fallback 到 LLM 审阅。"""
+    """LLM Review: 建边已在 _run_agent_loop() 的 review 步骤中完成，此处返回 0。"""
 
     @property
     def name(self) -> str:
@@ -279,25 +279,15 @@ class LLMReviewLinkStrategy(LinkStrategy):
         provider: "LLMProvider | None" = None,
         model: str = "",
     ) -> int:
-        # 1. 收集 bot 自己的 openviking_link 调用（链接已由 VikingLinkTool 写入）
-        link_calls = [t for t in tools_used
-                      if t.get("tool_name") == "openviking_link" and t.get("execute_success")]
-        if link_calls:
-            logger.info(f"[LLMReviewLink] Bot self-linked via {len(link_calls)} openviking_link call(s)")
-            return len(link_calls)
-
-        # 2. Fallback: 独立 LLM 审阅（暂时禁用，先测试纯 bot 自链接效果）
-        logger.info("[LLMReviewLink] Bot did not self-link, fallback disabled (returning 0)")
+        logger.info("[LLMReviewLink] Links already created during bot review step, nothing to do")
         return 0
-
-        # Fallback 代码已移除（从 git 历史 0015cc83 可恢复）。
-        # 恢复方式：将下面 return 0 替换为 fallback 逻辑。
 
 
 def get_link_strategy(strategy_name: str) -> LinkStrategy:
     """工厂函数：根据策略名返回对应的 LinkStrategy 实例。"""
     strategies = {
         "blind": BlindLinkStrategy(),
+        "read_blind": BlindLinkStrategy(),
         "cross_iteration": CrossIterationLinkStrategy(),
         "llm_review": LLMReviewLinkStrategy(),
     }

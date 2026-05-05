@@ -25,6 +25,7 @@ vikingbot:
   log_tool_calls: true
   enable_linking: true
   link_strategy: llm_review
+  enable_reasoning: false
 paths:
   dataset_path: "datasets/{dataset_name}/clapnq_dev_answerable.jsonl"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"

@@ -125,6 +125,7 @@ class ToolRegistry:
         session_key: SessionKey,
         sandbox_manager: SandboxManager | None = None,
         sender_id: str | None = None,
+        original_question: str | None = None,
     ) -> str:
         """
         Execute a tool by name with given parameters.
@@ -135,6 +136,7 @@ class ToolRegistry:
             session_key: Session key for the current session.
             sandbox_manager: Sandbox manager for file/shell operations.
             sender_id: Sender id for the current session.
+            original_question: Original user question, for tools that need query context.
 
         Returns:
             Tool execution result as string.
@@ -150,6 +152,7 @@ class ToolRegistry:
             session_key=session_key,
             sandbox_manager=sandbox_manager,
             sender_id=sender_id,
+            original_question=original_question,
         )
 
         # Langfuse tool call tracing - automatic for all tools

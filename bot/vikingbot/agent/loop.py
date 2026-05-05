@@ -263,6 +263,57 @@ class AgentLoop:
                         original_query = content
                         break
         logger.error(f"[RelationsDebug] origin_query is {original_query}");
+
+        # Reasoning switch: when disabled, force first search with original question
+        enable_reasoning = os.environ.get("VIKINGBOT_ENABLE_REASONING", "1")
+        if enable_reasoning == "0" and original_query:
+            search_tool = self.tools.get("openviking_search")
+            if search_tool:
+                try:
+                    search_result = await self.tools.execute(
+                        "openviking_search",
+                        {"query": original_query, "target_uri": "viking://resources/"},
+                        session_key=session_key,
+                        sandbox_manager=self.sandbox_manager,
+                        sender_id=sender_id,
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": "forced_search_0",
+                            "type": "function",
+                            "function": {
+                                "name": "openviking_search",
+                                "arguments": json.dumps({"query": original_query, "target_uri": "viking://resources/"})
+                            }
+                        }]
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": "forced_search_0",
+                        "name": "openviking_search",
+                        "content": search_result,
+                    })
+                    iteration = 1
+                    tools_used.append({
+                        "tool_name": "openviking_search",
+                        "args": json.dumps({"query": original_query, "target_uri": "viking://resources/"}),
+                        "reasoning": "(forced first search, reasoning disabled)",
+                        "result": search_result,
+                        "duration": 0,
+                        "execute_success": True if search_result and "Error executing" not in search_result else False,
+                        "input_token": 0,
+                        "output_token": cal_str_tokens(search_result or "", text_type="mixed"),
+                        "iteration": 1,
+                        "relations_found": 0,
+                    })
+                    messages.append(
+                        {"role": "system", "content": "Reflect on the results and decide next steps."}
+                    )
+                except Exception:
+                    logger.exception("Forced first search failed, continuing with normal loop")
+
         while iteration < self.max_iterations:
             iteration += 1
 
@@ -397,6 +448,116 @@ class AgentLoop:
                 final_content = f"Reached {self.max_iterations} iterations without completion."
             else:
                 final_content = "I've completed processing but have no response to give."
+
+        # LLM Review step: bot marks useful documents → code creates all pairwise links
+        _link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "")
+        _enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
+        if _link_strategy == "llm_review" and _enable_linking == "1" and tools_used and original_query:
+            from vikingbot.agent.link_strategies import LinkStrategy
+            from vikingbot.agent.tools.ov_file import VikingLinkTool
+
+            read_uris: set[str] = set()
+            uri_content: dict[str, str] = {}
+            for tool in tools_used:
+                if tool.get("tool_name") in ("openviking_read", "openviking_multi_read") and tool.get("execute_success"):
+                    args = tool.get("args", "")
+                    uris = LinkStrategy._extract_uris_from_args(args)
+                    result = tool.get("result", "")
+                    for u in uris:
+                        read_uris.add(u)
+                        if u not in uri_content:
+                            uri_content[u] = (result or "")[:800]
+
+            if read_uris:
+                uri_list_lines = []
+                for u in sorted(read_uris):
+                    preview = uri_content.get(u, "")[:200].replace("\n", " ")
+                    uri_list_lines.append(f"- {u}\n  {preview}")
+                uri_list = "\n".join(uri_list_lines)
+
+                review_msg = (
+                    f"You have read the following documents during your research:\n\n"
+                    f"{uri_list}\n\n"
+                    f"Please review these documents and identify which ones are USEFUL for answering the question: \"{original_query}\"\n\n"
+                    f"Use the openviking_link tool to mark useful documents. "
+                    f"For each useful document, link it to at least one other useful document that is related. "
+                    f"Only mark documents that actually help answer the question."
+                )
+
+                link_tool = VikingLinkTool()
+                self.tools.register(link_tool)
+
+                try:
+                    review_messages = messages + [{"role": "system", "content": review_msg}]
+                    review_response = await self.provider.chat(
+                        messages=review_messages,
+                        tools=[link_tool.to_schema()],
+                        model=self.model,
+                        session_id=session_key.safe_name(),
+                    )
+
+                    if review_response.usage:
+                        token_usage["prompt_tokens"] += review_response.usage.get("prompt_tokens", 0)
+                        token_usage["completion_tokens"] += review_response.usage.get("completion_tokens", 0)
+                        token_usage["total_tokens"] += review_response.usage.get("total_tokens", 0)
+
+                    # Collect useful URIs from bot's openviking_link calls
+                    useful_uris: set[str] = set()
+                    if review_response.has_tool_calls:
+                        for tool_call in review_response.tool_calls:
+                            if tool_call.name != "openviking_link":
+                                continue
+                            args_str = tool_call.arguments
+                            try:
+                                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                            except json.JSONDecodeError:
+                                continue
+                            # Extract URIs from this call (both from_uri and uris)
+                            call_uris = LinkStrategy._extract_uris_from_args(args)
+                            useful_uris.update(call_uris)
+
+                            iteration += 1
+                            tools_used.append({
+                                "tool_name": "openviking_link",
+                                "args": args_str if isinstance(args_str, str) else json.dumps(args_str),
+                                "reasoning": "(review step)",
+                                "result": "",
+                                "duration": 0,
+                                "execute_success": True,
+                                "input_token": 0,
+                                "output_token": 0,
+                                "iteration": iteration,
+                                "relations_found": 0,
+                            })
+
+                    # Pairwise linking: all read URIs → useful URIs
+                    if useful_uris:
+                        from vikingbot.openviking_mount.ov_server import VikingClient
+                        workspace_id = self.sandbox_manager.to_workspace_id(session_key) if self.sandbox_manager else None
+                        rv_client = await VikingClient.create(workspace_id)
+                        try:
+                            linked = 0
+                            seen_pairs: set[tuple[str, str]] = set()
+                            for src in read_uris:
+                                for tgt in useful_uris:
+                                    if src == tgt:
+                                        continue
+                                    pair = (min(src, tgt), max(src, tgt))
+                                    if pair in seen_pairs:
+                                        continue
+                                    seen_pairs.add(pair)
+                                    try:
+                                        await rv_client.link(src, [tgt], reason="bot-review",
+                                                            query=original_query, strategy="llm_review", weight=1.0)
+                                        linked += 1
+                                    except Exception as e:
+                                        logger.warning(f"[LLMReview] Link failed: {e}")
+                            logger.info(f"[LLMReview] Created {linked} pairwise relation(s) from {len(read_uris)} sources × {len(useful_uris)} targets")
+                        finally:
+                            await rv_client.close()
+                except Exception:
+                    logger.exception("[LLMReview] Review step failed, continuing")
+                # Note: VikingLinkTool stays registered but loop is ending, so no cleanup needed
 
         return final_content, tools_used, token_usage, iteration, original_query
 

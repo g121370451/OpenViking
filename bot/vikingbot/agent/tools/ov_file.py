@@ -685,7 +685,7 @@ class VikingMultiReadTool(OVFileTool):
                             link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
                             try:
                                 rels = await client.relations(uri, strategy=link_strategy)
-                                for rel in rels[:3]:
+                                for rel in rels:
                                     rel_uri = rel.get("uri", "")
                                     if not rel_uri or rel_uri == uri:
                                         continue
@@ -785,7 +785,9 @@ class VikingLinkTool(OVFileTool):
         try:
             client = await self._get_client(tool_context)
             link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
-            await client.link(from_uri, uris, reason=reason, strategy=link_strategy, weight=1.0)
+            query = tool_context.original_question or ""
+            await client.link(from_uri, uris, reason=reason, query=query, strategy=link_strategy, weight=1.0)
+            logger.info(f"[VikingLinkTool] {from_uri} -> {uris} (reason: {reason})")
             targets = ", ".join(uris)
             return f"Linked: {from_uri} -> [{targets}] (reason: {reason})"
         except Exception as e:

@@ -478,7 +478,7 @@ def _extract_json_payload(output: str) -> Optional[dict]:
     return None
 
 
-def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, use_relations: bool = False, embedding_config: dict = None, link_strategy: str = "blind") -> dict[str, str]:
+def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, use_relations: bool = False, embedding_config: dict = None, link_strategy: str = "blind", enable_reasoning: bool = True) -> dict[str, str]:
     env = os.environ.copy()
     env["OPENVIKING_CONFIG_FILE"] = ov_conf_path
     env["NANOBOT_AGENTS__MAX_TOOL_ITERATIONS"] = str(int(max_iterations))
@@ -491,6 +491,7 @@ def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking:
     env["VIKINGBOT_ENABLE_LINKING"] = "1" if enable_linking else "0"
     env["VIKINGBOT_USE_RELATIONS"] = "1" if use_relations else "0"
     env["VIKINGBOT_LINK_STRATEGY"] = link_strategy
+    env["VIKINGBOT_ENABLE_REASONING"] = "1" if enable_reasoning else "0"
 
     # Embedding config for relations vector matching
     if embedding_config:
@@ -541,6 +542,7 @@ class VikingBotRunner:
         self.enable_linking = self.vikingbot_config.get('enable_linking', False)
         self.use_relations = self.vikingbot_config.get('use_relations', False)
         self.link_strategy = self.vikingbot_config.get('link_strategy', 'blind')
+        self.enable_reasoning = self.vikingbot_config.get('enable_reasoning', True)
         self.embedding_config = config.get('embedding', {})
         # Get vector store path from config if available
         self.vector_store_path = config.get('paths', {}).get('vector_store')
@@ -590,7 +592,7 @@ Question: {question}"""
 {batch_read_hint}
 
 Question: {question}"""
-            env = _build_vikingbot_env(ov_conf_path, self.max_iterations, self.enable_linking, self.use_relations, self.embedding_config, self.link_strategy)
+            env = _build_vikingbot_env(ov_conf_path, self.max_iterations, self.enable_linking, self.use_relations, self.embedding_config, self.link_strategy, self.enable_reasoning)
 
             # Use CLI mode only for thread safety in multi-threaded environments
             cmd = ["vikingbot", "chat", "-m", input_msg, "-s", session_id, "-e", "-c", ov_conf_path]
