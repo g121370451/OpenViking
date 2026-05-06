@@ -92,6 +92,9 @@ class ContextBuilder:
         # Core identity
         parts.append(await self._get_identity(session_key))
 
+        if self._eval:
+            return "\n\n---\n\n".join(parts)
+
         # Sandbox environment info
         if self.sandbox_manager:
             sandbox_cwd = await self.sandbox_manager.get_sandbox_cwd(session_key)
@@ -217,6 +220,16 @@ Skills with available="false" need dependencies installed first - you can try in
         else:
             workspace_display = workspace_path
 
+        if self._eval:
+            return f"""# vikingbot
+
+You are VikingBot, an AI assistant for searching and reading from the OpenViking context database.
+You have access to tools that allow you to:
+- Read, search, and grep OpenViking files
+- Execute shell commands
+
+IMPORTANT: Reply directly with your text response. Be accurate and concise."""
+
         return f"""# vikingbot 🐈
 
 You are VikingBot, an AI assistant built based on the OpenViking context database.
@@ -297,15 +310,18 @@ IMPORTANT:
         if not self._eval:
             messages.extend(history)
 
-        # User
-        user_info = await self._build_user_memory(
-            session_key, current_message, self._sender_id, memory_user, ov_tools_enable=ov_tools_enable
-        )
-        messages.append({"role": "user", "content": user_info})
+        if self._eval:
+            messages.append({"role": "user", "content": current_message})
+        else:
+            # User memory context
+            user_info = await self._build_user_memory(
+                session_key, current_message, self._sender_id, memory_user, ov_tools_enable=ov_tools_enable
+            )
+            messages.append({"role": "user", "content": user_info})
 
-        # Current message (with optional image attachments)
-        user_content = self._build_user_content(current_message, media)
-        messages.append({"role": "user", "content": user_content})
+            # Current message (with optional image attachments)
+            user_content = self._build_user_content(current_message, media)
+            messages.append({"role": "user", "content": user_content})
 
         return messages
 

@@ -125,7 +125,12 @@ def main():
             raise e
         
         # 2. Vector Store
-        vector_store = VikingStoreWrapper(store_path=config['paths']['vector_store'])
+        use_nanobot = config.get('execution', {}).get('use_nanobot', False)
+        if use_nanobot:
+            vector_store = None
+            logger.info("Nanobot mode: skipping VikingStoreWrapper initialization")
+        else:
+            vector_store = VikingStoreWrapper(store_path=config['paths']['vector_store'])
         
         # 3. LLM Client
         api_key = os.environ.get(

@@ -38,6 +38,7 @@ from .parser_config import (
 )
 from .prompts_config import PromptsConfig
 from .rerank_config import RerankConfig
+from .retrieval_config import RetrievalConfig
 from .storage_config import StorageConfig
 from .telemetry_config import TelemetryConfig
 from .vlm_config import VLMConfig
@@ -64,6 +65,11 @@ class OpenVikingConfig(BaseModel):
 
     rerank: RerankConfig = Field(
         default_factory=lambda: RerankConfig(), description="Rerank configuration"
+    )
+
+    retrieval: RetrievalConfig = Field(
+        default_factory=lambda: RetrievalConfig(),
+        description="Retrieval ranking configuration",
     )
 
     # Encryption configuration

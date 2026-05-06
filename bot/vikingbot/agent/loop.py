@@ -219,6 +219,12 @@ class AgentLoop:
             send_callback=self.bus.publish_outbound,
             subagent_manager=self.subagents,
             cron_service=self.cron_service,
+            include_image_tool=not self._eval,
+            include_cron_tool=not self._eval,
+            include_spawn_tool=not self._eval,
+            include_message_tool=not self._eval,
+            include_web_tool=not self._eval,
+            include_memory_tool=not self._eval,
         )
 
     async def run(self) -> None:

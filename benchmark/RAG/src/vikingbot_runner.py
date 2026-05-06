@@ -309,7 +309,8 @@ class VikingBotRunner:
                 )
             input_msg = (
                 "Answer this question as briefly as possible. Use only the information available in the database. "
-                "Do not use web search or any external source. "
+                "Do not use any external source. "
+                "Always use OpenViking tools first. Search first, then read the results to answer. "
                 + scope_line
                 + f"\n\nQuestion: {question}"
             )
@@ -348,6 +349,8 @@ class VikingBotRunner:
             if json_start == -1:
                 raise ValueError(f"No JSON output found in vikingbot stdout (len={len(stdout)})")
             
+            trace = stdout[:json_start].strip() if json_start > 0 else ""
+
             import re
             raw_json = stdout[json_start:]
             raw_json = re.sub(r'[\x00-\x1f\x7f]', ' ', raw_json)
@@ -361,6 +364,8 @@ class VikingBotRunner:
                 "iterations_used": int(resp_json.get("iteration") or 0),
                 "debug_log": f"vikingbot.debug.{pid}.log",
                 "session_id": session_id,
+                "trace": trace,
+                "stderr_output": (stderr or "").strip()[:10000],
             }
             
             # 不删除临时配置文件，因为其他任务可能还在使用

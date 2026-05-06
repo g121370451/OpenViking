@@ -39,6 +39,8 @@ def register_default_tools(
     include_cron_tool: bool = True,
     include_image_tool: bool = True,
     include_viking_tools: bool = True,
+    include_web_tool: bool = True,
+    include_memory_tool: bool = True,
 ) -> None:
     """
     Register default tools to a tool registry.
@@ -81,15 +83,16 @@ def register_default_tools(
     )
 
     # Web tools
-    registry.register(
-        WebSearchTool(
-            backend="auto",
-            brave_api_key=brave_api_key,
-            exa_api_key=exa_api_key,
-            tavily_api_key=tavily_api_key,
+    if include_web_tool:
+        registry.register(
+            WebSearchTool(
+                backend="auto",
+                brave_api_key=brave_api_key,
+                exa_api_key=exa_api_key,
+                tavily_api_key=tavily_api_key,
+            )
         )
-    )
-    registry.register(WebFetchTool())
+        registry.register(WebFetchTool())
 
     # Open Viking tools
     if include_viking_tools:
@@ -98,7 +101,8 @@ def register_default_tools(
         registry.register(VikingSearchTool())
         registry.register(VikingGrepTool())
         registry.register(VikingGlobTool())
-        registry.register(VikingMemoryCommitTool())
+        if include_memory_tool:
+            registry.register(VikingMemoryCommitTool())
         if not config.read_only:
             registry.register(VikingAddResourceTool())
 

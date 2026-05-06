@@ -21,6 +21,7 @@ from core.metrics import MetricsCalculator
 from core.judge_util import llm_grader
 from core.checkpoint import CheckpointManager
 from vikingbot_runner import run_vikingbot_query
+from nanobot_runner import run_nanobot_query
 
 
 class BenchmarkPipeline:
@@ -90,9 +91,15 @@ class BenchmarkPipeline:
             doc_dir = os.path.join(self.output_dir, "docs")
 
         if skip_ingestion:
-            self.logger.info(f"Skipping ingestion. Reusing existing vector index at: {self.db.store_path}")
+            if self.db:
+                self.logger.info(f"Skipping ingestion. Reusing existing vector index at: {self.db.store_path}")
+            else:
+                self.logger.info("Skipping ingestion (no vector store in nanobot mode)")
             self.metrics_summary["insertion"] = {"time": 0, "input_tokens": 0, "output_tokens": 0, "embedding_tokens": 0}
         else:
+            if not self.db:
+                raise RuntimeError("Cannot ingest without a vector store. Set skip_ingestion=true or disable use_nanobot.")
+
             try:
                 doc_info = self.adapter.data_prepare(doc_dir)
             except Exception as e:
@@ -150,7 +157,13 @@ class BenchmarkPipeline:
         self.logger.info(f"Total tasks: {len(tasks)}, Remaining: {len(remaining_tasks)}")
         
         use_vikingbot = self.config.get("execution", {}).get("use_vikingbot", False)
-        process_fn = self._process_vikingbot_task if use_vikingbot else self._process_generation_task
+        use_nanobot = self.config.get("execution", {}).get("use_nanobot", False)
+        if use_nanobot:
+            process_fn = self._process_nanobot_task
+        elif use_vikingbot:
+            process_fn = self._process_vikingbot_task
+        else:
+            process_fn = self._process_generation_task
 
         if remaining_tasks:
             initial_completed = len(completed_tasks)
@@ -302,6 +315,9 @@ class BenchmarkPipeline:
     def run_deletion(self):
         """Step 5: Cleanup"""
         self.logger.info(">>> Stage: Deletion")
+        if not self.db:
+            self.logger.info("No vector store to delete (nanobot mode)")
+            return
         start_time = time.time()
         self.db.clear()
         duration = time.time() - start_time
@@ -367,6 +383,15 @@ class BenchmarkPipeline:
 
             self.logger.info(f"[Query-{task['id']}] VikingBot | Iterations: {iterations_used} | Time: {total_time_sec:.1f}s")
 
+            trace = vikingbot_result.get("trace", "")
+            trace_file = ""
+            if trace:
+                trace_dir = os.path.join(self.output_dir, "traces")
+                os.makedirs(trace_dir, exist_ok=True)
+                trace_file = os.path.join(trace_dir, f"query_{task['id']}_trace.txt")
+                with open(trace_file, "w", encoding="utf-8") as f:
+                    f.write(trace)
+
             return {
                 "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
                 "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
@@ -378,6 +403,7 @@ class BenchmarkPipeline:
                     "total_time_sec": total_time_sec,
                     "debug_log": vikingbot_result.get("debug_log", ""),
                     "session_id": vikingbot_result.get("session_id", ""),
+                    "trace_file": trace_file,
                 },
                 "metrics": {"Recall": 0.0},
                 "token_usage": {
@@ -407,6 +433,62 @@ class BenchmarkPipeline:
                 if len(parts) >= 5:
                     uris.append("/".join(parts[:5]))
         return list(set(uris)) if uris else None
+
+    def _process_nanobot_task(self, task):
+        self.monitor.worker_start()
+        try:
+            qa = task['qa']
+            self.logger.info(f"[Query-{task['id']}] Using Nanobot (grep/glob) for RAG")
+
+            session_id = f"query_{uuid.uuid4().hex}"
+
+            nanobot_result = run_nanobot_query(
+                question=qa.question,
+                config=self.config,
+                session_id=session_id,
+            )
+
+            ans = nanobot_result.get("answer", "")
+            total_time_sec = nanobot_result.get("total_time_sec", 0)
+            token_usage = nanobot_result.get("token_usage", {})
+            tools_used_names = nanobot_result.get("tools_used_names", [])
+            iterations_used = nanobot_result.get("iterations_used", 0)
+
+            prompt_tokens = int(
+                token_usage.get("prompt_tokens", token_usage.get("input_tokens", 0)) or 0
+            )
+            completion_tokens = int(
+                token_usage.get("completion_tokens", token_usage.get("output_tokens", 0)) or 0
+            )
+            total_tokens = int(token_usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+            self.monitor.worker_end(tokens=prompt_tokens + completion_tokens)
+
+            self.logger.info(f"[Query-{task['id']}] Nanobot | Time: {total_time_sec:.1f}s")
+
+            return {
+                "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
+                "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
+                "retrieval": {"latency_sec": total_time_sec, "uris": []},
+                "llm": {"final_answer": ans},
+                "nanobot": {
+                    "iterations_used": iterations_used,
+                    "tools_used_names": tools_used_names,
+                    "total_time_sec": total_time_sec,
+                    "session_id": nanobot_result.get("session_id", ""),
+                },
+                "metrics": {"Recall": 0.0},
+                "token_usage": {
+                    "total_input_tokens": 0,
+                    "llm_output_tokens": 0,
+                    "retrieval_embedding_tokens": 0,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                },
+            }
+        except Exception:
+            self.monitor.worker_end(success=False)
+            raise
 
     def _process_generation_task(self, task):
         self.monitor.worker_start()
@@ -525,6 +607,7 @@ class BenchmarkPipeline:
             f"\n[Gold Answer]: {golds}"
             f"\n[Metrics]: {item['metrics']}"
             f"\n[LLM Judge Reasoning]: {eval_record['reasoning']}"
+            f"\n[VikingBot Trace File]: {item.get('vikingbot', {}).get('trace_file', '')}"
             f"\n" + "="*60
         )
         self.logger.info(detailed_info)
