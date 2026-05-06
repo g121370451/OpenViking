@@ -49,7 +49,7 @@ from openviking_cli.utils.uri import VikingURI
 if TYPE_CHECKING:
     from openviking.storage.transaction.lock_handle import LockHandle
     from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
-    from openviking_cli.utils.config import RerankConfig
+    from openviking_cli.utils.config import RerankConfig, RetrievalConfig
 
 logger = get_logger(__name__)
 
@@ -105,6 +105,7 @@ def init_viking_fs(
     query_embedder: Optional[Any] = None,
     rerank_config: Optional["RerankConfig"] = None,
     vector_store: Optional["VikingVectorIndexBackend"] = None,
+    retrieval_config: Optional["RetrievalConfig"] = None,
     timeout: int = 10,
     enable_recorder: bool = False,
     encryptor: Optional[Any] = None,
@@ -116,6 +117,7 @@ def init_viking_fs(
         agfs_config: AGFS configuration object for backend settings
         query_embedder: Embedder instance
         rerank_config: Rerank configuration
+        retrieval_config: Retrieval ranking configuration
         vector_store: Vector store instance
         enable_recorder: Whether to enable IO recording
         encryptor: FileEncryptor instance for encryption/decryption
@@ -127,6 +129,7 @@ def init_viking_fs(
         query_embedder=query_embedder,
         rerank_config=rerank_config,
         vector_store=vector_store,
+        retrieval_config=retrieval_config,
         encryptor=encryptor,
     )
 
@@ -198,6 +201,7 @@ class VikingFS:
         query_embedder: Optional[Any] = None,
         rerank_config: Optional["RerankConfig"] = None,
         vector_store: Optional["VikingVectorIndexBackend"] = None,
+        retrieval_config: Optional["RetrievalConfig"] = None,
         timeout: int = 10,
         encryptor: Optional[Any] = None,
     ):
@@ -205,6 +209,7 @@ class VikingFS:
         self.query_embedder = query_embedder
         self.rerank_config = rerank_config
         self.vector_store = vector_store
+        self.retrieval_config = retrieval_config
         self._encryptor = encryptor
         self._bound_ctx: contextvars.ContextVar[Optional[RequestContext]] = contextvars.ContextVar(
             "vikingfs_bound_ctx", default=None
@@ -1042,6 +1047,7 @@ class VikingFS:
             storage=storage,
             embedder=embedder,
             rerank_config=self.rerank_config,
+            retrieval_config=self.retrieval_config,
         )
 
         # Infer context_type (None = search all types)
@@ -1200,6 +1206,7 @@ class VikingFS:
             storage=storage,
             embedder=embedder,
             rerank_config=self.rerank_config,
+            retrieval_config=self.retrieval_config,
         )
 
         async def _execute(tq: TypedQuery):
