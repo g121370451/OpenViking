@@ -47,6 +47,7 @@ class OutboundMessage:
     time_cost: float = field(default_factory=float)
     iteration: int = field(default_factory=int)
     tools_used_names: list[str] = field(default_factory=list)
+    messages: list[dict] | None = None
 
     @property
     def channel(self) -> str:

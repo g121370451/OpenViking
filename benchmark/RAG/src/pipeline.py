@@ -389,8 +389,13 @@ class BenchmarkPipeline:
                 trace_dir = os.path.join(self.output_dir, "traces")
                 os.makedirs(trace_dir, exist_ok=True)
                 trace_file = os.path.join(trace_dir, f"query_{task['id']}_trace.txt")
-                with open(trace_file, "w", encoding="utf-8") as f:
-                    f.write(trace)
+                try:
+                    trace_data = json.loads(trace, strict=False)
+                    with open(trace_file, "w", encoding="utf-8") as f:
+                        json.dump(trace_data, f, ensure_ascii=False, indent=2, default=str)
+                except json.JSONDecodeError:
+                    with open(trace_file, "w", encoding="utf-8") as f:
+                        f.write(trace)
 
             return {
                 "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,

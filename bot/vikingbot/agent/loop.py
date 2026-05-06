@@ -417,7 +417,7 @@ class AgentLoop:
             else:
                 final_content = "I've completed processing but have no response to give."
 
-        return final_content, tools_used, token_usage, iteration
+        return final_content, tools_used, token_usage, iteration, messages
 
     @trace(
         name="process_message",
@@ -603,7 +603,7 @@ class AgentLoop:
             # logger.info(f"New messages: {json.dumps(messages, indent=4)}")
 
             # Run agent loop
-            final_content, tools_used, token_usage, iteration = await self._run_agent_loop(
+            final_content, tools_used, token_usage, iteration, messages = await self._run_agent_loop(
                 messages=messages,
                 session_key=session_key,
                 publish_events=True,
@@ -636,7 +636,8 @@ class AgentLoop:
                 token_usage=token_usage,
                 time_cost=time_cost,
                 iteration=iteration,
-                tools_used_names=tools_used_names
+                tools_used_names=tools_used_names,
+                messages=messages if self._eval else None,
             )
         finally:
             long_running_notified = True

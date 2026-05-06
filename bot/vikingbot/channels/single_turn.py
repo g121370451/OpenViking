@@ -96,6 +96,9 @@ class SingleTurnChannel(BaseChannel):
         """Send a message - store final response for later retrieval."""
         if msg.is_normal_message:
             if self._eval:
+                if msg.messages:
+                    from vikingbot.cli.commands import console
+                    console.print(json.dumps(msg.messages, ensure_ascii=False, default=str))
                 content = msg.content.replace('"', "'") if msg.content else ""
                 output = {
                     "text": content,
