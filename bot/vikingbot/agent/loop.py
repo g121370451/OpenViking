@@ -225,6 +225,7 @@ class AgentLoop:
             include_message_tool=not self._eval,
             include_web_tool=not self._eval,
             include_memory_tool=not self._eval,
+            include_filesystem_tool=not self._eval,
         )
 
     async def run(self) -> None:

@@ -68,21 +68,11 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str) -> s
     path_hash = hashlib.md5(vector_store_path_bytes).hexdigest()
     temp_conf_path = str(temp_dir / f"ov_{path_hash}.conf")
     
-    # 只有当文件不存在或者配置内容变化时才重新写入
-    need_write = True
     if os.path.exists(temp_conf_path):
-        try:
-            with open(temp_conf_path, 'r', encoding='utf-8') as f:
-                existing_config = json.load(f)
-            if existing_config == config:
-                need_write = False
-        except Exception:
-            need_write = True
-    
-    if need_write:
-        # Write temporary config
-        with open(temp_conf_path, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2)
+        return temp_conf_path
+
+    with open(temp_conf_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
     
     return temp_conf_path
 

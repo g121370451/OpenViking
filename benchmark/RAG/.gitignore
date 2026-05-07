@@ -8,6 +8,7 @@ data/
 # Processed documents and vector storage
 ov_storage/
 ov_storage_content_only/
+ov_storage_raw/
 # Evaluation output results
 Output/
 

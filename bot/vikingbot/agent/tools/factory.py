@@ -41,6 +41,7 @@ def register_default_tools(
     include_viking_tools: bool = True,
     include_web_tool: bool = True,
     include_memory_tool: bool = True,
+    include_filesystem_tool: bool = True,
 ) -> None:
     """
     Register default tools to a tool registry.
@@ -56,6 +57,9 @@ def register_default_tools(
         include_cron_tool: Whether to include cron tool
         include_image_tool: Whether to include image tool
         include_viking_tools: Whether to include Viking tools
+        include_web_tool: Whether to include web tools
+        include_memory_tool: Whether to include memory tool
+        include_filesystem_tool: Whether to include filesystem tools
     """
     # Derive all parameters from config
     exec_config = config.tools.exec
@@ -70,17 +74,18 @@ def register_default_tools(
     provider_api_base = agent_config.api_base if agent_config else None
     gen_image_model = agent_config.gen_image_model
     # File tools
-    registry.register(ReadFileTool())
-    registry.register(WriteFileTool())
-    registry.register(EditFileTool())
-    registry.register(ListDirTool())
+    if include_filesystem_tool:
+        registry.register(ReadFileTool())
+        registry.register(WriteFileTool())
+        registry.register(EditFileTool())
+        registry.register(ListDirTool())
 
-    # Shell tool
-    registry.register(
-        ExecTool(
-            timeout=exec_config.timeout,
+        # Shell tool
+        registry.register(
+            ExecTool(
+                timeout=exec_config.timeout,
+            )
         )
-    )
 
     # Web tools
     if include_web_tool:
