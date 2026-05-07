@@ -225,9 +225,7 @@ Only use the 'message' tool when you need to send a message to a specific chat c
 For normal conversation, just respond with text - do not call the message tool.
 Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
 If you have already found relevant documents and the answer is reasonably clear, synthesize and respond immediately. Do not repeat searches with rephrased queries to verify facts you have already found.
-
-## Memory
-- Remember important facts: using openviking_memory_commit tool to commit"""
+"""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
@@ -265,20 +263,6 @@ If you have already found relevant documents and the answer is reasonably clear,
 
         # System prompt
         system_prompt = await self.build_system_prompt(session_key, current_message, history)
-
-        # Append linking instruction when bot self-review is enabled
-        import os as _os
-        _enable_linking = _os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
-        _link_strategy = _os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
-        if _enable_linking == "1" and _link_strategy == "llm_review":
-            system_prompt += (
-                "\n\n## Document Linking\n"
-                "After answering the question, review the documents you read. "
-                "If any pairs of documents are genuinely related (same topic, event, person, or provide complementary evidence), "
-                "use `openviking_link` to create links between them. "
-                "Provide a specific reason for each link explaining the relationship. "
-                "Do NOT link documents that merely share a single keyword or appear in the same search result.\n"
-            )
 
         messages.append({"role": "system", "content": system_prompt})
         # logger.debug(f"system_prompt: {system_prompt}")

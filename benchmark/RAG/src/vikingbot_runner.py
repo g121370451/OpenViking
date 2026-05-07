@@ -578,16 +578,7 @@ class VikingBotRunner:
             _ensure_openviking_server(ov_conf_path)
             batch_read_hint = "When reading multiple resources, always batch them in a single openviking_multi_read call instead of reading one at a time."
             search_hint = "You MUST use openviking_search to search in viking://resources/ path before answering. Always search and read the actual documents."
-            if self.enable_linking:
-                input_msg = f"""Answer this question as briefly as possible. Use only the information available in the database. Do not use web search or any external source.
-{search_hint}
-{batch_read_hint}
-
-During your search, when you find documents that are clearly related (same topic, same person, same event, or continuation of a conversation), use the openviking_link tool to connect them with a brief reason.
-
-Question: {question}"""
-            else:
-                input_msg = f"""Answer this question as briefly as possible. Use only the information available in the database. Do not use web search or any external source.
+            input_msg = f"""Answer this question as briefly as possible. Use only the information available in the database. Do not use web search or any external source.
 {search_hint}
 {batch_read_hint}
 

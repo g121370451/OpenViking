@@ -25,7 +25,7 @@ vikingbot:
   log_tool_calls: true
   enable_linking: true
   link_strategy: llm_review
-  enable_reasoning: false
+  enable_reasoning: true
 paths:
   dataset_path: "datasets/{dataset_name}/hotpot_qa_100.json"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
