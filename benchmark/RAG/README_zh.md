@@ -271,7 +271,6 @@ RAG 使用 YAML 配置文件来控制评估过程。每个数据集在 `config/`
    - `ingest_workers`：文档摄取的工作线程数
    - `retrieval_topk`：要检索的文档数
    - `max_queries`：限制要处理的查询数（null = 全部）
-   - `skip_ingestion`：跳过文档摄取（使用现有索引）
    - `ingest_mode`：文档摄取模式（"directory" 或 "per\_file"）
    - `retrieval_instruction`：检索的自定义指令（默认为空）
 4. **路径配置**：
@@ -326,7 +325,7 @@ Output/
         ├── generated_answers.json       # LLM 生成的答案
         ├── qa_eval_detailed_results.json # 详细评估结果
         ├── benchmark_metrics_report.json # 聚合指标报告
-        ├── docs/                         # 处理后的文档（如果 skip_ingestion=false）
+        ├── docs/                         # 处理后的文档
         └── benchmark.log                 # 日志文件
 ```
 
@@ -465,7 +464,7 @@ datasets/{dataset_name}/viking_store_index_dir
 
 **5.** **`docs/`** **- 处理后的文档**
 
-- **包含内容**：Markdown 格式的处理文档（如果 `skip_ingestion=false`）
+- **包含内容**：Markdown 格式的处理文档
 - **如何查看**：在任何 Markdown 查看器或文本编辑器中直接打开 `.md` 文件
 
 ### 基准测试结果参考
@@ -645,7 +644,7 @@ FinanceBench 有 3 种问题类型：
 ### 常见问题（FAQ）
 
 **问：如果我已经有向量索引，如何跳过数据摄取阶段？**
-答：在配置文件中设置 `skip_ingestion: true`。这将使用现有的向量索引。
+答：直接运行 `--step gen` 而不是 `--step all`。`import` 阶段是独立的，跳过它即可使用现有的向量索引。
 
 **问：我可以只运行评估阶段而不重新摄取文档吗？**
 答：可以！首先运行 `--step gen` 生成答案，然后运行 `--step eval` 评估生成的答案。

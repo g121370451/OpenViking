@@ -271,7 +271,6 @@ RAG uses YAML configuration files to control the evaluation process. Each datase
    - `ingest_workers`: Number of worker threads for document ingestion
    - `retrieval_topk`: Number of documents to retrieve
    - `max_queries`: Limit the number of queries to process (null = all)
-   - `skip_ingestion`: Skip document ingestion (use existing index)
    - `ingest_mode`: Document ingestion mode ("directory" or "per\_file")
    - `retrieval_instruction`: Custom instruction for retrieval (empty by default)
 4. **Path Configuration**:
@@ -326,7 +325,7 @@ Output/
         ├── generated_answers.json       # Generated answers from LLM
         ├── qa_eval_detailed_results.json # Detailed evaluation results
         ├── benchmark_metrics_report.json # Aggregated metrics report
-        ├── docs/                         # Processed documents (if skip_ingestion=false)
+        ├── docs/                         # Processed documents
         └── benchmark.log                 # Log file
 ```
 
@@ -465,7 +464,7 @@ Example (single result):
 
 **5.** **`docs/`** **- Processed Documents**
 
-- **What it contains**: Processed documents in Markdown format (if `skip_ingestion=false`)
+- **What it contains**: Processed documents in Markdown format
 - **How to view**: Open `.md` files directly in any Markdown viewer or text editor
 
 ### Benchmark Results Reference
@@ -645,7 +644,7 @@ This project integrates with OpenViking through:
 ### Frequently Asked Questions (FAQ)
 
 **Q: How do I skip the data ingestion stage if I already have a vector index?**
-A: Set `skip_ingestion: true` in the configuration file. This will use the existing vector index.
+A: Simply run `--step gen` instead of `--step all`. The `import` stage is independent, so skipping it will use the existing vector index.
 
 **Q: Can I run only the evaluation stage without re-ingesting documents?**
 A: Yes! First run `--step gen` to generate answers, then run `--step eval` to evaluate the generated answers.

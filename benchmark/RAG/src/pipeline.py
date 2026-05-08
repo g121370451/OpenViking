@@ -82,58 +82,54 @@ class BenchmarkPipeline:
             with open(self.eval_file, "w", encoding="utf-8") as f:
                 json.dump({"results": eval_records}, f, indent=2, ensure_ascii=False)
 
-    def run_generation(self):
-        """Step 1: Data Preparation"""
-        self.logger.info(">>> Stage: Ingestion & Generation")
-        skip_ingestion = self.config['execution'].get('skip_ingestion', False)
+    def run_import(self):
+        """Stage: Import documents into OV store"""
+        self.logger.info(">>> Stage: Import (Data Prepare + Ingest)")
+
+        if not self.db:
+            raise RuntimeError("Cannot ingest without a vector store. Disable use_nanobot to use import.")
+
         doc_dir = self.config['paths'].get('doc_output_dir')
         if not doc_dir:
             doc_dir = os.path.join(self.output_dir, "docs")
 
-        if skip_ingestion:
-            if self.db:
-                self.logger.info(f"Skipping ingestion. Reusing existing vector index at: {self.db.store_path}")
-            else:
-                self.logger.info("Skipping ingestion (no vector store in nanobot mode)")
-            self.metrics_summary["insertion"] = {"time": 0, "input_tokens": 0, "output_tokens": 0, "embedding_tokens": 0}
-        else:
-            if not self.db:
-                raise RuntimeError("Cannot ingest without a vector store. Set skip_ingestion=true or disable use_nanobot.")
+        try:
+            doc_info = self.adapter.data_prepare(doc_dir)
+        except Exception as e:
+            self.logger.exception(f"Data preparation failed: {e}")
+            exit(1)
 
-            try:
-                doc_info = self.adapter.data_prepare(doc_dir)
-            except Exception as e:
-                self.logger.exception(f"Data preparation failed: {e}")
-                exit(1)
-
-            ingest_workers = self.config['execution'].get('ingest_workers', 10)
-            ingest_mode = self.config['execution'].get('ingest_mode', 'per_file')
-            
-            mode_desc = {
-                'directory': 'Unified directory mode',
-                'per_file': 'Per-file mode'
-            }
-            self.logger.info(f"Ingestion mode: {ingest_mode} ({mode_desc.get(ingest_mode, 'Unknown mode')})")
-            self.logger.info(f"Number of documents: {len(doc_info)}")
-            
-            ingest_stats = self.db.ingest(
-                doc_info, 
-                max_workers=ingest_workers, 
-                monitor=self.monitor,
-                ingest_mode=ingest_mode
-            )
-            self.metrics_summary["insertion"] = ingest_stats
-            self.logger.info(f"Insertion finished. Time: {ingest_stats['time']:.2f}s")
-
-            self._update_report({
-                "Insertion Efficiency (Total Dataset)": {
-                    "Total Insertion Time (s)": self.metrics_summary["insertion"]["time"],
-                    "Total Input Tokens": self.metrics_summary["insertion"]["input_tokens"],
-                    "Total Output Tokens": self.metrics_summary["insertion"]["output_tokens"],
-                    "Total Embedding Tokens": self.metrics_summary["insertion"].get("embedding_tokens", 0)
-                }
-            })
+        ingest_workers = self.config['execution'].get('ingest_workers', 10)
+        ingest_mode = self.config['execution'].get('ingest_mode', 'per_file')
         
+        mode_desc = {
+            'directory': 'Unified directory mode',
+            'per_file': 'Per-file mode'
+        }
+        self.logger.info(f"Ingestion mode: {ingest_mode} ({mode_desc.get(ingest_mode, 'Unknown mode')})")
+        self.logger.info(f"Number of documents: {len(doc_info)}")
+        
+        ingest_stats = self.db.ingest(
+            doc_info, 
+            max_workers=ingest_workers, 
+            monitor=self.monitor,
+            ingest_mode=ingest_mode
+        )
+        self.metrics_summary["insertion"] = ingest_stats
+        self.logger.info(f"Import finished. Time: {ingest_stats['time']:.2f}s")
+
+        self._update_report({
+            "Insertion Efficiency (Total Dataset)": {
+                "Total Insertion Time (s)": self.metrics_summary["insertion"]["time"],
+                "Total Input Tokens": self.metrics_summary["insertion"]["input_tokens"],
+                "Total Output Tokens": self.metrics_summary["insertion"]["output_tokens"],
+                "Total Embedding Tokens": self.metrics_summary["insertion"].get("embedding_tokens", 0)
+            }
+        })
+
+    def run_generation(self):
+        """Stage: Generate answers for QA queries"""
+        self.logger.info(">>> Stage: Generation (Retrieve + Generate)")
         samples = self.adapter.load_and_transform()    
         tasks = self._prepare_tasks(samples)
         results_map = {}

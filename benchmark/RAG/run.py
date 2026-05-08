@@ -63,8 +63,8 @@ def main():
     parser.add_argument("--config", default=default_config_path, 
                         help=f"Path to config file. Default: {default_config_path}")
     
-    parser.add_argument("--step", choices=["all", "gen", "eval", "del"], default="all", 
-                        help="Execution step: 'gen' (Retrieval+LLM), 'eval' (Judge), or 'all'")
+    parser.add_argument("--step", choices=["all", "import", "gen", "eval", "del"], default="all", 
+                        help="Execution step: 'import' (Ingest), 'gen' (Retrieve+LLM), 'eval' (Judge), or 'all'")
 
     parser.add_argument("--resume", action="store_true",
                         help="Resume from checkpoint if available")
@@ -152,15 +152,19 @@ def main():
         )
 
         # --- E. Execute Tasks ---
+        if args.step in ["all", "import"]:
+            logger.info("Stage: Import (Data Prepare + Ingest)")
+            pipeline.run_import()
+            
         if args.step in ["all", "gen"]:
-            logger.info("Stage: Generation (Ingest -> Retrieve -> Generate)")
+            logger.info("Stage: Generation (Retrieve + Generate)")
             pipeline.run_generation()
             
         if args.step in ["all", "eval"]:
             logger.info("Stage: Evaluation (Judge -> Metrics)")
             pipeline.run_evaluation()
 
-        if args.step in ["all", "del"]:
+        if args.step in ["del"]:
             logger.info("Stage: Delete Vector Store")
             pipeline.run_deletion()
         

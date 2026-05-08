@@ -343,25 +343,30 @@ class MarkdownParser(BaseParser):
 
         return headings
 
+    def _find_sentence_boundary(self, text: str, start: int, end: int) -> int:
+        for sep in ['\n', '。', '！', '？', '. ', '! ', '? ', '；', ';', '，', ', ', ' ']:
+            pos = text.rfind(sep, start, end)
+            if pos > start:
+                return pos + len(sep)
+        return end
+
     def _smart_split_content(self, content: str, max_size: int) -> List[str]:
-        """
-        Split oversized content by paragraphs, force split single oversized paragraphs.
-
-        Enforces both a token estimate limit (max_size) and a hard character limit
-        (self.config.max_section_chars) to guard against token estimation errors.
-
-        Args:
-            content: Content to split
-            max_size: Maximum size per part (in tokens)
-
-        Returns:
-            List of content parts
-        """
         max_chars = self.config.max_section_chars
         if max_chars <= 0:
-            # Char limit disabled (misconfigured); fall back to token-only splitting
             max_chars = len(content) + 1
-        paragraphs = content.split("\n\n")
+
+        raw_paragraphs = content.split("\n\n")
+        paragraphs = []
+        i = 0
+        while i < len(raw_paragraphs):
+            para = raw_paragraphs[i]
+            if self._heading_pattern.match(para.strip()) and i + 1 < len(raw_paragraphs):
+                paragraphs.append(para + "\n\n" + raw_paragraphs[i + 1])
+                i += 2
+            else:
+                paragraphs.append(para)
+                i += 1
+
         parts = []
         current = ""
         current_tokens = 0
@@ -370,14 +375,24 @@ class MarkdownParser(BaseParser):
             para_tokens = self._estimate_token_count(para)
             para_len = len(para)
 
-            # Single paragraph too long (by tokens or chars): force split by characters
             if para_tokens > max_size or para_len > max_chars:
                 if current:
                     parts.append(current.strip())
                     current = ""
                     current_tokens = 0
-                for i in range(0, len(para), max_chars):
-                    parts.append(para[i : i + max_chars].strip())
+                start = 0
+                while start < len(para):
+                    end = start + max_chars
+                    if end >= len(para):
+                        parts.append(para[start:].strip())
+                        break
+                    boundary = self._find_sentence_boundary(para, start, end)
+                    if boundary > start:
+                        parts.append(para[start:boundary].strip())
+                        start = boundary
+                    else:
+                        parts.append(para[start:end].strip())
+                        start = end
             elif (
                 current_tokens + para_tokens > max_size or len(current) + len(para) + 2 > max_chars
             ) and current:

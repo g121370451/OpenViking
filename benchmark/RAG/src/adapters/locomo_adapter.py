@@ -124,9 +124,6 @@ class LocomoAdapter(BaseAdapter):
             md_lines.append(f"\n## Session {session_idx}")
 
             session_dt = conv.get(dt_key)
-            if session_dt:
-                md_lines.append(f"DATE: {session_dt}")
-
             session_sum = conv.get(sum_key)
             if session_sum:
                 md_lines.append(f"SUMMARY: {session_sum}")
@@ -149,12 +146,16 @@ class LocomoAdapter(BaseAdapter):
                             image_suffix += f"[Attached image {i+1}：{caption}]"
                 
                 dia_suffix = f" [{raw_id}]" if raw_id else ""
+                dt_prefix = ""
+                if session_dt:
+                    date_only = session_dt.split(" on ")[-1] if " on " in session_dt else session_dt
+                    dt_prefix = f" [{date_only}]"
                 
-                md_lines.append(f"**{spk}**: {txt}{image_suffix}{dia_suffix}")
+                md_lines.append(f"**{spk}**{dt_prefix}: {txt}{image_suffix}{dia_suffix}")
 
             session_idx += 1
 
-        return "\n".join(md_lines)
+        return "\n\n".join(md_lines)
 
     def build_prompt(self, qa: StandardQA, context_blocks: List[str]) -> tuple[str, Dict[str, Any]]:
         category = str(qa.category)

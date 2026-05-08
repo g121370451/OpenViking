@@ -25,9 +25,7 @@ class CheckpointManager:
         
         # 移除执行开关，这些不应该影响 hash
         if 'execution' in config_copy:
-            exec_config = config_copy['execution'].copy()
-            exec_config.pop('skip_ingestion', None)
-            config_copy['execution'] = exec_config
+            config_copy['execution'] = config_copy['execution'].copy()
         
         config_str = json.dumps(config_copy, sort_keys=True)
         return hashlib.md5(config_str.encode('utf-8')).hexdigest()
