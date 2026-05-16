@@ -13,7 +13,7 @@ execution:
   ingest_workers: 8
   retrieval_topk: 5
   max_queries: null
-  skip_ingestion: true
+  skip_ingestion: false
   ingest_mode: "directory"
   retrieval_instruction: ""
   generate_refusal_reason: true

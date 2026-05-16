@@ -25,7 +25,7 @@ vikingbot:
   enable_linking: false
   use_relations: true
   link_strategy: blind
-  enable_reasoning: false
+  enable_reasoning: true
 
 paths:
   dataset_path: "datasets/{dataset_name}/qasper_dev.json"

@@ -231,7 +231,10 @@ If you have already found relevant documents and the answer is reasonably clear,
         """Load all bootstrap files from workspace."""
         parts = []
 
+        skip_in_eval = {"TOOLS.md", "SOUL.md"}
         for filename in self.BOOTSTRAP_FILES:
+            if self._eval and filename in skip_in_eval:
+                continue
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")

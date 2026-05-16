@@ -38,6 +38,9 @@ def register_default_tools(
     include_image_tool: bool = True,
     include_viking_tools: bool = True,
     include_web_tools: bool = True,
+    include_filesystem_tools: bool = True,
+    include_exec_tool: bool = True,
+    eval_mode: bool = False,
 ) -> None:
     """
     Register default tools to a tool registry.
@@ -53,6 +56,9 @@ def register_default_tools(
         include_cron_tool: Whether to include cron tool
         include_image_tool: Whether to include image tool
         include_viking_tools: Whether to include Viking tools
+        include_filesystem_tools: Whether to include filesystem tools
+        include_exec_tool: Whether to include exec tool
+        eval_mode: When True, only register minimal Viking tools (search, multi_read, link)
     """
     # Derive all parameters from config
     workspace = config.workspace_path
@@ -68,17 +74,19 @@ def register_default_tools(
     provider_api_base = agent_config.api_base if agent_config else None
     gen_image_model = agent_config.gen_image_model
     # File tools
-    registry.register(ReadFileTool())
-    registry.register(WriteFileTool())
-    registry.register(EditFileTool())
-    registry.register(ListDirTool())
+    if include_filesystem_tools:
+        registry.register(ReadFileTool())
+        registry.register(WriteFileTool())
+        registry.register(EditFileTool())
+        registry.register(ListDirTool())
 
     # Shell tool
-    registry.register(
-        ExecTool(
-            timeout=exec_config.timeout,
+    if include_exec_tool:
+        registry.register(
+            ExecTool(
+                timeout=exec_config.timeout,
+            )
         )
-    )
 
     # Web tools
     if include_web_tools:
@@ -89,13 +97,22 @@ def register_default_tools(
 
     # Open Viking tools
     if include_viking_tools:
-        registry.register(VikingMultiReadTool())
-        registry.register(VikingListTool())
-        registry.register(VikingSearchTool())
-        registry.register(VikingGrepTool())
-        registry.register(VikingGlobTool())
-        if not config.read_only:
-            registry.register(VikingAddResourceTool())
+        if eval_mode:
+            registry.register(VikingSearchTool())
+            registry.register(VikingMultiReadTool())
+            enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0") == "1"
+            link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
+            # llm_review 策略下链接由 post-answer 系统步骤完成，不需要注册工具
+            if not config.read_only and enable_linking and link_strategy != "llm_review":
+                registry.register(VikingLinkTool())
+        else:
+            registry.register(VikingMultiReadTool())
+            registry.register(VikingListTool())
+            registry.register(VikingSearchTool())
+            registry.register(VikingGrepTool())
+            registry.register(VikingGlobTool())
+            if not config.read_only:
+                registry.register(VikingAddResourceTool())
 
 
 

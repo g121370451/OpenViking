@@ -126,7 +126,7 @@ class ToolRegistry:
         sandbox_manager: SandboxManager | None = None,
         sender_id: str | None = None,
         original_question: str | None = None,
-    ) -> str:
+    ) -> tuple[str, ToolContext | None]:
         """
         Execute a tool by name with given parameters.
 
@@ -139,7 +139,9 @@ class ToolRegistry:
             original_question: Original user question, for tools that need query context.
 
         Returns:
-            Tool execution result as string.
+            Tuple of (execution result as string, tool_context). The tool_context
+            is the same object passed to the tool, and may contain structured_result
+            populated by the tool.
 
         Raises:
             KeyError: If tool not found.
@@ -209,9 +211,9 @@ class ToolRegistry:
         )
         result = hook_result.get("result")
         if isinstance(result, Exception):
-            return f"Error executing {name}: {str(result)}"
+            return f"Error executing {name}: {str(result)}", tool_context
         else:
-            return result
+            return result, tool_context
 
     @property
     def tool_names(self) -> list[str]:

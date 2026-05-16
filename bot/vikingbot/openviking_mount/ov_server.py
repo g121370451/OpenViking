@@ -87,11 +87,18 @@ def _get_embedder():
         client = Ark(api_key=api_key, base_url=base_url)
 
         class _Embedder:
+            def __init__(self):
+                self._cache: dict[str, list] = {}
+
             def embed(self, text: str) -> list:
+                if text in self._cache:
+                    return self._cache[text]
                 resp = client.multimodal_embeddings.create(
                     input=[{"type": "text", "text": text}], model=model
                 )
-                return resp.data.embedding
+                embedding = resp.data.embedding
+                self._cache[text] = embedding
+                return embedding
 
         _embedder_cache = _Embedder()
         logger.info(f"[VikingClient] Embedder initialized: model={model}")
@@ -506,10 +513,8 @@ class VikingClient:
             if from_uri == to_uri:
                 continue
             try:
-                # 在 from_uri 的父目录写入正向记录
+                # 只写正向记录：from_uri → to_uri
                 self._append_relation(from_uri, to_uri, query, reason, strategy=strategy, weight=weight)
-                # 在 to_uri 的父目录写入反向记录（支持双向查询）
-                self._append_relation(to_uri, from_uri, query, reason, strategy=strategy, weight=weight)
             except Exception as e:
                 logger.error(f"[Link] Failed to write relation {from_uri} <-> {to_uri}: {e}")
 

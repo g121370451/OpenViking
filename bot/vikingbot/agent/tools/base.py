@@ -36,6 +36,7 @@ class ToolContext:
     workspace_id: str = sandbox_manager.to_workspace_id(session_key) if sandbox_manager else None
     sender_id: str | None = None
     original_question: str | None = None
+    structured_result: Any = None  # 工具可在此存放结构化数据，供 loop.py 的 tools_used 使用
 
 
 """Base class for agent tools."""

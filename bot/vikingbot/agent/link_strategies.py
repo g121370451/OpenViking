@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 class LinkStrategy(ABC):
     """Linking strategy interface."""
 
+    @staticmethod
+    def _normalize_uri(uri: str) -> str:
+        """Normalize a URI by removing whitespace (standard URIs should not contain spaces)."""
+        return re.sub(r'\s+', '', uri)
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -49,7 +54,8 @@ class LinkStrategy(ABC):
             args_str = args_raw
         else:
             return []
-        return re.findall(r'viking://[^\s"\\,\]\}]+', args_str)
+        uris = re.findall(r'viking://[^\s"\\,\]\}]+', args_str)
+        return [LinkStrategy._normalize_uri(u) for u in uris]
 
     def _collect_read_uris(self, tools_used: list[dict]) -> list[str]:
         """收集所有成功 read 的文档 URI（去重）。"""
@@ -134,6 +140,56 @@ class LinkStrategy(ABC):
         return uri_iter
 
 
+    def _collect_search_uris(self, tools_used: list[dict]) -> list[str]:
+        """收集所有 search 结果中的 URI。"""
+        all_uris = []
+        for tool in tools_used:
+            if tool.get("tool_name") == "openviking_search" and tool.get("execute_success"):
+                result = tool.get("result", "")
+                if isinstance(result, list):
+                    for item in result:
+                        uri = item.get("uri", "") if isinstance(item, dict) else ""
+                        if uri:
+                            all_uris.append(self._normalize_uri(uri))
+                elif isinstance(result, str):
+                    all_uris.extend(self._extract_uris_from_args(result))
+        seen = set()
+        return [u for u in all_uris if not (u in seen or seen.add(u))]
+
+    async def _link_search_to_read(
+        self,
+        tools_used: list[dict],
+        read_uris: list[str],
+        original_question: str,
+        client: "VikingClient",
+        strategy_name: str,
+    ) -> int:
+        """建立 search_uri → read_uri 的边（入口文档指向有效文档）。"""
+        search_uris = self._collect_search_uris(tools_used)
+        read_set = set(read_uris)
+        linked = 0
+        seen_pairs: set[tuple[str, str]] = set()
+        for s_uri in search_uris:
+            if s_uri in read_set:
+                continue
+            for r_uri in read_uris:
+                if s_uri == r_uri:
+                    continue
+                pair = (min(s_uri, r_uri), max(s_uri, r_uri))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                try:
+                    await client.link(s_uri, [r_uri], reason="search-to-read",
+                                      query=original_question, strategy=strategy_name, weight=0.8)
+                    linked += 1
+                except Exception as e:
+                    logger.warning(f"[SearchToRead] Link failed: {e}")
+        if linked:
+            logger.info(f"[SearchToRead] Created {linked} search→read relation(s)")
+        return linked
+
+
 class BlindLinkStrategy(LinkStrategy):
     """现有行为: 所有 read 过的 URI 去重后两两盲链接。"""
 
@@ -171,8 +227,12 @@ class BlindLinkStrategy(LinkStrategy):
                 except Exception as e:
                     logger.warning(f"[BlindLink] Link failed: {e}")
 
-        logger.info(f"[BlindLink] Created {len(linked)} relation(s)")
-        return len(linked)
+        # search_uri → read_uri 建边
+        s2r = await self._link_search_to_read(tools_used, unique_uris, original_question, client, self.name)
+
+        total = len(linked) + s2r
+        logger.info(f"[BlindLink] Created {len(linked)} read-read + {s2r} search-read = {total} relation(s)")
+        return total
 
 
 class CrossIterationLinkStrategy(LinkStrategy):
@@ -261,7 +321,15 @@ class CrossIterationLinkStrategy(LinkStrategy):
                             logger.warning(f"[CrossIterLink] Same-iter link failed: {e}")
 
         logger.info(f"[CrossIterLink] Created {cross_linked} cross-iter + {same_linked} same-iter = {cross_linked + same_linked} relation(s)")
-        return cross_linked + same_linked
+
+        # search_uri → read_uri 建边
+        all_read_uris = []
+        for it in iterations:
+            all_read_uris.extend(iteration_uris[it])
+        s2r = await self._link_search_to_read(tools_used, all_read_uris, original_question, client, self.name)
+
+        total = cross_linked + same_linked + s2r
+        return total
 
 
 class LLMReviewLinkStrategy(LinkStrategy):

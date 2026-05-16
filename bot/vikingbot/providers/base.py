@@ -52,6 +52,7 @@ class LLMProvider(ABC):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         session_id: str | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request.

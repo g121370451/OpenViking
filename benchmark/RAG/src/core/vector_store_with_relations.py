@@ -65,17 +65,15 @@ class VikingStoreWithRelations(VikingStoreWrapper):
                  use_query_expansion: bool = False, llm=None, embedder=None,
                  strategy: str = "blind"):
         super().__init__(store_path)
-        # 0 = unlimited, >0 = max additional docs from relations
         self.relations_topk = relations_topk
-        # AGFS localfs maps viking:// to {store_path}/viking/
         self._vikingfs_path = os.path.join(store_path, "viking")
-        # Query expansion: LLM reformulates original question into multiple queries
         self.use_query_expansion = use_query_expansion
-        self._llm = llm  # LLMClientWrapper instance, required if use_query_expansion
-        self._embedder = embedder  # VolcengineEmbedder instance, for vector matching
+        self._llm = llm
+        self._embedder = embedder
         self._strategy = strategy
-        # Strategy-specific relations file name
         self._relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
+        self._embed_cache: dict[str, list] = {}
+        self._ref_caches: dict[str, dict[str, dict]] = {}
 
     def _uri_to_parent_path(self, uri: str) -> str:
         """viking://resources/dataset/file.md -> {vikingfs_path}/resources/dataset"""
@@ -92,32 +90,45 @@ class VikingStoreWithRelations(VikingStoreWrapper):
         """Generate embedding via embedder. Returns list of floats or None."""
         if not self._embedder or not text:
             return None
+        if text in self._embed_cache:
+            return self._embed_cache[text]
         try:
-            return self._embedder.embed(text)
+            result = self._embedder.embed(text)
+            self._embed_cache[text] = result
+            return result
         except Exception as e:
             print(f"[Warning] Embedding failed: {e}")
             return None
 
-    def _resolve_ref_question(self, parent_dir: str, question_id: str) -> dict | None:
-        """Look up question_id in .reference_questions.jsonl, returns {question, embedding} or None."""
+    def _load_ref_cache(self, parent_dir: str) -> dict[str, dict]:
+        """Load .reference_questions.jsonl once per parent_dir, cache in memory."""
+        if parent_dir in self._ref_caches:
+            return self._ref_caches[parent_dir]
+        cache: dict[str, dict] = {}
         ref_path = os.path.join(parent_dir, ".reference_questions.jsonl")
-        if not os.path.exists(ref_path):
-            return None
-        try:
-            with open(ref_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        if rec.get("id") == question_id:
-                            return {"question": rec.get("question", ""), "embedding": rec.get("embedding")}
-                    except json.JSONDecodeError:
-                        continue
-        except Exception:
-            return None
-        return None
+        if os.path.exists(ref_path):
+            try:
+                with open(ref_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                            qid = rec.get("id", "")
+                            if qid:
+                                cache[qid] = {"question": rec.get("question", ""), "embedding": rec.get("embedding")}
+                        except json.JSONDecodeError:
+                            continue
+            except Exception:
+                pass
+        self._ref_caches[parent_dir] = cache
+        return cache
+
+    def _resolve_ref_question(self, parent_dir: str, question_id: str) -> dict | None:
+        """Look up question_id from cached .reference_questions.jsonl."""
+        cache = self._load_ref_cache(parent_dir)
+        return cache.get(question_id)
 
     def _query_relations(self, uri: str, query: str) -> List[str]:
         """Read .relations_{strategy}.jsonl from uri's parent dir, keyword + vector dual matching."""
@@ -285,29 +296,25 @@ class VikingStoreWithRelations(VikingStoreWrapper):
             except Exception:
                 continue
 
-        # Step 3: apply relations_topk limit
-        if self.relations_topk > 0:
-            related_uris = related_uris[:self.relations_topk]
-
-        # Step 4: read and append related docs
+        # Step 3: read related docs and prepend to context (priority position)
         relations_uris = []
-        relations_added = 0
+        relations_blocks = []
         for rel_uri, source_uri in related_uris:
             try:
                 content = self.read_resource(rel_uri)
                 if not content:
                     continue
                 ret["recall_texts"][rel_uri] = content
-                ret["context_blocks"].append(content[:8000])
+                relations_blocks.append(content[:8000])
                 relations_uris.append(rel_uri)
-                relations_added += 1
-            except Exception as e:
+            except Exception:
                 continue
+        ret["context_blocks"] = relations_blocks + ret["context_blocks"]
 
         # Keep retrieved_uris as vector-only
         ret["relations_uris"] = relations_uris
         ret["relations_found"] = len(related_uris)
-        ret["relations_added"] = relations_added
+        ret["relations_added"] = len(relations_uris)
 
         if expanded_queries is not None:
             ret["expanded_queries"] = expanded_queries

@@ -9,7 +9,7 @@ adapter:
 
 execution:
   max_workers: 10
-  ingest_workers: 5
+  ingest_workers: 8
   retrieval_topk: 5
   max_queries: null
   skip_ingestion: true

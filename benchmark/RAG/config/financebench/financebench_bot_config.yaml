@@ -11,7 +11,7 @@ execution:
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 1
-  max_queries: 30
+  max_queries: null
   skip_ingestion: true
   ingest_mode: "directory"
   retrieval_instruction: ""  
@@ -22,7 +22,7 @@ execution:
 vikingbot:
   max_iterations: 50
   log_tool_calls: true
-  enable_reasoning: false
+  enable_reasoning: true
   enable_linking: false
 
 paths:

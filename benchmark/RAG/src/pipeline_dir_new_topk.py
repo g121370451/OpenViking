@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from pathlib import Path
 import sys
-from typing import Set
+from typing import Set, Tuple
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -173,15 +173,74 @@ class BenchmarkPipeline:
             }
             total = len(sorted_results)
             if total > 0:
+                # 计算 tool_result_tokens 平均值
+                avg_tool_result_tokens = {}
+                for r in sorted_results:
+                    trt = r.get('token_usage', {}).get('tool_result_tokens', {})
+                    for k, v in trt.items():
+                        avg_tool_result_tokens[k] = avg_tool_result_tokens.get(k, 0) + v
+                avg_tool_result_tokens = {k: v / total for k, v in avg_tool_result_tokens.items()}
+
                 self._update_report({
                         "Query Efficiency (Average Per Query)": {
                             "Average Retrieval Time (s)": sum(r['retrieval']['latency_sec'] for r in sorted_results) / total,
                             "Average Input Tokens": sum(r['token_usage'].get('total_input_tokens', 0) for r in sorted_results) / total,
                             "Average Output Tokens": sum(r['token_usage'].get('llm_output_tokens', 0) for r in sorted_results) / total,
                             "Average Retrieval Embedding Tokens": sum(r['token_usage'].get('retrieval_embedding_tokens', 0) for r in sorted_results) / total,
+                            "Average Tool Result Tokens": avg_tool_result_tokens,
                         }
                     }
                 )
+
+                # Relations statistics
+                use_relations = self.config.get('vikingbot', {}).get('use_relations', False)
+                enable_linking = self.config.get('vikingbot', {}).get('enable_linking', False)
+                if use_relations or enable_linking:
+                    strategy = self.config.get('vikingbot', {}).get('link_strategy', 'blind')
+                    report_data = {"Strategy": strategy}
+
+                    if enable_linking:
+                        queries_with_links = 0
+                        for r in sorted_results:
+                            tool_calls = r.get("vikingbot", {}).get("tool_calls", [])
+                            for tc in tool_calls:
+                                if tc.get("tool_name") == "openviking_link":
+                                    result_str = tc.get("result", "")
+                                    match = re.search(r"Created (\d+) relation", result_str)
+                                    if match and int(match.group(1)) > 0:
+                                        queries_with_links += 1
+                                        break
+                        report_data["Link Construction Rate"] = round(queries_with_links / total, 4)
+                        report_data["Queries With Links Created"] = queries_with_links
+                        report_data["Queries Without Links"] = total - queries_with_links
+
+                    if use_relations:
+                        queries_with_relations = 0
+                        for r in sorted_results:
+                            tool_calls = r.get("vikingbot", {}).get("tool_calls", [])
+                            if any(tc.get("relations_found", 0) > 0 for tc in tool_calls):
+                                queries_with_relations += 1
+                        report_data["Relations Utilization Rate"] = round(queries_with_relations / total, 4)
+                        report_data["Queries Utilizing Relations"] = queries_with_relations
+                        report_data["Queries Not Utilizing Relations"] = total - queries_with_relations
+
+                        total_edges_count, all_edges = self._count_total_relations(strategy)
+                        hit_edges = self._extract_hit_edges(sorted_results)
+                        hit_count = len(hit_edges & all_edges) if all_edges else 0
+                        coverage = hit_count / total_edges_count if total_edges_count > 0 else 0.0
+                        total_relations_found = sum(
+                            tc.get("relations_found", 0)
+                            for r in sorted_results
+                            for tc in r.get("vikingbot", {}).get("tool_calls", [])
+                        )
+                        report_data["Total Edges in Store"] = total_edges_count
+                        report_data["Unique Edges Hit"] = hit_count
+                        report_data["Edge Coverage Rate"] = round(coverage, 4)
+                        report_data["Total Relations Found (with duplicates)"] = total_relations_found
+                        report_data["Average Relations Found Per Query"] = round(total_relations_found / total, 2)
+
+                    self._update_report({"Relations Statistics": report_data})
+
             with open(self.generated_file, "w", encoding="utf-8") as f:
                 json.dump(save_data, f, indent=2, ensure_ascii=False)
             
@@ -512,6 +571,11 @@ class BenchmarkPipeline:
         vb_usage = (vikingbot_result.get("vikingbot", {}) or {}).get("token_usage", {}) or {}
         in_tokens = int(vb_usage.get("prompt_tokens", 0) or 0)
         out_tokens = int(vb_usage.get("completion_tokens", 0) or 0)
+        tool_result_tokens = vb_usage.get("tool_result_tokens", {})
+        per_iteration = vb_usage.get("per_iteration", [])
+        reasoning_tokens = int(vb_usage.get("reasoning_tokens", 0) or 0)
+        estimated_system_tokens = int(vb_usage.get("estimated_system_prompt_tokens", 0) or 0)
+        estimated_tool_schema_tokens = int(vb_usage.get("estimated_tool_schema_tokens", 0) or 0)
         
         self.monitor.worker_end(tokens=in_tokens + out_tokens)
         
@@ -523,7 +587,15 @@ class BenchmarkPipeline:
             "retrieval": {"latency_sec": total_time, "uris": [], "mode": "agentic"},
             "llm": {"final_answer": ans},
             "metrics": {"Recall": recall}, 
-            "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens},
+            "token_usage": {
+                "total_input_tokens": in_tokens,
+                "llm_output_tokens": out_tokens,
+                "tool_result_tokens": tool_result_tokens,
+                "per_iteration": per_iteration,
+                "reasoning_tokens": reasoning_tokens,
+                "estimated_system_prompt_tokens": estimated_system_tokens,
+                "estimated_tool_schema_tokens": estimated_tool_schema_tokens,
+            },
             "vikingbot": vikingbot_result.get('vikingbot', {})
         }
 
@@ -593,6 +665,69 @@ class BenchmarkPipeline:
         )
         self.logger.info(detailed_info)
         return item
+
+    def _count_total_relations(self, strategy: str) -> Tuple[int, Set[Tuple[str, str]]]:
+        """Count total unique edge pairs in all .relations_{strategy}.jsonl files."""
+        vector_store_path = self.config.get('paths', {}).get('vector_store', '')
+        if not vector_store_path or not os.path.isdir(vector_store_path):
+            return 0, set()
+
+        viking_dir = os.path.join(vector_store_path, "viking")
+        if not os.path.isdir(viking_dir):
+            return 0, set()
+
+        filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
+        all_edges: Set[Tuple[str, str]] = set()
+
+        for root, _dirs, files in os.walk(viking_dir):
+            if filename in files:
+                fpath = os.path.join(root, filename)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                rec = json.loads(line)
+                                uri1 = rec.get("uri1", "")
+                                uri2 = rec.get("uri2", "")
+                                if uri1 and uri2:
+                                    edge = (min(uri1, uri2), max(uri1, uri2))
+                                    all_edges.add(edge)
+                            except json.JSONDecodeError:
+                                continue
+                except Exception:
+                    continue
+
+        return len(all_edges), all_edges
+
+    def _extract_hit_edges(self, results: list) -> Set[Tuple[str, str]]:
+        """Extract unique relation edge pairs hit across all query results."""
+        hit_edges: Set[Tuple[str, str]] = set()
+        for r in results:
+            vikingbot = r.get("vikingbot", {})
+            tool_calls = vikingbot.get("tool_calls", [])
+            for tc in tool_calls:
+                if tc.get("tool_name") != "openviking_search":
+                    continue
+                if not tc.get("relations_found"):
+                    continue
+                result_data = tc.get("result")
+                if not isinstance(result_data, list):
+                    continue
+                for item in result_data:
+                    if not isinstance(item, dict):
+                        continue
+                    match_reason = item.get("match_reason", "")
+                    if not match_reason.startswith("relation_from:"):
+                        continue
+                    source_uri = match_reason.replace("relation_from:", "").strip()
+                    target_uri = item.get("uri", "")
+                    if source_uri and target_uri:
+                        edge = (min(source_uri, target_uri), max(source_uri, target_uri))
+                        hit_edges.add(edge)
+        return hit_edges
 
     def _update_report(self, data):
         """Read existing report, merge new data, and write back"""

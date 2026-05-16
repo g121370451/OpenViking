@@ -128,13 +128,146 @@ class VikingSearchTool(OVFileTool):
             else:
                 resources_list = []
 
-            if resources_list:
+            if not resources_list:
+                return str(results)
+
+            # 过滤无意义的 .abstract.md 和 .overview.md
+            resources_list = [
+                r for r in resources_list
+                if not r.get("uri", "").endswith(".abstract.md")
+                and not r.get("uri", "").endswith(".overview.md")
+            ]
+
+            if not resources_list:
+                return f"No results found for query: {query}"
+
+            # Relations enhancement at search time
+            use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
+            relations_found = 0
+            if use_relations:
+                link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
+                seen_uris = {r.get("uri", "") for r in resources_list}
+
+                resources_list_real = [r for r in resources_list if r.get("uri", "")]
+                rel_tasks = [client.relations(r.get("uri", ""), query=query, strategy=link_strategy) for r in resources_list_real]
+                rel_results = await asyncio.gather(*rel_tasks, return_exceptions=True)
+
+                for r, rels in zip(resources_list_real, rel_results):
+                    if isinstance(rels, Exception):
+                        continue
+                    uri = r.get("uri", "")
+                    for rel in rels:
+                        rel_uri = rel.get("uri", "")
+                        if not rel_uri:
+                            continue
+                        if rel_uri.endswith(".abstract.md") or rel_uri.endswith(".overview.md"):
+                            continue
+                        if rel_uri in seen_uris:
+                            # 已在 search 结果中，升级为 PRIORITY（被 relations 交叉验证）
+                            for existing in resources_list:
+                                if existing.get("uri") == rel_uri and not existing.get("match_reason"):
+                                    existing["match_reason"] = f"relation_from: {uri}"
+                                    existing["relation_reason"] = rel.get("reason", "")
+                                    relations_found += 1
+                                    break
+                            continue
+                        seen_uris.add(rel_uri)
+                        try:
+                            abstract = await client.read_content(rel_uri, level="abstract")
+                        except Exception:
+                            abstract = ""
+                        resources_list.append({
+                            "uri": rel_uri,
+                            "context_type": "ContextType.RESOURCE",
+                            "is_leaf": False,
+                            "abstract": abstract or "",
+                            "overview": None,
+                            "category": "",
+                            "score": 0,
+                            "match_reason": f"relation_from: {uri}",
+                            "relation_reason": rel.get("reason", ""),
+                            "relations": [],
+                        })
+                        relations_found += 1
+
+            # 保存结构化结果供 loop.py 的 tools_used 使用
+            if tool_context:
+                tool_context.structured_result = resources_list
+
+            if use_relations and relations_found > 0:
+                logger.info(f"[Search] Relations mode: {relations_found} related docs found, using priority format")
+                relation_results = []
+                search_results = []
+                for r in resources_list:
+                    if r.get("match_reason", "").startswith("relation_from:"):
+                        relation_results.append(r)
+                    else:
+                        search_results.append(r)
+
+                result_strs = []
+                idx = 1
+
+                # 从 relation_results 中提取 reason 信息，按原始问题分组展示
+                reason_groups: dict[str, list[str]] = {}
+                for r in relation_results:
+                    reason = r.get("relation_reason", "")
+                    if reason and reason not in reason_groups:
+                        reason_groups[reason] = []
+                    if reason:
+                        reason_groups[reason].append(r.get("uri", ""))
+
+                all_searched: list[str] = []
+                result_strs.append("=== PRIORITY (pre-explored results) ===")
+                result_strs.append("")
+                result_strs.append("[RECORD OF PREVIOUS SESSION]")
+                result_strs.append("A previous bot session already searched and answered THIS EXACT SAME QUESTION:")
+                for reason_text in reason_groups:
+                    parts = reason_text.split(" | ")
+                    for part in parts:
+                        if part.startswith("Question: "):
+                            result_strs.append(f"  Question: {part[len('Question: '):]}")
+                        elif part.startswith("Searched: "):
+                            result_strs.append("")
+                            result_strs.append("  ALREADY SEARCHED — DO NOT REPEAT ANY OF THESE:")
+                            search_terms = part[len("Searched: "):].split("; ")
+                            for st in search_terms:
+                                st = st.strip()
+                                if st:
+                                    result_strs.append(f'  ✗ "{st}"')
+                                    all_searched.append(st)
+                            result_strs.append("")
+                result_strs.append("Documents selected as useful by that session:")
+                for r in relation_results:
+                    rel_uri = r.get("uri", "")
+                    rel_abstract = r.get("abstract", "")[:200]
+                    result_strs.append(f"  {idx}. [{rel_uri}] {rel_abstract}")
+                    idx += 1
+                result_strs.append("")
+                result_strs.append("[YOUR STRATEGY]")
+                result_strs.append("(1) Batch-read ALL documents listed above using openviking_multi_read — they were hand-picked as relevant to this question.")
+                result_strs.append("(2) If they contain the answer → respond immediately.")
+                result_strs.append("(3) If not → also read the SEARCH RESULTS below.")
+                result_strs.append("(4) Do NOT re-execute the searches listed in the previous session record — they have already been tried.")
+                result_strs.append("")
+                result_strs.append("=== SEARCH RESULTS ===")
+                for r in search_results:
+                    uri = r.get("uri", "")
+                    abstract = r.get("abstract", "")[:200]
+                    score = r.get("score", 0)
+                    result_strs.append(f"{idx}. [{uri}] (score: {score:.2f}) {abstract}")
+                    idx += 1
+
+                # Build HTML comment with relations_found and searched terms for loop.py
+                searched_encoded = ";;".join(all_searched)
+                output = "\n".join(result_strs)
+                logger.error(f"final context is {output}")
+                output += f"\n<!-- relations_found:{relations_found} searched:{searched_encoded} -->"
+            else:
+                logger.info(f"[Search] Standard mode: {len(resources_list)} results")
                 result_strs = []
                 for i, result in enumerate(resources_list, 1):
                     result_strs.append(f"{i}. {str(result)}")
                 output = "\n".join(result_strs)
-            else:
-                output = str(results)
 
             return output
         except Exception as e:
@@ -677,33 +810,10 @@ class VikingMultiReadTool(OVFileTool):
                 async with semaphore:
                     try:
                         content = await client.read_content(uri, level=level)
-                        relations_found = 0
-
-                        # Relations enhancement at read time
-                        use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
-                        if use_relations and content:
-                            link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
-                            try:
-                                rels = await client.relations(uri, strategy=link_strategy)
-                                for rel in rels:
-                                    rel_uri = rel.get("uri", "")
-                                    if not rel_uri or rel_uri == uri:
-                                        continue
-                                    try:
-                                        rel_content = await client.read_content(rel_uri, level=level)
-                                        if rel_content:
-                                            content += f"\n\n--- Related document: {rel_uri} ---\n{rel_content[:3000]}"
-                                            relations_found += 1
-                                    except Exception:
-                                        continue
-                            except Exception:
-                                pass
-
                         return {
                             "uri": uri,
                             "content": content,
                             "success": True,
-                            "relations_found": relations_found,
                         }
                     except Exception as e:
                         logger.warning(f"Error reading from {uri}: {e}")
@@ -718,7 +828,6 @@ class VikingMultiReadTool(OVFileTool):
             results = await asyncio.gather(*read_tasks)
 
             # 构建结果
-            total_relations = sum(r.get("relations_found", 0) for r in results)
             result_lines = [f"Multi-read results for {len(uris)} resources (level: {level}):"]
 
             for i, result in enumerate(results, 1):
@@ -734,7 +843,6 @@ class VikingMultiReadTool(OVFileTool):
                 result_lines.append(f"--- END OF {uri} ---")
 
             output = "\n".join(result_lines)
-            output += f"\n<!-- relations_found:{total_relations} -->"
             return output
 
         except Exception as e:

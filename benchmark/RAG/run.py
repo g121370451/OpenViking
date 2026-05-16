@@ -83,7 +83,7 @@ def resolve_path(path_str, base_path):
 
 def main():
     parser = ArgumentParser(description="Run RAG Benchmark (Smart Path Handling)")
-    default_config_path = os.path.join(SCRIPT_DIR, "config/locomo/locomo_bot_config_build_links.yaml")
+    default_config_path = os.path.join(SCRIPT_DIR, "config/hotpotqa/hotpotqa_bot_config_relations_review.yaml")
     
     parser.add_argument("--config", default=default_config_path, 
                         help=f"Path to config file. Default: {default_config_path}")

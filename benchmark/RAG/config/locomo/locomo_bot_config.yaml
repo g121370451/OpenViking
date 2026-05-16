@@ -11,7 +11,7 @@ execution:
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 1
-  max_queries: 50
+  max_queries: null
   skip_ingestion: true
   ingest_mode: "directory"
   retrieval_instruction: ""  
@@ -22,15 +22,15 @@ execution:
 vikingbot:
   max_iterations: 50
   log_tool_calls: true
-  enable_reasoning: false
+  enable_reasoning: true
   enable_linking: false
 
 paths:
   dataset_path: "datasets/{dataset_name}/locomo10.json"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
   vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_connection_failures"
-  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}_connection_failuresbenchmark.log"
+  output_dir: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}"
+  log_file: "Output/{dataset_name}/experiment_test_bot_top_{retrieval_topk}.log"
 
 
 llm:

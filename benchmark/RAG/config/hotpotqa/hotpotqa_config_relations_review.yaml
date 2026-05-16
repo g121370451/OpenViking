@@ -8,7 +8,7 @@ adapter:
   class_name: "HotpotQAAdapter"
 
 execution:
-  max_workers: 1
+  max_workers: 10
   ingest_workers: 8
   retrieval_topk: 5
   max_queries: null

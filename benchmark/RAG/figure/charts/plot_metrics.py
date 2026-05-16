@@ -32,8 +32,8 @@ DATASETS = ["FinanceBench", "QASPER", "SyllabusQA", "LocoMo", "NQ", "HotpotQA"]
 # (列索引 0-based, 中文名, 英文文件名后缀, Y轴单位, 是否线性刻度)
 METRICS = [
     (6, "Accuracy", "accuracy", "Accuracy", True),
-    (7, "检索时间", "retrieval_time", "seconds/query", False),
-    (8, "检索Token成本", "retrieval_cost", "tokens/query", False),
+    (7, "检索时间", "retrieval_time", "seconds/query", True),
+    (8, "检索Token成本", "retrieval_cost", "tokens/query", True),
     (9, "迭代次数", "iterations", "iterations/query", True),
 ]
 

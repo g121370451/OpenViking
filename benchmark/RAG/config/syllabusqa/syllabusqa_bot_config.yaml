@@ -8,9 +8,9 @@ adapter:
   class_name: "SyllabusQAAdapter"     
 
 execution:
-  max_workers: 8
+  max_workers: 10
   ingest_workers: 8
-  retrieval_topk: 5
+  retrieval_topk: 1
   max_queries: null
   skip_ingestion: true
   ingest_mode: "directory"
@@ -20,9 +20,9 @@ execution:
 
 # ===========VikingBot Configuration============
 vikingbot:
-  max_iterations: 10
+  max_iterations: 50
   log_tool_calls: true
-  enable_reasoning: false
+  enable_reasoning: true
   enable_linking: false
 
 paths:

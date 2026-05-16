@@ -179,6 +179,13 @@ class AgentLoop:
             subagent_manager=self.subagents,
             cron_service=self.cron_service,
             include_web_tools=not self._eval,
+            include_message_tool=not self._eval,
+            include_spawn_tool=not self._eval,
+            include_cron_tool=not self._eval,
+            include_image_tool=not self._eval,
+            include_filesystem_tools=not self._eval,
+            include_exec_tool=not self._eval,
+            eval_mode=self._eval,
         )
 
     async def run(self) -> None:
@@ -240,6 +247,9 @@ class AgentLoop:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        tool_result_tokens: dict[str, int] = {}
+        per_iteration_usage: list[dict] = []
+        reasoning_tokens: int = 0
 
         # Extract original question from messages
         import re as _re_q
@@ -270,7 +280,7 @@ class AgentLoop:
             search_tool = self.tools.get("openviking_search")
             if search_tool:
                 try:
-                    search_result = await self.tools.execute(
+                    search_result, _ = await self.tools.execute(
                         "openviking_search",
                         {"query": original_query, "target_uri": "viking://resources/"},
                         session_key=session_key,
@@ -295,6 +305,21 @@ class AgentLoop:
                         "name": "openviking_search",
                         "content": search_result,
                     })
+                    # Parse relations_found and searched terms from search result
+                    import re as _re_fs
+                    forced_relations = 0
+                    forced_searched: list[str] = []
+                    rf_match = _re_fs.search(r'<!-- relations_found:(\d+)\s+searched:(.*?)\s*-->', search_result or "")
+                    if rf_match:
+                        forced_relations = int(rf_match.group(1))
+                        searched_str = rf_match.group(2).strip()
+                        if searched_str:
+                            forced_searched = [s.strip() for s in searched_str.split(";;") if s.strip()]
+                    else:
+                        rf_match = _re_fs.search(r'<!-- relations_found:(\d+)\s*-->', search_result or "")
+                        if rf_match:
+                            forced_relations = int(rf_match.group(1))
+
                     iteration = 1
                     tools_used.append({
                         "tool_name": "openviking_search",
@@ -306,11 +331,26 @@ class AgentLoop:
                         "input_token": 0,
                         "output_token": cal_str_tokens(search_result or "", text_type="mixed"),
                         "iteration": 1,
-                        "relations_found": 0,
+                        "relations_found": forced_relations,
                     })
-                    messages.append(
-                        {"role": "system", "content": "Reflect on the results and decide next steps."}
-                    )
+                    tool_result_tokens["openviking_search"] = tool_result_tokens.get("openviking_search", 0) + cal_str_tokens(search_result or "", text_type="mixed")
+                    if forced_relations > 0:
+                        searched_lines = "\n".join(f'  ✗ "{s}"' for s in forced_searched)
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "The following searches have ALREADY been executed for this question "
+                                "by a previous session. Do NOT repeat any of them:\n"
+                                f"{searched_lines}\n\n"
+                                "Now read the PRIORITY documents using openviking_multi_read. "
+                                "If they answer the question, respond immediately. "
+                                "If not, read the SEARCH RESULTS."
+                            )
+                        })
+                    else:
+                        messages.append(
+                            {"role": "system", "content": "Reflect on the results and decide next steps."}
+                        )
                 except Exception:
                     logger.exception("Forced first search failed, continuing with normal loop")
 
@@ -326,17 +366,30 @@ class AgentLoop:
                     )
                 )
 
+            _extra_body = {}
+            if enable_reasoning != "0":
+                _extra_body["thinking"] = {"type": "enabled"}
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
                 model=self.model,
                 session_id=session_key.safe_name(),
+                extra_body=_extra_body or None,
             )
             if response.usage:
                 cur_token = response.usage
                 token_usage["prompt_tokens"] += cur_token["prompt_tokens"]
                 token_usage["completion_tokens"] += cur_token["completion_tokens"]
                 token_usage["total_tokens"] += cur_token["total_tokens"]
+                per_iteration_usage.append({
+                    "iteration": iteration,
+                    "prompt_tokens": cur_token["prompt_tokens"],
+                    "completion_tokens": cur_token["completion_tokens"],
+                })
+
+            # 统计 reasoning tokens
+            if response.reasoning_content:
+                reasoning_tokens += cal_str_tokens(response.reasoning_content, text_type="mixed")
 
             if publish_events and response.reasoning_content:
                 await self.bus.publish_outbound(
@@ -371,7 +424,7 @@ class AgentLoop:
                 async def execute_single_tool(idx: int, tool_call):
                     """Execute a single tool and track execution time."""
                     tool_execute_start_time = time.time()
-                    result = await self.tools.execute(
+                    result, tool_context = await self.tools.execute(
                         tool_call.name,
                         tool_call.arguments,
                         session_key=session_key,
@@ -379,7 +432,7 @@ class AgentLoop:
                         sender_id=sender_id,
                     )
                     tool_execute_duration = (time.time() - tool_execute_start_time) * 1000
-                    return idx, tool_call, result, tool_execute_duration
+                    return idx, tool_call, result, tool_execute_duration, tool_context
 
                 # Run all tool executions in parallel
                 tool_tasks = [
@@ -388,8 +441,10 @@ class AgentLoop:
                 ]
                 results = await asyncio.gather(*tool_tasks)
 
+                total_relations_found = 0
+                total_all_searched: set[str] = set()
                 # Stage 3: Process results sequentially in original order
-                for _idx, tool_call, result, tool_execute_duration in results:
+                for _idx, tool_call, result, tool_execute_duration, tool_context in results:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"[TOOL_CALL]: {tool_call.name}({args_str[:200]})")
                     logger.info(f"[RESULT]: {str(result)[:600]}")
@@ -415,16 +470,39 @@ class AgentLoop:
 
                     import re as _re
                     relations_found = 0
+                    searched_from_comment: list[str] = []
                     if tool_call.name in ("openviking_search", "openviking_multi_read"):
-                        rf_match = _re.search(r'<!-- relations_found:(\d+) -->', result or "")
+                        rf_match = _re.search(r'<!-- relations_found:(\d+)\s+searched:(.*?)\s*-->', result or "")
                         if rf_match:
                             relations_found = int(rf_match.group(1))
+                            searched_str = rf_match.group(2).strip()
+                            if searched_str:
+                                searched_from_comment = [s.strip() for s in searched_str.split(";;") if s.strip()]
+                        else:
+                            # Fallback: old format without searched terms
+                            rf_match = _re.search(r'<!-- relations_found:(\d+)\s*-->', result or "")
+                            if rf_match:
+                                relations_found = int(rf_match.group(1))
+
+                    total_relations_found += relations_found
+                    total_all_searched.update(searched_from_comment)
+
+                    # Parse args as object if it's a JSON string
+                    try:
+                        args_obj = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    except (json.JSONDecodeError, TypeError):
+                        args_obj = args_str
+
+                    # Use structured result if available, otherwise fall back to string result
+                    display_result = getattr(tool_context, 'structured_result', None)
+                    if display_result is None:
+                        display_result = result
 
                     tool_used_dict = {
                         "tool_name": tool_call.name,
-                        "args": args_str,
-                        "reasoning": (response.content or response.reasoning_content or "")[:1000],
-                        "result": result,
+                        "args": args_obj,
+                        "reasoning": (response.reasoning_content or response.content or "")[:1000],
+                        "result": display_result,
                         "duration": tool_execute_duration,
                         "execute_success": True
                         if result and "Error executing" not in result
@@ -435,26 +513,44 @@ class AgentLoop:
                         "relations_found": relations_found,
                     }
                     tools_used.append(tool_used_dict)
+                    tool_result_tokens[tool_call.name] = tool_result_tokens.get(tool_call.name, 0) + cal_str_tokens(result, text_type="mixed")
 
-                messages.append(
-                    {"role": "system", "content": "Reflect on the results and decide next steps."}
-                )
+                if total_relations_found > 0:
+                    searched_lines = "\n".join(f'  ✗ "{s}"' for s in sorted(total_all_searched))
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "The following searches have ALREADY been executed for this question "
+                            "by a previous session. Do NOT repeat any of them:\n"
+                            f"{searched_lines}\n\n"
+                            "Now read the PRIORITY documents using openviking_multi_read. "
+                            "If they answer the question, respond immediately. "
+                            "If not, read the SEARCH RESULTS."
+                        )
+                    })
+                else:
+                    messages.append(
+                        {"role": "system", "content": "Reflect on the results and decide next steps."}
+                    )
             else:
                 final_content = response.content
                 break
-
         if final_content is None:
             if iteration >= self.max_iterations:
                 final_content = f"Reached {self.max_iterations} iterations without completion."
             else:
                 final_content = "I've completed processing but have no response to give."
 
-        # LLM Review step: bot marks useful documents → code creates all pairwise links
+        # LLM Review step: precise relation building with minimal context
         _link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "")
         _enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
+        logger.info(
+            f"[LLMReview] gate check: strategy={_link_strategy}, enable={_enable_linking}, "
+            f"tools_used={len(tools_used) if tools_used else 0}, "
+            f"original_query={bool(original_query)}"
+        )
         if _link_strategy == "llm_review" and _enable_linking == "1" and tools_used and original_query:
             from vikingbot.agent.link_strategies import LinkStrategy
-            from vikingbot.agent.tools.ov_file import VikingLinkTool
 
             read_uris: set[str] = set()
             uri_content: dict[str, str] = {}
@@ -466,32 +562,105 @@ class AgentLoop:
                     for u in uris:
                         read_uris.add(u)
                         if u not in uri_content:
-                            uri_content[u] = (result or "")[:800]
+                            uri_content[u] = (result or "")
 
-            if read_uris:
-                uri_list_lines = []
-                for u in sorted(read_uris):
-                    preview = uri_content.get(u, "")[:200].replace("\n", " ")
-                    uri_list_lines.append(f"- {u}\n  {preview}")
-                uri_list = "\n".join(uri_list_lines)
+            # 收集 search 结果中的 URI 及其所在轮次，同时保存 abstract/score
+            search_uri_iterations: dict[str, int] = {}
+            search_uri_meta: dict[str, dict] = {}  # uri -> {"abstract": ..., "score": ...}
+            for tool in tools_used:
+                if tool.get("tool_name") == "openviking_search" and tool.get("execute_success"):
+                    iter_num = tool.get("iteration", 1)
+                    result = tool.get("result", "")
+                    if isinstance(result, list):
+                        for item in result:
+                            if not isinstance(item, dict):
+                                continue
+                            uri = item.get("uri", "")
+                            if uri:
+                                uri = LinkStrategy._normalize_uri(uri)
+                                if uri not in search_uri_iterations:
+                                    search_uri_iterations[uri] = iter_num
+                                    search_uri_meta[uri] = {
+                                        "abstract": item.get("abstract", ""),
+                                        "score": item.get("score", 0),
+                                    }
+                    elif isinstance(result, str):
+                        for u in LinkStrategy._extract_uris_from_args(result):
+                            if u not in search_uri_iterations:
+                                search_uri_iterations[u] = iter_num
+            search_uris = set(search_uri_iterations.keys())
 
-                review_msg = (
-                    f"You have read the following documents during your research:\n\n"
-                    f"{uri_list}\n\n"
-                    f"Please review these documents and identify which ones are USEFUL for answering the question: \"{original_query}\"\n\n"
-                    f"Use the openviking_link tool to mark useful documents. "
-                    f"For each useful document, link it to at least one other useful document that is related. "
-                    f"Only mark documents that actually help answer the question."
+            logger.info(
+                f"[LLMReview] collected: read_uris={len(read_uris)}, search_uris={len(search_uris)}, "
+                f"search_uri_meta={len(search_uri_meta)}"
+            )
+
+            if read_uris or search_uris:
+                # 确定候选池和 prompt
+                import re as _re
+
+                if read_uris:
+                    # Case 1: 有 read_uris，用 read 内容作为候选池
+                    candidate_uris = set(read_uris)
+                    uri_list_lines = []
+                    for idx, u in enumerate(sorted(read_uris), 1):
+                        preview = uri_content.get(u, "")[:300].replace("\n", " ")
+                        uri_list_lines.append(f"{idx}. {u}\n   Content: {preview}")
+                    uri_list = "\n".join(uri_list_lines)
+                    review_prompt = (
+                        f"Question: {original_query}\n"
+                        f"Answer: {final_content[:800]}\n\n"
+                        f"Documents read during research:\n{uri_list}\n\n"
+                        f"Task: Which of the above documents were USEFUL for answering the question?\n"
+                        f"The answer was generated using these documents, so at least one MUST be relevant.\n\n"
+                        f"Rules:\n"
+                        f"- You MUST return at least one URI. An empty array [] is NEVER valid.\n"
+                        f"- If unsure, pick the document most likely related to the answer.\n\n"
+                        f"Output ONLY a JSON array of URI strings, no other text:\n"
+                        f'["viking://...", "viking://...", ...]\n'
+                    )
+                else:
+                    # Case 2: search-only，用 search 结果的 abstract 作为候选池
+                    # 按 score 排序取 top 15
+                    sorted_search = sorted(
+                        search_uri_meta.items(),
+                        key=lambda x: x[1].get("score", 0),
+                        reverse=True,
+                    )[:15]
+                    candidate_uris = {uri for uri, _ in sorted_search}
+                    uri_list_lines = []
+                    for idx, (u, meta) in enumerate(sorted_search, 1):
+                        abstract = (meta.get("abstract") or "")[:200].replace("\n", " ")
+                        uri_list_lines.append(f"{idx}. {u}\n   Abstract: {abstract}")
+                    uri_list = "\n".join(uri_list_lines)
+                    review_prompt = (
+                        f"Question: {original_query}\n"
+                        f"Answer: {final_content[:800]}\n\n"
+                        f"Documents found via search:\n{uri_list}\n\n"
+                        f"Task: Based on the abstracts, which documents were USEFUL for answering the question?\n"
+                        f"The answer was generated using these documents, so at least one MUST be relevant.\n\n"
+                        f"Rules:\n"
+                        f"- You MUST return at least one URI. An empty array [] is NEVER valid.\n"
+                        f"- If unsure, pick the document most likely related to the answer.\n\n"
+                        f"Output ONLY a JSON array of URI strings, no other text:\n"
+                        f'["viking://...", "viking://...", ...]\n'
+                    )
+
+                logger.info(
+                    f"[LLMReview] candidate_uris={len(candidate_uris)}, "
+                    f"mode={'read' if read_uris else 'search-only'}, "
+                    f"search_uris={len(search_uris)}"
                 )
-
-                link_tool = VikingLinkTool()
-                self.tools.register(link_tool)
+                logger.debug(f"[LLMReview] review_prompt:\n{review_prompt[:1500]}")
 
                 try:
-                    review_messages = messages + [{"role": "system", "content": review_msg}]
+                    review_messages = [
+                        {"role": "system", "content": "You are a document relation analyst. Output only valid JSON."},
+                        {"role": "user", "content": review_prompt},
+                    ]
                     review_response = await self.provider.chat(
                         messages=review_messages,
-                        tools=[link_tool.to_schema()],
+                        tools=[],
                         model=self.model,
                         session_id=session_key.safe_name(),
                     )
@@ -501,36 +670,78 @@ class AgentLoop:
                         token_usage["completion_tokens"] += review_response.usage.get("completion_tokens", 0)
                         token_usage["total_tokens"] += review_response.usage.get("total_tokens", 0)
 
-                    # Collect useful URIs from bot's openviking_link calls
-                    useful_uris: set[str] = set()
-                    if review_response.has_tool_calls:
-                        for tool_call in review_response.tool_calls:
-                            if tool_call.name != "openviking_link":
-                                continue
-                            args_str = tool_call.arguments
-                            try:
-                                args = json.loads(args_str) if isinstance(args_str, str) else args_str
-                            except json.JSONDecodeError:
-                                continue
-                            # Extract URIs from this call (both from_uri and uris)
-                            call_uris = LinkStrategy._extract_uris_from_args(args)
-                            useful_uris.update(call_uris)
+                    # Parse LLM output as JSON
+                    raw_output = review_response.content or ""
+                    # 1. 清理 markdown 代码块包裹
+                    cleaned = _re.sub(r'```(?:json)?\s*', '', raw_output).strip()
+                    cleaned = _re.sub(r'```\s*$', '', cleaned).strip()
 
-                            iteration += 1
-                            tools_used.append({
-                                "tool_name": "openviking_link",
-                                "args": args_str if isinstance(args_str, str) else json.dumps(args_str),
-                                "reasoning": "(review step)",
-                                "result": "",
-                                "duration": 0,
-                                "execute_success": True,
-                                "input_token": 0,
-                                "output_token": 0,
-                                "iteration": iteration,
-                                "relations_found": 0,
-                            })
+                    # 2. 尝试提取 JSON 数组
+                    json_match = _re.search(r'\[.*\]', cleaned, _re.DOTALL)
+                    useful_uris = []
+                    parse_method = "none"
 
-                    # Pairwise linking: all read URIs → useful URIs
+                    logger.info(f"[LLMReview] raw_output={raw_output[:300]}")
+
+                    if json_match:
+                        try:
+                            parsed = json.loads(json_match.group())
+                            for item in parsed:
+                                if isinstance(item, str):
+                                    u = LinkStrategy._normalize_uri(item)
+                                    if u in candidate_uris:
+                                        useful_uris.append(u)
+                                elif isinstance(item, dict):
+                                    u = LinkStrategy._normalize_uri(item.get("uri", ""))
+                                    if u in candidate_uris:
+                                        useful_uris.append(u)
+                            parse_method = "json"
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                f"[LLMReview] JSON parse FAILED. Raw output (first 300 chars): {raw_output[:300]}"
+                            )
+
+                    # 3. fallback：正则提取 viking:// URI，与 candidate_uris 取交集
+                    if not useful_uris:
+                        found_uris = _re.findall(r'viking://[^\s"\'\\,\]\}]+', raw_output)
+                        for u in found_uris:
+                            u = LinkStrategy._normalize_uri(u.rstrip('.'))
+                            if u in candidate_uris:
+                                useful_uris.append(u)
+                        if useful_uris:
+                            parse_method = "regex-fallback"
+
+                    # 去重
+                    useful_uris = list(dict.fromkeys(useful_uris))
+
+                    # Fallback: 如果 LLM 返回空数组，强制选 score 最高的候选文档
+                    if not useful_uris:
+                        if read_uris:
+                            # read 模式：选第一个 read_uri 作为 fallback
+                            useful_uris = [sorted(candidate_uris)[0]]
+                        elif search_uri_meta:
+                            # search-only 模式：选 score 最高的
+                            best_uri = max(search_uri_meta.keys(), key=lambda u: search_uri_meta[u].get("score", 0))
+                            if best_uri in candidate_uris:
+                                useful_uris = [best_uri]
+                            else:
+                                useful_uris = [sorted(candidate_uris)[0]]
+                        else:
+                            useful_uris = [sorted(candidate_uris)[0]]
+                        parse_method = "forced-fallback"
+                        logger.warning(
+                            f"[LLMReview] LLM returned empty, forced fallback: {useful_uris}"
+                        )
+
+                    # 日志
+                    if useful_uris:
+                        logger.info(f"[LLMReview] Parsed {len(useful_uris)} useful doc(s) via {parse_method}")
+                    else:
+                        logger.warning(
+                            f"[LLMReview] 0 useful docs extracted. "
+                            f"candidate_uris={len(candidate_uris)}, raw_output={raw_output[:300]}"
+                        )
+
                     if useful_uris:
                         from vikingbot.openviking_mount.ov_server import VikingClient
                         workspace_id = self.sandbox_manager.to_workspace_id(session_key) if self.sandbox_manager else None
@@ -538,8 +749,52 @@ class AgentLoop:
                         try:
                             linked = 0
                             seen_pairs: set[tuple[str, str]] = set()
-                            for src in read_uris:
-                                for tgt in useful_uris:
+
+                            # 用原始问题搜索 top5 URI，并入 from_uris 以扩展链接覆盖
+                            try:
+                                search_result = await rv_client.search(original_query)
+                                top5_resources = search_result.get("resources", [])[:5]
+                                top5_uris = set()
+                                for r in top5_resources:
+                                    uri = r.get("uri", "")
+                                    if uri:
+                                        top5_uris.add(LinkStrategy._normalize_uri(uri))
+                                all_search_uris = search_uris | top5_uris
+                                logger.info(
+                                    f"[LLMReview] top5 search added {len(top5_uris)} URIs to from_uris "
+                                    f"(total search_uris: {len(search_uris)} -> {len(all_search_uris)})"
+                                )
+                            except Exception as e:
+                                logger.warning(f"[LLMReview] top5 search failed, using original search_uris: {e}")
+                                all_search_uris = search_uris
+
+                            # from_uris = search_uris - useful_uris（避免自链接）
+                            from_uris = all_search_uris - set(useful_uris)
+                            if not from_uris:
+                                # 如果所有 search URI 都被选为 useful，用全部 search_uris
+                                from_uris = all_search_uris
+
+                            # 收集所有 search 轮次的改写 query，构建富 reason
+                            search_queries = []
+                            for tool in tools_used:
+                                if tool.get("tool_name") == "openviking_search" and tool.get("execute_success"):
+                                    args = tool.get("args", {})
+                                    if isinstance(args, str):
+                                        try:
+                                            args = json.loads(args)
+                                        except (json.JSONDecodeError, TypeError):
+                                            args = {}
+                                    if isinstance(args, dict):
+                                        q = args.get("query", "")
+                                        if q and q not in search_queries:
+                                            search_queries.append(q)
+                            reason_parts = [f"Question: {original_query}"]
+                            if search_queries:
+                                reason_parts.append(f"Searched: {'; '.join(search_queries)}")
+                            link_reason = " | ".join(reason_parts)
+
+                            for tgt in useful_uris:
+                                for src in from_uris:
                                     if src == tgt:
                                         continue
                                     pair = (min(src, tgt), max(src, tgt))
@@ -547,18 +802,68 @@ class AgentLoop:
                                         continue
                                     seen_pairs.add(pair)
                                     try:
-                                        await rv_client.link(src, [tgt], reason="bot-review",
+                                        await rv_client.link(src, [tgt], reason=link_reason,
                                                             query=original_query, strategy="llm_review", weight=1.0)
                                         linked += 1
                                     except Exception as e:
                                         logger.warning(f"[LLMReview] Link failed: {e}")
-                            logger.info(f"[LLMReview] Created {linked} pairwise relation(s) from {len(read_uris)} sources × {len(useful_uris)} targets")
+
+                            iteration += 1
+                            tools_used.append({
+                                "tool_name": "openviking_link",
+                                "args": json.dumps({
+                                    "from_uris": sorted(from_uris),
+                                    "to_uris": useful_uris,
+                                }),
+                                "reasoning": "(precise review step)",
+                                "result": f"Created {linked} relation(s) from {len(from_uris)} from_uris to {len(useful_uris)} useful docs, parse={parse_method}",
+                                "duration": 0,
+                                "execute_success": linked > 0,
+                                "input_token": 0,
+                                "output_token": 0,
+                                "iteration": iteration,
+                                "relations_found": 0,
+                            })
+                            logger.info(
+                                f"[LLMReview] post_link DONE: created {linked} edge(s), "
+                                f"from {len(from_uris)} from_uris to {len(useful_uris)} useful_docs, "
+                                f"parse={parse_method}"
+                            )
                         finally:
                             await rv_client.close()
+                    else:
+                        # 解析失败，仍然写 tools_used 记录
+                        logger.warning(
+                            f"[LLMReview] post_link SKIPPED - no useful docs parsed. "
+                            f"search_uris={len(search_uris)}, read_uris={len(read_uris)}, "
+                            f"query={original_query[:100]}"
+                        )
+                        iteration += 1
+                        tools_used.append({
+                            "tool_name": "openviking_link",
+                            "args": json.dumps({"from_uris": sorted(search_uris), "to_uris": []}),
+                            "reasoning": "(precise review step - PARSE FAILED)",
+                            "result": f"FAILED: parse_method={parse_method}",
+                            "duration": 0,
+                            "execute_success": False,
+                            "input_token": 0,
+                            "output_token": 0,
+                            "iteration": iteration,
+                            "relations_found": 0,
+                            "parse_method": parse_method,
+                        })
                 except Exception:
                     logger.exception("[LLMReview] Review step failed, continuing")
-                # Note: VikingLinkTool stays registered but loop is ending, so no cleanup needed
 
+        # 估算固定开销
+        estimated_system_tokens = cal_str_tokens(messages[0].get("content", "") if messages and messages[0].get("role") == "system" else "", text_type="mixed")
+        estimated_tool_schema_tokens = cal_str_tokens(json.dumps(self.tools.get_definitions()), text_type="mixed")
+
+        token_usage["tool_result_tokens"] = tool_result_tokens
+        token_usage["per_iteration"] = per_iteration_usage
+        token_usage["reasoning_tokens"] = reasoning_tokens
+        token_usage["estimated_system_prompt_tokens"] = estimated_system_tokens
+        token_usage["estimated_tool_schema_tokens"] = estimated_tool_schema_tokens
         return final_content, tools_used, token_usage, iteration, original_query
 
     @trace(

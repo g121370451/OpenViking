@@ -170,6 +170,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         session_id: str | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -215,6 +216,9 @@ class LiteLLMProvider(LLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         # Langfuse integration
         # Note: session_id is set via propagate_attributes in loop.py, not here

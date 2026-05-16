@@ -25,7 +25,7 @@ execution:
   # Limit the maximum number of queries to process, null means process all queries
   max_queries: null
   # Whether to skip document ingestion phase (true means use existing vector index)
-  skip_ingestion: false
+  skip_ingestion: true
   # Document ingestion mode
   # - "directory": Unified directory ingestion mode, treats the entire directory as one document
   # - "per_file": Per-file ingestion mode, each file is treated as a separate document

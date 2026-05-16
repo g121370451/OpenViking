@@ -21,7 +21,7 @@ execution:
 
 # ===========VikingBot Configuration============
 vikingbot:
-  max_iterations: 10
+  max_iterations: 60
   log_tool_calls: true
   enable_linking: true
   link_strategy: llm_review

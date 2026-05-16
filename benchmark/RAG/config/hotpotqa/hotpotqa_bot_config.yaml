@@ -22,7 +22,7 @@ execution:
 vikingbot:
   max_iterations: 50
   log_tool_calls: true
-  enable_reasoning: false
+  enable_reasoning: true
   enable_linking: false
 paths:
   dataset_path: "datasets/{dataset_name}/hotpot_qa_100.json"

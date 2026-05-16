@@ -244,6 +244,10 @@ def _clean_tool_calls(tools_used):
         try:
             tools_used = json.loads(tools_used)
         except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                f"[ToolsParse] _clean_tool_calls: tools_used is unparseable string, "
+                f"len={len(tools_used)}, first_200={tools_used[:200]}"
+            )
             return tools_used
     if not isinstance(tools_used, list):
         return tools_used
@@ -272,19 +276,147 @@ def _clean_tool_calls(tools_used):
     return cleaned
 
 
+def _clean_json_chunk(raw: str) -> str:
+    """递归清洗 JSON 片段中字符串值的 \\' 和未转义内部双引号。
+
+    使用 key-based boundary 检测来正确定位字符串值的结束位置，
+    即使字符串内部有未转义的 " 也能正确处理。
+    """
+    # 所有可能出现的 JSON key（顶层 + result 内部）
+    all_keys = [
+        'tool_name', 'args', 'reasoning', 'duration', 'execute_success',
+        'iteration', 'relations_found', 'result',
+        'uri', 'context_type', 'is_leaf', 'abstract', 'overview',
+        'category', 'score', 'match_reason', 'relations',
+        'from', 'to', 'reason', 'weight', 'query', 'target_uri',
+        'from_uri', 'to_uri', 'relation_type', 'uris',
+    ]
+    key_alt = '|'.join(re.escape(k) for k in all_keys)
+    # boundary: 下一个已知 key 或结构符号
+    boundary_re = re.compile(r'"\s*,\s*"(' + key_alt + r')"\s*:|"\s*,\s*\{|"\s*,\s*\[|"\s*\}|"\s*\]')
+
+    out = []
+    i = 0
+    n = len(raw)
+
+    while i < n:
+        ch = raw[i]
+
+        # 遇到 { 或 [ → 括号匹配，递归清洗内部
+        if ch in '{[':
+            depth = 1
+            i += 1
+            esc = False
+            in_s = False
+            start_inner = i
+            while i < n and depth > 0:
+                c = raw[i]
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"':
+                    in_s = not in_s
+                elif not in_s:
+                    if c in '{[':
+                        depth += 1
+                    elif c in '}]':
+                        depth -= 1
+                i += 1
+            # ch 是开括号，raw[i-1] 是闭括号
+            out.append(ch)
+            inner_content = raw[start_inner:i - 1]
+            out.append(_clean_json_chunk(inner_content))
+            out.append(raw[i - 1])
+            continue
+
+        # 遇到 "key": 模式 → 检测是否是已知 key
+        if ch == '"':
+            key_m = re.match(r'"(' + key_alt + r')"\s*:', raw[i:])
+            if key_m:
+                # 是已知 key，原样输出 key 部分
+                out.append(raw[i:i + key_m.end()])
+                i += key_m.end()
+
+                # 跳过空白
+                while i < n and raw[i] in ' \t':
+                    out.append(raw[i]); i += 1
+
+                if i >= n:
+                    continue
+
+                # value 是 { 或 [ → 交给下一轮循环处理
+                if raw[i] in '{[':
+                    continue
+
+                # value 是数字/bool/null → 原样输出到逗号或 } ]
+                if raw[i] != '"':
+                    while i < n and raw[i] not in ',}]':
+                        out.append(raw[i]); i += 1
+                    continue
+
+                # value 是字符串 → 用 boundary 检测找真正的结束位置
+                out.append('"'); i += 1  # 跳过开引号
+                bm = boundary_re.search(raw, i)
+                if bm:
+                    inner = raw[i:bm.start()]
+                else:
+                    inner = raw[i:]
+
+                # 清洗内部：去 \'，去未转义的 "
+                inner = inner.replace("\\'", "'")
+                inner = inner.replace('\\"', '').replace('"', '')
+                out.append(inner)
+                out.append('"')
+
+                if bm:
+                    i = bm.start() + 1  # +1 跳过 boundary 中的 "
+                else:
+                    i = n
+                continue
+
+            # 不是已知 key 的 " → 可能是数组中的普通字符串值
+            # 用转义感知找闭合引号
+            out.append(ch); i += 1
+            esc = False
+            while i < n:
+                c = raw[i]
+                if esc:
+                    out.append(c); i += 1; esc = False
+                elif c == '\\':
+                    # 检查是否是 \' → 替换为 '
+                    if i + 1 < n and raw[i + 1] == "'":
+                        out.append("'"); i += 2
+                    else:
+                        out.append(c); i += 1; esc = True
+                elif c == '"':
+                    out.append(c); i += 1; break
+                else:
+                    out.append(c); i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return ''.join(out)
+
+
 def _fix_malformed_tools_json(raw: str) -> list:
     """
     Fix common malformed JSON patterns in LLM-generated tool calls:
     1. Any key whose value is "{ ... }" (object wrapped in quotes) → strip outer quotes
-    2. Any key whose string value contains unescaped inner quotes → remove them
-    3. Remove all \n and \\n from the raw string (both real newlines and escaped ones)
+    2. Any key whose value is "[...]" (array wrapped in quotes) → strip outer quotes
+    3. Any key whose value starts with [ or { → bracket-match to find end
+    4. Any key whose string value contains unescaped inner quotes → remove them
+    5. Remove all \n and \\n from the raw string (both real newlines and escaped ones)
     """
     # Pre-clean: remove all newline variants and fix escaped single quotes
     raw = raw.replace('\\n', ' ').replace('\n', ' ').replace('\r', ' ')
     raw = raw.replace("\\'", "'")
     raw = raw.replace("\'", "'")
 
-    all_keys = ['tool_name', 'args', 'reasoning', 'duration', 'execute_success', 'iteration']
+    all_keys = ['tool_name', 'args', 'reasoning', 'duration', 'execute_success',
+                'iteration', 'relations_found', 'result']
     key_alt = '|'.join(re.escape(k) for k in all_keys)
     key_re = re.compile(r'"(' + key_alt + r')"\s*:')
     boundary_re = re.compile(r'"\s*,\s*"(' + key_alt + r')"|"\s*,\s*\{|"\s*\}')
@@ -308,11 +440,49 @@ def _fix_malformed_tools_json(raw: str) -> list:
             if i >= length:
                 continue
 
-            # Case 1: value starts with " followed by { → object wrapped in quotes, strip outer "
+            # Case 1: value starts with { → object, bracket-match
+            if raw[i] == '{':
+                stack, in_str, esc = 0, False, False
+                while i < length:
+                    ch = raw[i]
+                    if ch == '\\' and not esc:
+                        esc = True
+                    else:
+                        if ch == '"' and not esc: in_str = not in_str
+                        if not in_str:
+                            if ch == '{': stack += 1
+                            elif ch == '}': stack -= 1
+                        esc = False
+                    result.append(ch); i += 1
+                    if stack == 0 and ch == '}':
+                        break
+                continue
+
+            # Case 2: value starts with [ → array, bracket-match
+            if raw[i] == '[':
+                stack, in_str, esc = 0, False, False
+                while i < length:
+                    ch = raw[i]
+                    if ch == '\\' and not esc:
+                        esc = True
+                    else:
+                        if ch == '"' and not esc: in_str = not in_str
+                        if not in_str:
+                            if ch == '[': stack += 1
+                            elif ch == ']': stack -= 1
+                        esc = False
+                    result.append(ch); i += 1
+                    if stack == 0 and ch == ']':
+                        break
+                continue
+
+            # Case 3: value starts with "
             if raw[i] == '"':
                 peek = i + 1
                 while peek < length and raw[peek] in ' \t\\':
                     peek += 1
+
+                # Case 3a: "{ ... }" → object wrapped in quotes, strip outer "
                 if peek < length and raw[peek] == '{':
                     i += 1  # skip opening "
                     stack, in_str, esc = 0, False, False
@@ -334,7 +504,29 @@ def _fix_malformed_tools_json(raw: str) -> list:
                             break
                     continue
 
-                # Case 2: normal string value — find boundary, remove inner quotes
+                # Case 3b: "[ ... ]" → array wrapped in quotes, strip outer "
+                if peek < length and raw[peek] == '[':
+                    i += 1  # skip opening "
+                    stack, in_str, esc = 0, False, False
+                    while i < length:
+                        ch = raw[i]
+                        if ch == '\\' and not esc:
+                            esc = True
+                        else:
+                            if ch == '"' and not esc: in_str = not in_str
+                            if not in_str:
+                                if ch == '[': stack += 1
+                                elif ch == ']': stack -= 1
+                            esc = False
+                        result.append(ch); i += 1
+                        if stack == 0 and ch == ']':
+                            while i < length and raw[i] in ' \t':
+                                result.append(raw[i]); i += 1
+                            if i < length and raw[i] == '"': i += 1
+                            break
+                    continue
+
+                # Case 3c: normal string value — find boundary, remove inner quotes
                 result.append('"'); i += 1
                 bm = boundary_re.search(raw, i)
                 if bm:
@@ -355,6 +547,7 @@ def _fix_malformed_tools_json(raw: str) -> list:
         i += 1
 
     fixed = ''.join(result)
+    fixed = _clean_json_chunk(fixed)
     data = json.loads(fixed)
     if isinstance(data, str):
         data = json.loads(data)
@@ -415,16 +608,58 @@ def _extract_json_payload(output: str) -> Optional[dict]:
             'completion_tokens': int(completion_tokens.group(1)) if completion_tokens else 0,
             'total_tokens': int(total_tokens.group(1)) if total_tokens else 0
         }
+
+    # 提取 tool_result_tokens（嵌套在 token_usage 中）
+    trt_match = re.search(r'"tool_result_tokens"\s*:\s*(\{[^}]*\})', obj_str)
+    if trt_match:
+        trt_str = trt_match.group(1)
+        if 'token_usage' not in result:
+            result['token_usage'] = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+        tool_result_tokens = {}
+        for m in re.finditer(r'"([^"]+)"\s*:\s*(\d+)', trt_str):
+            tool_result_tokens[m.group(1)] = int(m.group(2))
+        result['token_usage']['tool_result_tokens'] = tool_result_tokens
+
+    # 提取 per_iteration
+    pi_match = re.search(r'"per_iteration"\s*:\s*(\[.*?\])', obj_str)
+    if pi_match:
+        try:
+            if 'token_usage' not in result:
+                result['token_usage'] = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+            result['token_usage']['per_iteration'] = json.loads(pi_match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 提取 reasoning_tokens
+    rt_match = re.search(r'"reasoning_tokens"\s*:\s*(\d+)', obj_str)
+    if rt_match:
+        if 'token_usage' not in result:
+            result['token_usage'] = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+        result['token_usage']['reasoning_tokens'] = int(rt_match.group(1))
+
+    # 提取 estimated_system_prompt_tokens
+    est_sys_match = re.search(r'"estimated_system_prompt_tokens"\s*:\s*(\d+)', obj_str)
+    if est_sys_match:
+        if 'token_usage' not in result:
+            result['token_usage'] = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+        result['token_usage']['estimated_system_prompt_tokens'] = int(est_sys_match.group(1))
+
+    # 提取 estimated_tool_schema_tokens
+    est_tool_match = re.search(r'"estimated_tool_schema_tokens"\s*:\s*(\d+)', obj_str)
+    if est_tool_match:
+        if 'token_usage' not in result:
+            result['token_usage'] = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+        result['token_usage']['estimated_tool_schema_tokens'] = int(est_tool_match.group(1))
     
     # 提取 time_cost
     tc_match = re.search(r'"time_cost"\s*:\s*([\d.]+)', obj_str)
     if tc_match:
         result['time_cost'] = float(tc_match.group(1))
     
-    # 提取 iteration
-    it_match = re.search(r'"iteration"\s*:\s*(\d+)', obj_str)
-    if it_match:
-        result['iteration'] = int(it_match.group(1))
+    # 提取 total_iterations（顶层字段，不会和 tools_used 中的 iteration 冲突）
+    ti_match = re.search(r'"total_iterations"\s*:\s*(\d+)', obj_str)
+    if ti_match:
+        result['iteration'] = int(ti_match.group(1))
     
     # 提取 tools_used_names
     tun_match = re.search(r'"tools_used_names"\s*:\s*(\[[^\]]*\])', obj_str)
@@ -470,6 +705,10 @@ def _extract_json_payload(output: str) -> Optional[dict]:
                     try:
                         result['tools_used'] = _fix_malformed_tools_json(tools_str)
                     except Exception:
+                        logger.warning(
+                            f"[ToolsParse] _fix_malformed_tools_json also failed. "
+                            f"tools_str (first 500 chars): {tools_str[:500]}"
+                        )
                         result['tools_used'] = tools_str
     
     if 'text' in result:
@@ -606,13 +845,18 @@ Question: {question}"""
                 logger.warning(f"VikingBot stderr:\n{stderr}")
             resp_json = _extract_json_payload(output)
             # If JSON extraction fails, use the raw output as answer
+            tool_calls_parse_error = None
             if resp_json is None:
-                logger.warning(f"Failed to extract JSON from VikingBot output, using raw output")
+                logger.warning(
+                    f"Failed to extract JSON from VikingBot output, using raw output. "
+                    f"stdout_len={len(output)}, first_200={output[:200]}"
+                )
                 answer = output
                 token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 total_time = time.time() - start_time
                 iterations_used = 0
                 tool_calls = []
+                tool_calls_parse_error = f"_extract_json_payload returned None, stdout_len={len(output)}"
             else:
                 answer = resp_json.get("text", output)
                 token_usage = resp_json.get(
@@ -620,7 +864,7 @@ Question: {question}"""
                     {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 )
                 total_time = float(resp_json.get("time_cost", time.time() - start_time))
-                iterations_used = int(resp_json.get("iteration", 0))
+                iterations_used = int(resp_json.get("iteration", 0) or resp_json.get("total_iterations", 0))
                 tools_used = resp_json.get("tools_used", [])
                 tool_calls = _clean_tool_calls(tools_used)
 
@@ -639,7 +883,8 @@ Question: {question}"""
                     "iterations_used": iterations_used,
                     "tool_calls": tool_calls,
                     "total_tool_time": 0.0,
-                    "token_usage": token_usage
+                    "token_usage": token_usage,
+                    "tool_calls_parse_error": tool_calls_parse_error,
                 }
             }
             
