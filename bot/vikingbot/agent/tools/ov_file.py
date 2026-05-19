@@ -141,54 +141,58 @@ class VikingSearchTool(OVFileTool):
             if not resources_list:
                 return f"No results found for query: {query}"
 
-            # Relations enhancement at search time
+            # Relations enhancement at search time (BFS multi-hop)
             use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
             relations_found = 0
             if use_relations:
                 link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
                 seen_uris = {r.get("uri", "") for r in resources_list}
 
-                resources_list_real = [r for r in resources_list if r.get("uri", "")]
-                rel_tasks = [client.relations(r.get("uri", ""), query=query, strategy=link_strategy) for r in resources_list_real]
-                rel_results = await asyncio.gather(*rel_tasks, return_exceptions=True)
+                frontier = [r.get("uri", "") for r in resources_list if r.get("uri", "")]
 
-                for r, rels in zip(resources_list_real, rel_results):
-                    if isinstance(rels, Exception):
-                        continue
-                    uri = r.get("uri", "")
-                    for rel in rels:
-                        rel_uri = rel.get("uri", "")
-                        if not rel_uri:
+                while frontier:
+                    rel_tasks = [client.relations(uri, query=query, strategy=link_strategy) for uri in frontier]
+                    rel_results = await asyncio.gather(*rel_tasks, return_exceptions=True)
+
+                    next_frontier = []
+                    for from_uri, rels in zip(frontier, rel_results):
+                        if isinstance(rels, Exception):
                             continue
-                        if rel_uri.endswith(".abstract.md") or rel_uri.endswith(".overview.md"):
-                            continue
-                        if rel_uri in seen_uris:
-                            # 已在 search 结果中，升级为 PRIORITY（被 relations 交叉验证）
-                            for existing in resources_list:
-                                if existing.get("uri") == rel_uri and not existing.get("match_reason"):
-                                    existing["match_reason"] = f"relation_from: {uri}"
-                                    existing["relation_reason"] = rel.get("reason", "")
-                                    relations_found += 1
-                                    break
-                            continue
-                        seen_uris.add(rel_uri)
-                        try:
-                            abstract = await client.read_content(rel_uri, level="abstract")
-                        except Exception:
-                            abstract = ""
-                        resources_list.append({
-                            "uri": rel_uri,
-                            "context_type": "ContextType.RESOURCE",
-                            "is_leaf": False,
-                            "abstract": abstract or "",
-                            "overview": None,
-                            "category": "",
-                            "score": 0,
-                            "match_reason": f"relation_from: {uri}",
-                            "relation_reason": rel.get("reason", ""),
-                            "relations": [],
-                        })
-                        relations_found += 1
+                        for rel in rels:
+                            rel_uri = rel.get("uri", "")
+                            if not rel_uri:
+                                continue
+                            if rel_uri.endswith(".abstract.md") or rel_uri.endswith(".overview.md"):
+                                continue
+                            if rel_uri in seen_uris:
+                                for existing in resources_list:
+                                    if existing.get("uri") == rel_uri and not existing.get("match_reason"):
+                                        existing["match_reason"] = f"relation_from: {from_uri}"
+                                        existing["relation_reason"] = rel.get("reason", "")
+                                        relations_found += 1
+                                        break
+                                continue
+                            seen_uris.add(rel_uri)
+                            try:
+                                abstract = await client.read_content(rel_uri, level="abstract")
+                            except Exception:
+                                abstract = ""
+                            resources_list.append({
+                                "uri": rel_uri,
+                                "context_type": "ContextType.RESOURCE",
+                                "is_leaf": False,
+                                "abstract": abstract or "",
+                                "overview": None,
+                                "category": "",
+                                "score": 0,
+                                "match_reason": f"relation_from: {from_uri}",
+                                "relation_reason": rel.get("reason", ""),
+                                "relations": [],
+                            })
+                            relations_found += 1
+                            next_frontier.append(rel_uri)
+
+                    frontier = next_frontier
 
             # 保存结构化结果供 loop.py 的 tools_used 使用
             if tool_context:

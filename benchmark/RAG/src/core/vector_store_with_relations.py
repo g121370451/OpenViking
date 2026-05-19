@@ -285,16 +285,26 @@ class VikingStoreWithRelations(VikingStoreWrapper):
         vector_uris = list(ret["retrieved_uris"])
         vector_uris_set = set(vector_uris)
 
-        # Step 2: query relations for each vector result (always uses original query)
+        # Step 2: query relations for each vector result with BFS multi-hop
         related_uris = []
-        for uri in vector_uris:
-            try:
-                rels = self._query_relations(uri, query)
-                for r in rels:
-                    if r not in vector_uris_set and r not in {x[0] for x in related_uris}:
-                        related_uris.append((r, uri))
-            except Exception:
-                continue
+        related_uris_set = set()
+        frontier = list(vector_uris)
+        seen_uris = set(vector_uris)
+
+        while frontier:
+            next_frontier = []
+            for uri in frontier:
+                try:
+                    rels = self._query_relations(uri, query)
+                    for r in rels:
+                        if r not in seen_uris and r not in related_uris_set:
+                            related_uris.append((r, uri))
+                            related_uris_set.add(r)
+                            next_frontier.append(r)
+                except Exception:
+                    continue
+            seen_uris.update(next_frontier)
+            frontier = next_frontier
 
         # Step 3: read related docs and prepend to context (priority position)
         relations_uris = []
