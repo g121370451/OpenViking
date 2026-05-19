@@ -523,9 +523,8 @@ class AgentLoop:
                             "The following searches have ALREADY been executed for this question "
                             "by a previous session. Do NOT repeat any of them:\n"
                             f"{searched_lines}\n\n"
-                            "Now read the PRIORITY documents using openviking_multi_read. "
-                            "If they answer the question, respond immediately. "
-                            "If not, read the SEARCH RESULTS."
+                            "Now batch-read ALL documents (both PRIORITY and SEARCH RESULTS) "
+                            "in a SINGLE openviking_multi_read call, then answer immediately."
                         )
                     })
                 else:
@@ -563,6 +562,35 @@ class AgentLoop:
                         read_uris.add(u)
                         if u not in uri_content:
                             uri_content[u] = (result or "")
+                # grep structured_result: list of {"uri", "line", "content", "pattern"}
+                if tool.get("tool_name") == "openviking_grep" and tool.get("execute_success"):
+                    result = tool.get("result", "")
+                    if isinstance(result, list):
+                        # Structured format from tool_context.structured_result
+                        for item in result:
+                            if isinstance(item, dict):
+                                uri = item.get("uri", "")
+                                if uri:
+                                    uri = LinkStrategy._normalize_uri(uri)
+                                    read_uris.add(uri)
+                                    if uri not in uri_content:
+                                        uri_content[uri] = ""
+                                    # Append grep match content to uri_content
+                                    uri_content[uri] += f"L{item.get('line', '?')}: {item.get('content', '')}\n"
+                    elif isinstance(result, str):
+                        # Fallback: parse text format "[uri]\n  L42: content"
+                        import re as _re_grep
+                        current_uri = None
+                        for line in result.split("\n"):
+                            line_s = line.strip()
+                            m = _re_grep.match(r'^\[(.+)\]$', line_s)
+                            if m:
+                                current_uri = LinkStrategy._normalize_uri(m.group(1))
+                                read_uris.add(current_uri)
+                                if current_uri not in uri_content:
+                                    uri_content[current_uri] = ""
+                            elif current_uri and line_s.startswith("L"):
+                                uri_content[current_uri] += line_s + "\n"
 
             # 收集 search 结果中的 URI 及其所在轮次，同时保存 abstract/score
             search_uri_iterations: dict[str, int] = {}

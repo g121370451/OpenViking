@@ -770,7 +770,7 @@ class VikingBotRunner:
     def __init__(self, config: Dict[str, Any]):
         """
         Initialize VikingBotRunner.
-        
+
         Args:
             config: Configuration dictionary containing vikingbot settings
         """
@@ -785,6 +785,10 @@ class VikingBotRunner:
         self.embedding_config = config.get('embedding', {})
         # Get vector store path from config if available
         self.vector_store_path = config.get('paths', {}).get('vector_store')
+        # Create log directory under output_dir for bot JSON output files
+        output_dir = config.get('paths', {}).get('output_dir', '.')
+        self.log_dir = os.path.join(output_dir, "log")
+        os.makedirs(self.log_dir, exist_ok=True)
     
     def generate_answer(
         self,
@@ -824,8 +828,12 @@ class VikingBotRunner:
 Question: {question}"""
             env = _build_vikingbot_env(ov_conf_path, self.max_iterations, self.enable_linking, self.use_relations, self.embedding_config, self.link_strategy, self.enable_reasoning)
 
+            # Write bot JSON output to log dir (persistent, for inspection)
+            safe_session = session_id.replace("/", "_").replace("\\", "_")
+            output_file = os.path.join(self.log_dir, f"{safe_session}.json")
+
             # Use CLI mode only for thread safety in multi-threaded environments
-            cmd = ["vikingbot", "chat", "-m", input_msg, "-s", session_id, "-e", "-c", ov_conf_path]
+            cmd = ["vikingbot", "chat", "-m", input_msg, "-s", session_id, "-e", "-c", ov_conf_path, "-o", output_file]
             logger.debug(f"Running command: {' '.join(cmd)}")
             logger.debug(f"Using config file: {ov_conf_path}")
             result = subprocess.run(
@@ -840,10 +848,25 @@ Question: {question}"""
             )
             output = result.stdout.strip()
             stderr = result.stderr.strip()
-            logger.debug(f"VikingBot stdout: {repr(output)}")
+            logger.debug(f"VikingBot stdout: {repr(output[:500])}")
             if stderr:
                 logger.warning(f"VikingBot stderr:\n{stderr}")
-            resp_json = _extract_json_payload(output)
+
+            # Read structured JSON from output file (guaranteed valid)
+            resp_json = None
+            try:
+                if os.path.exists(output_file):
+                    with open(output_file, "r", encoding="utf-8") as f:
+                        resp_json = json.load(f)
+                    logger.debug(f"Successfully read bot output from: {output_file}")
+                else:
+                    logger.warning(f"Output file not found: {output_file}, falling back to stdout parsing")
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to read output file: {e}, falling back to stdout parsing")
+
+            # Fallback to stdout parsing if file-based approach failed
+            if resp_json is None:
+                resp_json = _extract_json_payload(output)
             # If JSON extraction fails, use the raw output as answer
             tool_calls_parse_error = None
             if resp_json is None:

@@ -244,10 +244,9 @@ class VikingSearchTool(OVFileTool):
                     idx += 1
                 result_strs.append("")
                 result_strs.append("[YOUR STRATEGY]")
-                result_strs.append("(1) Batch-read ALL documents listed above using openviking_multi_read — they were hand-picked as relevant to this question.")
-                result_strs.append("(2) If they contain the answer → respond immediately.")
-                result_strs.append("(3) If not → also read the SEARCH RESULTS below.")
-                result_strs.append("(4) Do NOT re-execute the searches listed in the previous session record — they have already been tried.")
+                result_strs.append("(1) Batch-read ALL documents (both PRIORITY and SEARCH RESULTS) in a SINGLE openviking_multi_read call.")
+                result_strs.append("(2) Answer immediately from the content.")
+                result_strs.append("(3) Do NOT re-execute the searches listed in the previous session record — they have already been tried.")
                 result_strs.append("")
                 result_strs.append("=== SEARCH RESULTS ===")
                 for r in search_results:
@@ -422,16 +421,31 @@ class VikingGrepTool(OVFileTool):
                 pattern_str = ", ".join(f"'{p}'" for p in patterns)
                 return f"No matches found for patterns: {pattern_str}"
 
-            # Format output
-            result_lines = [f"Found {total_matches} match{'es' if total_matches != 1 else ''} across {len(patterns)} pattern{'s' if len(patterns) != 1 else ''}:"]
-
+            # Build structured result (like search's structured_result)
+            structured = []
             for match_uri, matches in merged_results.items():
-                # Sort matches by line number
                 matches.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
-                result_lines.append(f"\n📄 {match_uri}")
                 for line, content, pattern_name in matches:
-                    result_lines.append(f"   Line {line} (pattern: '{pattern_name}'):")
-                    result_lines.append(f"   {content}")
+                    structured.append({
+                        "uri": match_uri,
+                        "line": line,
+                        "content": content.strip(),
+                        "pattern": pattern_name,
+                    })
+
+            # Store structured result for tools_used output
+            if tool_context:
+                tool_context.structured_result = structured
+
+            # Format concise string for LLM context
+            result_lines = [f"{total_matches} matches in {len(merged_results)} files:"]
+            result_lines.append("")
+            for match_uri, matches in merged_results.items():
+                matches.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
+                result_lines.append(f"[{match_uri}]")
+                for line, content, pattern_name in matches:
+                    result_lines.append(f"  L{line}: {content.strip()}")
+                result_lines.append("")
 
             return "\n".join(result_lines)
         except Exception as e:

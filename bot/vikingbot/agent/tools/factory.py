@@ -100,6 +100,8 @@ def register_default_tools(
         if eval_mode:
             registry.register(VikingSearchTool())
             registry.register(VikingMultiReadTool())
+            registry.register(VikingListTool())
+            registry.register(VikingGrepTool())
             enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0") == "1"
             link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
             # llm_review 策略下链接由 post-answer 系统步骤完成，不需要注册工具
