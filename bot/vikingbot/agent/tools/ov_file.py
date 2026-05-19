@@ -216,26 +216,16 @@ class VikingSearchTool(OVFileTool):
                     if reason:
                         reason_groups[reason].append(r.get("uri", ""))
 
-                all_searched: list[str] = []
                 result_strs.append("=== PRIORITY (pre-explored results) ===")
                 result_strs.append("")
                 result_strs.append("[RECORD OF PREVIOUS SESSION]")
                 result_strs.append("A previous bot session already searched and answered THIS EXACT SAME QUESTION:")
+
                 for reason_text in reason_groups:
-                    parts = reason_text.split(" | ")
-                    for part in parts:
-                        if part.startswith("Question: "):
-                            result_strs.append(f"  Question: {part[len('Question: '):]}")
-                        elif part.startswith("Searched: "):
-                            result_strs.append("")
-                            result_strs.append("  ALREADY SEARCHED — DO NOT REPEAT ANY OF THESE:")
-                            search_terms = part[len("Searched: "):].split("; ")
-                            for st in search_terms:
-                                st = st.strip()
-                                if st:
-                                    result_strs.append(f'  ✗ "{st}"')
-                                    all_searched.append(st)
-                            result_strs.append("")
+                    result_strs.append("")
+                    result_strs.append(reason_text)
+                    result_strs.append("")
+
                 result_strs.append("Documents selected as useful by that session:")
                 for r in relation_results:
                     rel_uri = r.get("uri", "")
@@ -244,9 +234,9 @@ class VikingSearchTool(OVFileTool):
                     idx += 1
                 result_strs.append("")
                 result_strs.append("[YOUR STRATEGY]")
-                result_strs.append("(1) Batch-read ALL documents (both PRIORITY and SEARCH RESULTS) in a SINGLE openviking_multi_read call.")
-                result_strs.append("(2) Answer immediately from the content.")
-                result_strs.append("(3) Do NOT re-execute the searches listed in the previous session record — they have already been tried.")
+                result_strs.append("(1) Batch-read ONLY the PRIORITY documents in a SINGLE openviking_multi_read call.")
+                result_strs.append("(2) Answer immediately from the content. Only read SEARCH RESULTS if PRIORITY documents are insufficient.")
+                result_strs.append("(3) The Path above shows exactly how the previous session found the answer — skip those steps.")
                 result_strs.append("")
                 result_strs.append("=== SEARCH RESULTS ===")
                 for r in search_results:
@@ -256,11 +246,9 @@ class VikingSearchTool(OVFileTool):
                     result_strs.append(f"{idx}. [{uri}] (score: {score:.2f}) {abstract}")
                     idx += 1
 
-                # Build HTML comment with relations_found and searched terms for loop.py
-                searched_encoded = ";;".join(all_searched)
                 output = "\n".join(result_strs)
                 logger.error(f"final context is {output}")
-                output += f"\n<!-- relations_found:{relations_found} searched:{searched_encoded} -->"
+                output += f"\n<!-- relations_found:{relations_found} searched: -->"
             else:
                 logger.info(f"[Search] Standard mode: {len(resources_list)} results")
                 result_strs = []

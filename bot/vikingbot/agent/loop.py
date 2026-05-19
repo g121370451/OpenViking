@@ -34,6 +34,70 @@ if TYPE_CHECKING:
     from vikingbot.cron.service import CronService
 
 
+def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, final_content: str) -> str:
+    """为 from→tgt 这条边构建执行路径摘要（纯字符串拼接，无 LLM）。"""
+    path_parts = []
+    for tool in tools_used:
+        tool_name = tool.get("tool_name", "")
+        if not tool.get("execute_success"):
+            continue
+
+        args = tool.get("args", "")
+        result = tool.get("result", "")
+
+        involves_tgt = False
+
+        if tool_name == "openviking_search":
+            if isinstance(result, list):
+                involves_tgt = any(
+                    isinstance(item, dict) and item.get("uri", "") == tgt_uri
+                    for item in result
+                )
+            elif isinstance(result, str):
+                involves_tgt = tgt_uri in result
+
+        elif tool_name in ("openviking_read", "openviking_multi_read"):
+            args_str = json.dumps(args) if not isinstance(args, str) else args
+            involves_tgt = tgt_uri in args_str
+
+        elif tool_name == "openviking_grep":
+            if isinstance(result, list):
+                involves_tgt = any(
+                    isinstance(item, dict) and item.get("uri", "") == tgt_uri
+                    for item in result
+                )
+            elif isinstance(result, str):
+                involves_tgt = tgt_uri in result
+
+        if not involves_tgt:
+            continue
+
+        if tool_name == "openviking_search":
+            args_obj = json.loads(args) if isinstance(args, str) else args
+            query = args_obj.get("query", "") if isinstance(args_obj, dict) else ""
+            path_parts.append(f'search("{query[:50]}")')
+
+        elif tool_name in ("openviking_read", "openviking_multi_read"):
+            path_parts.append(f"read({tgt_uri})")
+
+        elif tool_name == "openviking_grep":
+            args_obj = json.loads(args) if isinstance(args, str) else args
+            pattern = args_obj.get("pattern", "") if isinstance(args_obj, dict) else ""
+            grep_hits = []
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, dict) and item.get("uri") == tgt_uri:
+                        grep_hits.append(f"L{item.get('line', '?')}: {item.get('content', '')[:60]}")
+            hit_str = "; ".join(grep_hits[:3])
+            if hit_str:
+                path_parts.append(f'grep("{pattern[:30]}") -> {hit_str}')
+            else:
+                path_parts.append(f'grep("{pattern[:30]}")')
+
+    path_str = " -> ".join(path_parts) if path_parts else "direct relation"
+    return f"Q: {original_query[:100]}\nPath: {path_str}\nAnswer: {final_content[:100]}"
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -523,8 +587,9 @@ class AgentLoop:
                             "The following searches have ALREADY been executed for this question "
                             "by a previous session. Do NOT repeat any of them:\n"
                             f"{searched_lines}\n\n"
-                            "Now batch-read ALL documents (both PRIORITY and SEARCH RESULTS) "
-                            "in a SINGLE openviking_multi_read call, then answer immediately."
+                            "Now read the PRIORITY documents using openviking_multi_read. "
+                            "If they answer the question, respond immediately. "
+                            "If not, read the SEARCH RESULTS."
                         )
                     })
                 else:
@@ -802,26 +867,8 @@ class AgentLoop:
                                 # 如果所有 search URI 都被选为 useful，用全部 search_uris
                                 from_uris = all_search_uris
 
-                            # 收集所有 search 轮次的改写 query，构建富 reason
-                            search_queries = []
-                            for tool in tools_used:
-                                if tool.get("tool_name") == "openviking_search" and tool.get("execute_success"):
-                                    args = tool.get("args", {})
-                                    if isinstance(args, str):
-                                        try:
-                                            args = json.loads(args)
-                                        except (json.JSONDecodeError, TypeError):
-                                            args = {}
-                                    if isinstance(args, dict):
-                                        q = args.get("query", "")
-                                        if q and q not in search_queries:
-                                            search_queries.append(q)
-                            reason_parts = [f"Question: {original_query}"]
-                            if search_queries:
-                                reason_parts.append(f"Searched: {'; '.join(search_queries)}")
-                            link_reason = " | ".join(reason_parts)
-
                             for tgt in useful_uris:
+                                edge_reason = _build_edge_reason(original_query, tgt, tools_used, final_content)
                                 for src in from_uris:
                                     if src == tgt:
                                         continue
@@ -830,7 +877,7 @@ class AgentLoop:
                                         continue
                                     seen_pairs.add(pair)
                                     try:
-                                        await rv_client.link(src, [tgt], reason=link_reason,
+                                        await rv_client.link(src, [tgt], reason=edge_reason,
                                                             query=original_query, strategy="llm_review", weight=1.0)
                                         linked += 1
                                     except Exception as e:
