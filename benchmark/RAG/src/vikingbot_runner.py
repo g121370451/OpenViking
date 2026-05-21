@@ -31,7 +31,7 @@ _OPENVIKING_SERVER_LOG_FH: Optional[Any] = None
 _SERVER_LOCK = threading.Lock()
 
 
-def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str) -> str:
+def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, search_limit=None) -> str:
     with open(original_conf_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
 
@@ -45,11 +45,16 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str) -> s
         config['storage'] = {}
     config['storage']['workspace'] = vector_store_path
 
+    if search_limit is not None:
+        config['default_search_limit'] = search_limit
+
     temp_dir = Path(__file__).parent.parent / ".temp"
     temp_dir.mkdir(exist_ok=True)
 
-    vector_store_path_bytes = vector_store_path.encode('utf-8')
-    path_hash = hashlib.md5(vector_store_path_bytes).hexdigest()
+    hash_input = vector_store_path.encode('utf-8')
+    if search_limit is not None:
+        hash_input += f"_sl{search_limit}".encode('utf-8')
+    path_hash = hashlib.md5(hash_input).hexdigest()
     temp_conf_path = str(temp_dir / f"ov_{path_hash}.conf")
 
     if os.path.exists(temp_conf_path):
@@ -226,6 +231,7 @@ class VikingBotRunner:
         self.vikingbot_config = config.get('vikingbot', {})
         self.max_iterations = self.vikingbot_config.get('max_iterations', 50)
         self.log_tool_calls = self.vikingbot_config.get('log_tool_calls', True)
+        self.search_limit = self.vikingbot_config.get('search_limit')
         self.vector_store_path = config.get('paths', {}).get('vector_store')
 
     def generate_answer(
@@ -242,7 +248,7 @@ class VikingBotRunner:
             ov_conf_path = _OV_CONF_PATH
             temp_conf_path = None
             if self.vector_store_path:
-                temp_conf_path = _generate_temp_ov_conf(_OV_CONF_PATH, self.vector_store_path)
+                temp_conf_path = _generate_temp_ov_conf(_OV_CONF_PATH, self.vector_store_path, search_limit=self.search_limit)
                 ov_conf_path = temp_conf_path
                 logger.info(f"Using vector store: {self.vector_store_path}")
 

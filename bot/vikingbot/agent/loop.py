@@ -262,6 +262,145 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    @staticmethod
+    def _format_messages_for_compression(messages: list[dict]) -> str:
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "")
+            if role == "system":
+                continue
+            if role == "assistant":
+                content = msg.get("content", "") or ""
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "")
+                        args = fn.get("arguments", "")
+                        lines.append(f"[Called {name}({args})]")
+                if content.strip() and content.strip() != "\n":
+                    lines.append(f"[Assistant: {content[:500]}]")
+            elif role == "tool":
+                name = msg.get("name", "unknown")
+                content = msg.get("content", "") or ""
+                lines.append(f"[{name}]: {content}")
+            elif role == "user":
+                content = msg.get("content", "") or ""
+                lines.append(f"[User]: {content}")
+        return "\n".join(lines)
+
+    async def _compress_history_with_summary(
+        self,
+        messages: list[dict],
+        keep_recent: int = 3,
+        token_usage: dict | None = None,
+    ) -> tuple[list[dict], dict]:
+        reflect_count = 0
+        boundary = 0
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if msg.get("role") == "user" and "Reflect" in (msg.get("content", "") or ""):
+                reflect_count += 1
+                if reflect_count > keep_recent:
+                    boundary = i + 1
+                    break
+
+        if boundary == 0:
+            return messages, {}
+
+        old_messages = messages[:boundary]
+        recent_messages = messages[boundary:]
+
+        system_messages = [m for m in old_messages if m.get("role") == "system"]
+        non_system_old = [m for m in old_messages if m.get("role") != "system"]
+
+        if not non_system_old:
+            return messages, {}
+
+        existing_summary = ""
+        new_messages = []
+        for msg in non_system_old:
+            content = msg.get("content", "") or ""
+            if msg.get("role") == "user" and "Previous conversation" in content and "summary" in content:
+                existing_summary = content.replace("[Previous conversation summary]", "").replace("[Previous conversation \nsummary]", "").strip()
+            elif msg.get("role") == "assistant" and content.strip() == "Understood. I'll continue based on this context.":
+                continue
+            else:
+                new_messages.append(msg)
+
+        if new_messages:
+            conversation = self._format_messages_for_compression(new_messages)
+        else:
+            conversation = ""
+
+        if not conversation and not existing_summary:
+            return messages, {}
+
+        compression_prompt = (
+            "Compress into a dense record. No meta-descriptions. Start directly with content.\n\n"
+            "Rules:\n"
+            "1. Preserve ORIGINAL QUESTION verbatim\n"
+            "2. List ALL searched queries (prevent repeats)\n"
+            "3. List ALL read URIs (prevent re-reads)\n"
+            "4. Extract ONLY relevant facts from reads — no filler\n"
+            "5. Search abstracts → topic + relevance, one line each\n"
+            "6. Preserve intermediate conclusions/reasoning\n"
+            "7. Preserve eliminated options [ELIMINATED], failed attempts [TRIED-FAILED]\n"
+            "8. Conflicting facts → preserve BOTH, mark [CONFLICT]\n\n"
+            "Format:\n"
+            "## Question\n<verbatim>\n\n"
+            "## Searches\n- \"<query>\": <topic>\n\n"
+            "## Reads\n- <URI>: <facts>\n\n"
+            "## Facts\n- <key facts>\n\n"
+            "## Conclusions\n- <deduced so far>\n\n"
+            "## Eliminated\n- [ELIMINATED]/[TRIED-FAILED]/[CONFLICT] <items>\n\n"
+        )
+
+        if existing_summary:
+            compression_prompt += f"## Prior Summary (merge into output)\n{existing_summary}\n\n"
+        if conversation:
+            compression_prompt += f"## New Conversation\n{conversation}"
+
+        try:
+            response = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": "Dense compression agent. No filler, preserve all facts including negatives. No meta-descriptions."},
+                    {"role": "user", "content": compression_prompt},
+                ],
+                model=self.model,
+                max_tokens=3072,
+                temperature=0,
+                session_id="compression",
+            )
+            summary = (response.content or "").strip()
+            if not summary:
+                return messages, {}
+            compression_usage = {}
+            if response.usage:
+                compression_usage = {
+                    "prompt_tokens": response.usage.get("prompt_tokens", 0),
+                    "completion_tokens": response.usage.get("completion_tokens", 0),
+                    "total_tokens": response.usage.get("total_tokens", 0),
+                }
+                if token_usage is not None:
+                    token_usage["prompt_tokens"] += compression_usage["prompt_tokens"]
+                    token_usage["completion_tokens"] += compression_usage["completion_tokens"]
+                    token_usage["total_tokens"] += compression_usage["total_tokens"]
+        except Exception as e:
+            logger.warning(f"History compression failed, keeping original: {e}")
+            return messages, {}
+
+        compressed = list(system_messages)
+        compressed.append({"role": "user", "content": f"[Previous conversation summary]\n{summary}"})
+        compressed.append({"role": "assistant", "content": "Understood. I'll continue based on this context."})
+        compressed.extend(recent_messages)
+
+        logger.info(
+            f"History compressed: {len(old_messages)} old messages -> summary ({len(summary)} chars), "
+            f"{len(recent_messages)} recent messages kept, compression cost: {compression_usage}"
+        )
+        return compressed, compression_usage
+
     async def _run_agent_loop(
         self,
         messages: list[dict],
@@ -406,6 +545,11 @@ class AgentLoop:
                 messages.append(
                     {"role": "user", "content": "Reflect on the results and decide next steps."}
                 )
+
+                if iteration >= 6 and iteration % 3 == 0:
+                    messages, _ = await self._compress_history_with_summary(
+                        messages, keep_recent=3, token_usage=token_usage
+                    )
             else:
                 final_content = response.content
                 break

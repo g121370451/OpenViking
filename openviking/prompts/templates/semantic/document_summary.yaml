@@ -25,35 +25,41 @@ variables:
 template: |
   Output Language: {{ output_language }}
 
-  You are a documentation analysis expert. Generate a concise yet informative summary for the following documentation file.
+  You are an expert in creating routing summaries for Agentic RAG systems.
+  Your task is to generate a compact indexing summary for the provided document chunk.
+  This summary will be read by an AI Agent to decide whether to read this chunk for single-hop or multi-hop reasoning.
 
-  【File Name】
-  {{ file_name }}
+  <Constraints>
+  - Purpose: Information scent for Agent retrieval decisions.
+  - Style: Dense, specific, telegraphic. Start directly with the core subject.
+  - STRICTLY FORBIDDEN meta-padding, e.g., "This document is...", "This chunk covers...", "The text describes...".
+  - Accuracy: Extract strictly from the chunk. Preserve exact entity names, technical terms, code identifiers, and numeric values. Do not hallucinate.
+  - Total length: Maximum 160 words.
+  - If content is too dense, prioritize: 1) core entities and relationships, 2) navigational mappings, 3) most important numeric data, 4) answer patterns.
+  - Do not list every value if doing so exceeds the limit; select the most retrieval-critical values and mention ranges or representative values only when explicit in the chunk.
+  </Constraints>
 
-  【File Content】
+  <Content_Requirements>
+  To support multi-hop reasoning, capture:
+  - Key entities and their relationships in the Core sentence.
+  - Exact numeric data points with units and time periods when available. Numbers without context are useless.
+  - Specific relationships between entities, e.g., "A acquired B in 2019", "function X calls Y with parameter Z".
+  - Navigational mappings if present, e.g., "Topic X → see File Y".
+  - For tabular data: preserve important row-column relationships as compact key-value pairs. Prefer final totals, named metrics, and rows with clear labels.
+  </Content_Requirements>
+
+  <Output_Format>
+  Core: [1-2 dense sentences: first state the core subject and key entities and their relationships, then enumerate the main sub-topics the chunk covers, e.g., "Sony's PlayStation 3 (successor to PS2, competing with Xbox 360) covering hardware specs, launch history, regional pricing, and backward compatibility." Max 100 words.]
+  Data: [Comma-separated exact metrics, values, or code signatures with context, use "None" if no concrete data.]
+  Can answer: [Max 3 short phrases describing what this chunk resolves; each max 10 words. Good: "lead single from Confessions album", "song blocked at #2 by Yeah!". Bad: "What was the lead single?", "information about music charts".]
+  </Output_Format>
+
+  <Input>
+  File Name: {{ file_name }}
+  Chunk Content:
   {{ content }}
+  </Input>
 
-  Output requirements:
-  - Length: 60-180 words
-  - Focus on the main topics and purpose of this document
-  - Highlight key sections, headings, and their relationships
-  - Mention any important concepts, definitions, or explanations
-  - Note the document type (tutorial, reference, guide, API docs, etc.)
-  - Describe the target audience and prerequisite knowledge if apparent
-  - Include relevant keywords for semantic search
-  - Output plain text directly, no markdown format
-
-  Structure your summary with:
-  1. One sentence describing the document's primary purpose
-  2. Main sections or topics covered
-  3. Key information or takeaways
-  4. Intended audience or use case context
-
-  Special considerations:
-  - For Markdown files: pay attention to heading hierarchy
-  - For API documentation: highlight key functions, parameters, return values
-  - For tutorials: note the step-by-step process and learning objectives
-  - For reference docs: focus on completeness and organization
 
 llm_config:
   temperature: 0.0

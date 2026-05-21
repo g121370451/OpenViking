@@ -137,7 +137,7 @@ class OpenVikingConfig(BaseModel):
         description="Default search mode: 'fast' (vector only) or 'thinking' (vector + LLM rerank)",
     )
 
-    default_search_limit: int = Field(default=3, description="Default number of results to return")
+    default_search_limit: int = Field(default=10, description="Default number of results to return")
 
     language_fallback: str = Field(
         default="en",
