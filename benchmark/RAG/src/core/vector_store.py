@@ -103,6 +103,9 @@ class VikingStoreWrapper:
         """Read resource content"""
         return str(self.client.read(uri))
 
+    def close(self):
+        self.client.close()
+
     def clear(self):
         """Clear the store"""
         self.client.rm("viking://resources", recursive=True)

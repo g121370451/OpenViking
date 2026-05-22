@@ -118,6 +118,9 @@ class BenchmarkPipeline:
         self.metrics_summary["insertion"] = ingest_stats
         self.logger.info(f"Import finished. Time: {ingest_stats['time']:.2f}s")
 
+        if self.db:
+            self.db.close()
+
         self._update_report({
             "Insertion Efficiency (Total Dataset)": {
                 "Total Insertion Time (s)": self.metrics_summary["insertion"]["time"],

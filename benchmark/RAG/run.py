@@ -53,26 +53,7 @@ def resolve_path(path_str, base_path):
         return path_str
     return os.path.normpath(os.path.join(base_path, path_str))
 
-def _generate_bench_ov_conf(original_conf_path, search_limit=None):
-    """Generate a temporary ov.conf with benchmark control parameters injected."""
-    import hashlib
-
-    with open(original_conf_path, 'r', encoding='utf-8') as f:
-        config = json.load(f)
-
-    if search_limit is not None:
-        config['default_search_limit'] = search_limit
-
-    temp_dir = Path(SCRIPT_DIR) / ".temp"
-    temp_dir.mkdir(exist_ok=True)
-
-    conf_hash = hashlib.md5(original_conf_path.encode('utf-8')).hexdigest()[:8]
-    temp_conf_path = str(temp_dir / f"ov_bench_{conf_hash}.conf")
-
-    with open(temp_conf_path, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2)
-
-    return temp_conf_path
+from src.vikingbot_runner import _generate_temp_ov_conf
 
 # ==========================================
 # 3. Main Program
@@ -110,7 +91,9 @@ def main():
     
     format_vars = {
         'dataset_name': dataset_name,
-        'retrieval_topk': retrieval_topk
+        'retrieval_topk': retrieval_topk,
+        'search_limit': config.get('vikingbot', {}).get('search_limit', ''),
+        'max_iterations': config.get('vikingbot', {}).get('max_iterations', ''),
     }
     
     path_keys = ['dataset_path', 'output_dir', 'vector_store', 'log_file', 'doc_output_dir']
@@ -125,10 +108,18 @@ def main():
     # --- D. Initialize Components ---
     try:
         search_limit = config.get('vikingbot', {}).get('search_limit')
-        if search_limit is not None and os.path.exists(ov_config_path):
-            temp_conf_path = _generate_bench_ov_conf(ov_config_path, search_limit=search_limit)
+        llm_config = config.get('llm', None)
+        server_port = config.get('execution', {}).get('server_port', None)
+        if os.path.exists(ov_config_path):
+            temp_conf_path = _generate_temp_ov_conf(
+                ov_config_path,
+                config['paths'].get('vector_store', ''),
+                search_limit=search_limit,
+                llm_config=llm_config,
+                server_port=server_port,
+            )
             os.environ["OPENVIKING_CONFIG_FILE"] = temp_conf_path
-            print(f"[Init] Injected search_limit={search_limit} into temporary ov.conf: {temp_conf_path}")
+            print(f"[Init] Generated temporary ov.conf: {temp_conf_path}")
 
         logger = setup_logging(config['paths']['log_file'])
         logger.info(">>> Benchmark Session Started")

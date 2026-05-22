@@ -31,7 +31,7 @@ _OPENVIKING_SERVER_LOG_FH: Optional[Any] = None
 _SERVER_LOCK = threading.Lock()
 
 
-def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, search_limit=None) -> str:
+def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, search_limit=None, llm_config: dict | None = None, server_port: int | None = None) -> str:
     with open(original_conf_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
 
@@ -41,6 +41,11 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, sear
         if not config['server'].get('root_api_key'):
             config['server'].pop('root_api_key', None)
 
+    if server_port is not None:
+        if 'server' not in config or config.get('server') is None:
+            config['server'] = {}
+        config['server']['port'] = server_port
+
     if 'storage' not in config:
         config['storage'] = {}
     config['storage']['workspace'] = vector_store_path
@@ -48,12 +53,28 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, sear
     if search_limit is not None:
         config['default_search_limit'] = search_limit
 
+    if llm_config:
+        if 'vlm' not in config or config.get('vlm') is None:
+            config['vlm'] = {}
+        if 'model' in llm_config:
+            config['vlm']['model'] = llm_config['model']
+        if 'api_key' in llm_config:
+            config['vlm']['api_key'] = llm_config['api_key']
+        if 'base_url' in llm_config:
+            config['vlm']['api_base'] = llm_config['base_url']
+        if 'temperature' in llm_config:
+            config['vlm']['temperature'] = llm_config['temperature']
+
     temp_dir = Path(__file__).parent.parent / ".temp"
     temp_dir.mkdir(exist_ok=True)
 
     hash_input = vector_store_path.encode('utf-8')
     if search_limit is not None:
         hash_input += f"_sl{search_limit}".encode('utf-8')
+    if llm_config:
+        hash_input += json.dumps(llm_config, sort_keys=True).encode('utf-8')
+    if server_port is not None:
+        hash_input += f"_port{server_port}".encode('utf-8')
     path_hash = hashlib.md5(hash_input).hexdigest()
     temp_conf_path = str(temp_dir / f"ov_{path_hash}.conf")
 
@@ -233,6 +254,8 @@ class VikingBotRunner:
         self.log_tool_calls = self.vikingbot_config.get('log_tool_calls', True)
         self.search_limit = self.vikingbot_config.get('search_limit')
         self.vector_store_path = config.get('paths', {}).get('vector_store')
+        self.llm_config = config.get('llm', None)
+        self.server_port = config.get('execution', {}).get('server_port', None)
 
     def generate_answer(
         self,
@@ -248,7 +271,7 @@ class VikingBotRunner:
             ov_conf_path = _OV_CONF_PATH
             temp_conf_path = None
             if self.vector_store_path:
-                temp_conf_path = _generate_temp_ov_conf(_OV_CONF_PATH, self.vector_store_path, search_limit=self.search_limit)
+                temp_conf_path = _generate_temp_ov_conf(_OV_CONF_PATH, self.vector_store_path, search_limit=self.search_limit, llm_config=self.llm_config, server_port=self.server_port)
                 ov_conf_path = temp_conf_path
                 logger.info(f"Using vector store: {self.vector_store_path}")
 
