@@ -456,7 +456,11 @@ class BenchmarkPipeline:
         max_queries = self.config['execution'].get('max_queries')
         env_max = os.environ.get("RAG_MAX_QUERIES")
         if env_max is not None:
-            max_queries = int(env_max)
+            env_max_stripped = env_max.strip().lower()
+            if env_max_stripped in ("", "null", "none"):
+                max_queries = None
+            else:
+                max_queries = int(env_max_stripped)
         for sample in samples:
             for qa in sample.qa_pairs:
                 if max_queries is not None and global_idx >= max_queries:
