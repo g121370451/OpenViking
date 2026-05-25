@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -32,6 +34,87 @@ from vikingbot.utils.tracing import trace
 if TYPE_CHECKING:
     from vikingbot.config.schema import ExecToolConfig
     from vikingbot.cron.service import CronService
+
+
+def _normalize_uri(uri: str) -> str:
+    """Normalize a URI by removing whitespace."""
+    return re.sub(r'\s+', '', uri)
+
+
+def _extract_uris_from_args(args_raw) -> list[str]:
+    """Extract viking:// URIs from tool call args."""
+    if isinstance(args_raw, dict):
+        args_str = json.dumps(args_raw)
+    elif isinstance(args_raw, str):
+        args_str = args_raw
+    else:
+        return []
+    uris = re.findall(r'viking://[^\s"\\,\]\}]+', args_str)
+    return [_normalize_uri(u) for u in uris]
+
+
+def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, final_content: str) -> str:
+    """为 from→tgt 这条边构建执行路径摘要（纯字符串拼接，无 LLM）。"""
+    path_parts = []
+    for tool in tools_used:
+        tool_name = tool.get("tool_name", "")
+        if not tool.get("execute_success"):
+            continue
+
+        args = tool.get("args", "")
+        result = tool.get("result", "")
+
+        involves_tgt = False
+
+        if tool_name == "openviking_search":
+            if isinstance(result, list):
+                involves_tgt = any(
+                    isinstance(item, dict) and item.get("uri", "") == tgt_uri
+                    for item in result
+                )
+            elif isinstance(result, str):
+                involves_tgt = tgt_uri in result
+
+        elif tool_name in ("openviking_read", "openviking_multi_read"):
+            args_str = json.dumps(args) if not isinstance(args, str) else args
+            involves_tgt = tgt_uri in args_str
+
+        elif tool_name == "openviking_grep":
+            if isinstance(result, list):
+                involves_tgt = any(
+                    isinstance(item, dict) and item.get("uri", "") == tgt_uri
+                    for item in result
+                )
+            elif isinstance(result, str):
+                involves_tgt = tgt_uri in result
+
+        if not involves_tgt:
+            continue
+
+        if tool_name == "openviking_search":
+            args_obj = json.loads(args) if isinstance(args, str) else args
+            query = args_obj.get("query", "") if isinstance(args_obj, dict) else ""
+            path_parts.append(f'search("{query[:50]}")')
+
+        elif tool_name in ("openviking_read", "openviking_multi_read"):
+            path_parts.append(f"read({tgt_uri})")
+
+        elif tool_name == "openviking_grep":
+            args_obj = json.loads(args) if isinstance(args, str) else args
+            pattern = args_obj.get("pattern", "") if isinstance(args_obj, dict) else ""
+            grep_hits = []
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, dict) and item.get("uri") == tgt_uri:
+                        grep_hits.append(f"L{item.get('line', '?')}: {item.get('content', '')[:60]}")
+            hit_str = "; ".join(grep_hits[:3])
+            if hit_str:
+                path_parts.append(f'grep("{pattern[:30]}") -> {hit_str}')
+            else:
+                path_parts.append(f'grep("{pattern[:30]}")')
+
+    path_str = " -> ".join(path_parts) if path_parts else "direct relation"
+    return f"Q: {original_query}\nPath: {path_str}\nAnswer: {final_content}"
 
 
 class AgentLoop:
@@ -348,7 +431,7 @@ class AgentLoop:
                 async def execute_single_tool(idx: int, tool_call):
                     """Execute a single tool and track execution time."""
                     tool_execute_start_time = time.time()
-                    result = await self.tools.execute(
+                    result, tool_context = await self.tools.execute(
                         tool_call.name,
                         tool_call.arguments,
                         session_key=session_key,
@@ -356,7 +439,7 @@ class AgentLoop:
                         sender_id=sender_id,
                     )
                     tool_execute_duration = (time.time() - tool_execute_start_time) * 1000
-                    return idx, tool_call, result, tool_execute_duration
+                    return idx, tool_call, result, tool_execute_duration, tool_context
 
                 # Run all tool executions in parallel
                 tool_tasks = [
@@ -366,7 +449,7 @@ class AgentLoop:
                 results = await asyncio.gather(*tool_tasks)
 
                 # Stage 3: Process results sequentially in original order
-                for _idx, tool_call, result, tool_execute_duration in results:
+                for _idx, tool_call, result, tool_execute_duration, tool_context in results:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"[TOOL_CALL]: {tool_call.name}({args_str[:200]})")
                     logger.info(f"[RESULT]: {str(result)[:600]}")
@@ -390,10 +473,19 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
 
+                    try:
+                        args_obj = json.loads(args_str) if isinstance(args_str, str) else args_str
+                    except (json.JSONDecodeError, TypeError):
+                        args_obj = args_str
+
+                    display_result = getattr(tool_context, 'structured_result', None)
+                    if display_result is None:
+                        display_result = result
+
                     tool_used_dict = {
                         "tool_name": tool_call.name,
-                        "args": args_str,
-                        "result": result,
+                        "args": args_obj,
+                        "result": display_result,
                         "duration": tool_execute_duration,
                         "execute_success": True
                         if result and "Error executing" not in result
@@ -417,6 +509,327 @@ class AgentLoop:
                 final_content = f"Reached {self.max_iterations} iterations without completion."
             else:
                 final_content = "I've completed processing but have no response to give."
+
+        # --- LLM Review 建边 ---
+        _enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
+        # Extract original query from messages
+        original_query = ""
+        for msg_item in reversed(messages):
+            content = msg_item.get("content", "") if isinstance(msg_item, dict) else ""
+            if not isinstance(content, str):
+                continue
+            for pattern in [r"Here'?s the question:\s*(.+)", r"Question:\s*(.+)"]:
+                m = re.search(pattern, content, re.DOTALL)
+                if m:
+                    original_query = m.group(1).strip()
+                    break
+            if original_query:
+                break
+        if not original_query:
+            for msg_item in reversed(messages):
+                if isinstance(msg_item, dict) and msg_item.get("role") == "user":
+                    content = msg_item.get("content", "")
+                    if isinstance(content, str) and len(content) > 5:
+                        original_query = content
+                        break
+
+        logger.info(
+            f"[LLMReview] gate check: strategy=llm_review, enable={_enable_linking}, "
+            f"tools_used={len(tools_used) if tools_used else 0}, "
+            f"original_query={bool(original_query)}"
+        )
+        if _enable_linking == "1" and tools_used and original_query:
+            # Collect read_uris and uri_content
+            read_uris: set[str] = set()
+            uri_content: dict[str, str] = {}
+            for tool in tools_used:
+                if tool.get("tool_name") in ("openviking_read", "openviking_multi_read") and tool.get("execute_success"):
+                    args = tool.get("args", "")
+                    uris = _extract_uris_from_args(args)
+                    result = tool.get("result", "")
+                    for u in uris:
+                        read_uris.add(u)
+                        if u not in uri_content:
+                            uri_content[u] = (result or "")
+                if tool.get("tool_name") == "openviking_grep" and tool.get("execute_success"):
+                    result = tool.get("result", "")
+                    if isinstance(result, list):
+                        for item in result:
+                            if isinstance(item, dict):
+                                uri = item.get("uri", "")
+                                if uri:
+                                    uri = _normalize_uri(uri)
+                                    read_uris.add(uri)
+                                    if uri not in uri_content:
+                                        uri_content[uri] = ""
+                                    uri_content[uri] += f"L{item.get('line', '?')}: {item.get('content', '')}\n"
+                    elif isinstance(result, str):
+                        current_uri = None
+                        for line in result.split("\n"):
+                            line_s = line.strip()
+                            m = re.match(r'^\[(.+)\]$', line_s)
+                            if m:
+                                current_uri = _normalize_uri(m.group(1))
+                                read_uris.add(current_uri)
+                                if current_uri not in uri_content:
+                                    uri_content[current_uri] = ""
+                            elif current_uri and line_s.startswith("L"):
+                                uri_content[current_uri] += line_s + "\n"
+
+            # Collect search URIs and metadata
+            search_uri_meta: dict[str, dict] = {}
+            for tool in tools_used:
+                if tool.get("tool_name") == "openviking_search" and tool.get("execute_success"):
+                    result = tool.get("result", "")
+                    if isinstance(result, list):
+                        for item in result:
+                            if not isinstance(item, dict):
+                                continue
+                            uri = item.get("uri", "")
+                            if uri:
+                                uri = _normalize_uri(uri)
+                                if uri not in search_uri_meta:
+                                    search_uri_meta[uri] = {
+                                        "abstract": item.get("abstract", ""),
+                                        "score": item.get("score", 0),
+                                    }
+                    elif isinstance(result, str):
+                        for u in _extract_uris_from_args(result):
+                            if u not in search_uri_meta:
+                                search_uri_meta[u] = {"abstract": "", "score": 0}
+            search_uris = set(search_uri_meta.keys())
+
+            logger.info(
+                f"[LLMReview] collected: read_uris={len(read_uris)}, search_uris={len(search_uris)}, "
+                f"search_uri_meta={len(search_uri_meta)}"
+            )
+
+            if read_uris or search_uris:
+                # Build review prompt
+                if read_uris:
+                    candidate_uris = set(read_uris)
+                    uri_list_lines = []
+                    for idx, u in enumerate(sorted(read_uris), 1):
+                        preview = uri_content.get(u, "")[:300].replace("\n", " ")
+                        uri_list_lines.append(f"{idx}. {u}\n   Content: {preview}")
+                    uri_list = "\n".join(uri_list_lines)
+                    review_prompt = (
+                        f"Question: {original_query}\n"
+                        f"Answer: {final_content[:800]}\n\n"
+                        f"Documents read during research:\n{uri_list}\n\n"
+                        f"Task: Which of the above documents were USEFUL for answering the question?\n"
+                        f"The answer was generated using these documents, so at least one MUST be relevant.\n\n"
+                        f"Rules:\n"
+                        f"- You MUST return at least one URI. An empty array [] is NEVER valid.\n"
+                        f"- If unsure, pick the document most likely related to the answer.\n\n"
+                        f"Output ONLY a JSON array of URI strings, no other text:\n"
+                        f'["viking://...", "viking://...", ...]\n'
+                    )
+                    mode = "read"
+                else:
+                    sorted_search = sorted(
+                        search_uri_meta.items(),
+                        key=lambda x: x[1].get("score", 0),
+                        reverse=True,
+                    )[:15]
+                    candidate_uris = {uri for uri, _ in sorted_search}
+                    uri_list_lines = []
+                    for idx, (u, meta) in enumerate(sorted_search, 1):
+                        abstract = (meta.get("abstract") or "")[:200].replace("\n", " ")
+                        uri_list_lines.append(f"{idx}. {u}\n   Abstract: {abstract}")
+                    uri_list = "\n".join(uri_list_lines)
+                    review_prompt = (
+                        f"Question: {original_query}\n"
+                        f"Answer: {final_content[:800]}\n\n"
+                        f"Documents found via search:\n{uri_list}\n\n"
+                        f"Task: Based on the abstracts, which documents were USEFUL for answering the question?\n"
+                        f"The answer was generated using these documents, so at least one MUST be relevant.\n\n"
+                        f"Rules:\n"
+                        f"- You MUST return at least one URI. An empty array [] is NEVER valid.\n"
+                        f"- If unsure, pick the document most likely related to the answer.\n\n"
+                        f"Output ONLY a JSON array of URI strings, no other text:\n"
+                        f'["viking://...", "viking://...", ...]\n'
+                    )
+                    mode = "search-only"
+
+                logger.info(
+                    f"[LLMReview] candidate_uris={len(candidate_uris)}, "
+                    f"mode={mode}, search_uris={len(search_uris)}"
+                )
+
+                try:
+                    # Call LLM for review
+                    review_messages = [
+                        {"role": "system", "content": "You are a document relation analyst. Output only valid JSON."},
+                        {"role": "user", "content": review_prompt},
+                    ]
+                    review_response = await self.provider.chat(
+                        messages=review_messages,
+                        tools=[],
+                        model=self.model,
+                        session_id=session_key.safe_name(),
+                    )
+
+                    if review_response.usage:
+                        token_usage["prompt_tokens"] += review_response.usage.get("prompt_tokens", 0)
+                        token_usage["completion_tokens"] += review_response.usage.get("completion_tokens", 0)
+                        token_usage["total_tokens"] += review_response.usage.get("total_tokens", 0)
+
+                    # Parse LLM output
+                    raw_output = review_response.content or ""
+                    cleaned = re.sub(r'```(?:json)?\s*', '', raw_output).strip()
+                    cleaned = re.sub(r'```\s*$', '', cleaned).strip()
+
+                    json_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+                    useful_uris: list[str] = []
+                    parse_method = "none"
+
+                    logger.info(f"[LLMReview] raw_output={raw_output[:300]}")
+
+                    if json_match:
+                        try:
+                            parsed = json.loads(json_match.group(0))
+                            if isinstance(parsed, list):
+                                for u in parsed:
+                                    if isinstance(u, str):
+                                        u = _normalize_uri(u.rstrip('.'))
+                                        if u in candidate_uris:
+                                            useful_uris.append(u)
+                            parse_method = "json"
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                f"[LLMReview] JSON parse FAILED. Raw output (first 300 chars): {raw_output[:300]}"
+                            )
+
+                    # Fallback: regex extract viking:// URIs
+                    if not useful_uris:
+                        found_uris = re.findall(r'viking://[^\s"\'\\,\]\}]+', raw_output)
+                        for u in found_uris:
+                            u = _normalize_uri(u.rstrip('.'))
+                            if u in candidate_uris:
+                                useful_uris.append(u)
+                        if useful_uris:
+                            parse_method = "regex-fallback"
+
+                    # Deduplicate
+                    useful_uris = list(dict.fromkeys(useful_uris))
+
+                    # Forced fallback if empty
+                    if not useful_uris:
+                        if read_uris:
+                            useful_uris = [sorted(candidate_uris)[0]]
+                        elif search_uri_meta:
+                            best_uri = max(search_uri_meta.keys(), key=lambda u: search_uri_meta[u].get("score", 0))
+                            if best_uri in candidate_uris:
+                                useful_uris = [best_uri]
+                            else:
+                                useful_uris = [sorted(candidate_uris)[0]]
+                        else:
+                            useful_uris = [sorted(candidate_uris)[0]]
+                        parse_method = "forced-fallback"
+                        logger.warning(
+                            f"[LLMReview] LLM returned empty, forced fallback: {useful_uris}"
+                        )
+
+                    if useful_uris:
+                        logger.info(f"[LLMReview] Parsed {len(useful_uris)} useful doc(s) via {parse_method}")
+                    else:
+                        logger.warning(
+                            f"[LLMReview] 0 useful docs extracted. "
+                            f"candidate_uris={len(candidate_uris)}, raw_output={raw_output[:300]}"
+                        )
+
+                    # Create edges
+                    if useful_uris:
+                        from vikingbot.openviking_mount.ov_server import VikingClient
+                        workspace_id = self.sandbox_manager.to_workspace_id(session_key) if self.sandbox_manager else None
+                        rv_client = await VikingClient.create(workspace_id)
+                        try:
+                            linked = 0
+                            seen_pairs: set[tuple[str, str]] = set()
+
+                            # Search top5 to expand from_uris
+                            try:
+                                search_result = await rv_client.search(original_query)
+                                top5_resources = search_result.get("resources", [])[:5]
+                                top5_uris = set()
+                                for r in top5_resources:
+                                    uri = r.get("uri", "")
+                                    if uri:
+                                        top5_uris.add(_normalize_uri(uri))
+                                all_search_uris = search_uris | top5_uris
+                                logger.info(
+                                    f"[LLMReview] top5 search added {len(top5_uris)} URIs to from_uris "
+                                    f"(total search_uris: {len(search_uris)} -> {len(all_search_uris)})"
+                                )
+                            except Exception as e:
+                                logger.warning(f"[LLMReview] top5 search failed, using original search_uris: {e}")
+                                all_search_uris = search_uris
+
+                            from_uris = all_search_uris - set(useful_uris)
+                            if not from_uris:
+                                from_uris = all_search_uris
+
+                            for tgt in useful_uris:
+                                edge_reason = _build_edge_reason(original_query, tgt, tools_used, final_content)
+                                for src in from_uris:
+                                    if src == tgt:
+                                        continue
+                                    pair = (min(src, tgt), max(src, tgt))
+                                    if pair in seen_pairs:
+                                        continue
+                                    seen_pairs.add(pair)
+                                    try:
+                                        await rv_client.link(src, [tgt], reason=edge_reason, query=original_query, strategy="llm_review", weight=1.0)
+                                        linked += 1
+                                    except Exception as e:
+                                        logger.warning(f"[LLMReview] Link failed: {e}")
+
+                            iteration += 1
+                            tools_used.append({
+                                "tool_name": "openviking_link",
+                                "args": {
+                                    "from_uris": sorted(from_uris),
+                                    "to_uris": useful_uris,
+                                },
+                                "reasoning": "(precise review step)",
+                                "result": f"Created {linked} relation(s) from {len(from_uris)} from_uris to {len(useful_uris)} useful docs, parse={parse_method}",
+                                "duration": 0,
+                                "execute_success": True,
+                                "input_token": 0,
+                                "output_token": 0,
+                                "iteration": iteration,
+                                "relations_found": linked,
+                            })
+                            logger.info(
+                                f"[LLMReview] post_link DONE: created {linked} edge(s), "
+                                f"from {len(from_uris)} from_uris to {len(useful_uris)} useful_docs, "
+                                f"parse={parse_method}"
+                            )
+                        finally:
+                            await rv_client.close()
+                    else:
+                        logger.warning(
+                            f"[LLMReview] post_link SKIPPED - no useful docs parsed. "
+                            f"search_uris={len(search_uris)}, read_uris={len(read_uris)}, "
+                            f"query={original_query[:100]}"
+                        )
+                        iteration += 1
+                        tools_used.append({
+                            "tool_name": "openviking_link",
+                            "args": {"from_uris": sorted(search_uris), "to_uris": []},
+                            "reasoning": "(precise review step - PARSE FAILED)",
+                            "result": f"FAILED: parse_method={parse_method}",
+                            "duration": 0,
+                            "execute_success": False,
+                            "input_token": 0,
+                            "output_token": 0,
+                            "iteration": iteration,
+                            "relations_found": 0,
+                            "parse_method": parse_method,
+                        })
+                except Exception:
+                    logger.exception("[LLMReview] Review step failed, continuing")
 
         return final_content, tools_used, token_usage, iteration, messages
 
@@ -638,6 +1051,7 @@ class AgentLoop:
                 time_cost=time_cost,
                 iteration=iteration,
                 tools_used_names=tools_used_names,
+                tools_used=tools_used if tools_used else [],
                 messages=messages if self._eval else None,
             )
         finally:

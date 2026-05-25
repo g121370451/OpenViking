@@ -25,13 +25,22 @@ execution:
   # Limit the maximum number of queries to process, null means process all queries
   max_queries: null
   # Whether to skip document ingestion phase (true means use existing vector index)
-  skip_ingestion: false
   # Document ingestion mode
   # - "directory": Unified directory ingestion mode, treats the entire directory as one document
   # - "per_file": Per-file ingestion mode, each file is treated as a separate document
   ingest_mode: "per_file"
   # Instruction for retrieval, empty by default
   retrieval_instruction: ""  
+  # Whether to use VikingBot for agentic RAG (false means standard RAG)
+  use_vikingbot: false
+
+# ===========VikingBot Configuration============
+# Configuration for VikingBot agentic RAG mode
+vikingbot:
+  # Maximum number of iterations for VikingBot agent loop
+  max_iterations: 10
+  # Whether to log tool calls made by VikingBot
+  log_tool_calls: true
 
 # ===========Path Configuration============
 # All paths support {dataset_name} placeholder, which will be automatically replaced with the current dataset name
@@ -57,4 +66,4 @@ llm:
   # API base URL
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   # API key (keep this secure, do not commit to code repositories)
-  api_key: ""
+  api_key: "${VOLCENGINE_API_KEY}"

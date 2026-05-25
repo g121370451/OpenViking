@@ -1,0 +1,39 @@
+project_name: "RAG_Benchmark"
+
+# ===========Modify Configuration================
+dataset_name: "SyllabusQA"
+
+adapter:
+  module: "src.adapters.syllabusqa_adapter"
+  class_name: "SyllabusQAAdapter"
+
+execution:
+  max_workers: 10
+  ingest_workers: 8
+  retrieval_topk: 5
+  max_queries: null
+  ingest_mode: "directory"
+  retrieval_instruction: ""
+  use_vikingbot: false
+  use_relations: true
+  relations_topk: 0
+  generate_refusal_reason: true
+  link_strategy: llm_review
+# ==================================
+
+paths:
+  dataset_path: "datasets/{dataset_name}"
+  doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
+  output_dir: "Output/{dataset_name}/experiment_standard_top_{retrieval_topk}_relations_review"
+  log_file: "Output/{dataset_name}/experiment_standard_top_{retrieval_topk}_relations_review/benchmark.log"
+
+llm:
+  model: "doubao-seed-1-8-251228"
+  temperature: 0
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+embedding:
+  model: "doubao-embedding-vision-250615"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"

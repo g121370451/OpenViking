@@ -132,7 +132,8 @@ class ToolRegistry:
         session_key: SessionKey,
         sandbox_manager: SandboxManager | None = None,
         sender_id: str | None = None,
-    ) -> str:
+        original_question: str | None = None,
+    ) -> tuple[str, ToolContext | None]:
         """
         Execute a tool by name with given parameters.
 
@@ -151,12 +152,13 @@ class ToolRegistry:
         """
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found"
+            return f"Error: Tool '{name}' not found", None
 
         tool_context = ToolContext(
             session_key=session_key,
             sandbox_manager=sandbox_manager,
             sender_id=sender_id,
+            original_question=original_question,
         )
 
         # Langfuse tool call tracing - automatic for all tools
@@ -213,9 +215,9 @@ class ToolRegistry:
         )
         result = hook_result.get("result")
         if isinstance(result, Exception):
-            return f"Error executing {name}: {str(result)}"
+            return f"Error executing {name}: {str(result)}", tool_context
         else:
-            return result
+            return result, tool_context
 
     @property
     def tool_names(self) -> list[str]:

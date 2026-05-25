@@ -1,6 +1,7 @@
 """OpenViking file system tools: read, write, list, search resources."""
 
 import asyncio
+import os
 from abc import ABC
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -117,13 +118,150 @@ class VikingSearchTool(OVFileTool):
 
             if not results:
                 return f"No results found for query: {query}"
-            if isinstance(results, list):
-                result_strs = []
-                for i, result in enumerate(results, 1):
-                    result_strs.append(f"{i}. {str(result)}")
-                return "\n".join(result_strs)
+
+            if isinstance(results, dict):
+                resources_list = results.get('resources', []) or []
+            elif isinstance(results, list):
+                resources_list = results
             else:
+                resources_list = []
+
+            if not resources_list:
                 return str(results)
+
+            resources_list = [
+                r for r in resources_list
+                if not r.get("uri", "").endswith(".abstract.md")
+                and not r.get("uri", "").endswith(".overview.md")
+            ]
+
+            if not resources_list:
+                return f"No results found for query: {query}"
+
+            use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
+            relations_found = 0
+            if use_relations:
+                link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
+                seen_uris = {r.get("uri", "") for r in resources_list}
+
+                frontier = [r.get("uri", "") for r in resources_list if r.get("uri", "")]
+
+                while frontier:
+                    rel_tasks = [client.relations(uri, query=query, strategy=link_strategy) for uri in frontier]
+                    rel_results = await asyncio.gather(*rel_tasks, return_exceptions=True)
+
+                    next_frontier = []
+                    for from_uri, rels in zip(frontier, rel_results):
+                        if isinstance(rels, Exception):
+                            continue
+                        for rel in rels:
+                            rel_uri = rel.get("uri", "")
+                            if not rel_uri:
+                                continue
+                            if rel_uri.endswith(".abstract.md") or rel_uri.endswith(".overview.md"):
+                                continue
+                            if rel_uri in seen_uris:
+                                for existing in resources_list:
+                                    if existing.get("uri") == rel_uri and not existing.get("match_reason"):
+                                        existing["match_reason"] = f"relation_from: {from_uri}"
+                                        existing["relation_reason"] = rel.get("reason", "")
+                                        relations_found += 1
+                                        break
+                                continue
+                            seen_uris.add(rel_uri)
+                            try:
+                                abstract = await client.read_content(rel_uri, level="abstract")
+                            except Exception:
+                                abstract = ""
+                            resources_list.append({
+                                "uri": rel_uri,
+                                "context_type": "ContextType.RESOURCE",
+                                "is_leaf": False,
+                                "abstract": abstract or "",
+                                "overview": None,
+                                "category": "",
+                                "score": 0,
+                                "match_reason": f"relation_from: {from_uri}",
+                                "relation_reason": rel.get("reason", ""),
+                                "relations": [],
+                            })
+                            relations_found += 1
+                            next_frontier.append(rel_uri)
+
+                    frontier = next_frontier
+
+            if tool_context:
+                tool_context.structured_result = resources_list
+
+            if use_relations and relations_found > 0:
+                logger.info(f"[Search] Relations mode: {relations_found} related docs found, using priority format")
+                relation_results = []
+                search_results = []
+                for r in resources_list:
+                    if r.get("match_reason", "").startswith("relation_from:"):
+                        relation_results.append(r)
+                    else:
+                        search_results.append(r)
+
+                result_strs = []
+                idx = 1
+
+                reason_groups: dict[str, list[str]] = {}
+                for r in relation_results:
+                    reason = r.get("relation_reason", "")
+                    if reason and reason not in reason_groups:
+                        reason_groups[reason] = []
+                    if reason:
+                        reason_groups[reason].append(r.get("uri", ""))
+
+                result_strs.append("=== PRIORITY (pre-explored results) ===")
+                result_strs.append("")
+                result_strs.append("[RECORD OF PREVIOUS SESSION]")
+                result_strs.append("A previous bot session already searched and answered THIS EXACT SAME QUESTION:")
+
+                for reason_text in reason_groups:
+                    result_strs.append("")
+                    result_strs.append(reason_text)
+                    result_strs.append("")
+
+                result_strs.append("Documents selected as useful by that session:")
+                for r in relation_results:
+                    rel_uri = r.get("uri", "")
+                    rel_abstract = r.get("abstract", "")[:200]
+                    result_strs.append(f"  {idx}. [{rel_uri}] {rel_abstract}")
+                    idx += 1
+                result_strs.append("")
+                result_strs.append("[YOUR STRATEGY]")
+                result_strs.append("(1) Batch-read ONLY the PRIORITY documents in a SINGLE openviking_multi_read call.")
+                result_strs.append("(2) Answer immediately from the content. Only read SEARCH RESULTS if PRIORITY documents are insufficient.")
+                result_strs.append("(3) The Path above shows exactly how the previous session found the answer — skip those steps.")
+                result_strs.append("")
+                result_strs.append("=== SEARCH RESULTS ===")
+                for r in search_results:
+                    uri = r.get("uri", "")
+                    abstract = r.get("abstract", "")[:200]
+                    score = r.get("score", 0)
+                    result_strs.append(f"{idx}. [{uri}] (score: {score:.2f}) {abstract}")
+                    idx += 1
+
+                output = "\n".join(result_strs)
+                output += f"\n<!-- relations_found:{relations_found} searched:{len(resources_list)} -->"
+            else:
+                logger.info(f"[Search] Standard mode: {len(resources_list)} results")
+                result_strs = [f"Search results for: {query}"]
+                result_strs.append(f"\n{'=' * 40}")
+                result_strs.append(f"SEARCH RESULTS ({len(resources_list)} items):")
+                result_strs.append(f"{'=' * 40}")
+                for i, item in enumerate(resources_list, 1):
+                    uri = item.get("uri", "")
+                    abstract = item.get("abstract", "")
+                    score = item.get("score", 0.0)
+                    result_strs.append(f"\n  [{i}] {uri} (score: {score:.3f})")
+                    if abstract:
+                        result_strs.append(f"      {abstract[:200]}")
+                output = "\n".join(result_strs)
+
+            return output
         except Exception as e:
             return f"Error searching Viking: {str(e)}"
 
@@ -277,16 +415,19 @@ class VikingGrepTool(OVFileTool):
                 pattern_str = ", ".join(f"'{p}'" for p in patterns)
                 return f"No matches found for patterns: {pattern_str}"
 
-            # Format output
             result_lines = [f"Found {total_matches} match{'es' if total_matches != 1 else ''} across {len(patterns)} pattern{'s' if len(patterns) != 1 else ''}:"]
 
+            struct_result: list[dict[str, Any]] = []
+
             for match_uri, matches in merged_results.items():
-                # Sort matches by line number
                 matches.sort(key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
-                result_lines.append(f"\n📄 {match_uri}")
+                result_lines.append(f"\n[{match_uri}]")
+                uri_struct = {"uri": match_uri, "lines": []}
                 for line, content, pattern_name in matches:
-                    result_lines.append(f"   Line {line} (pattern: '{pattern_name}'):")
-                    result_lines.append(f"   {content}")
+                    result_lines.append(f"  L{line}: {content}")
+                    uri_struct["lines"].append({"line": line, "content": content, "pattern": pattern_name})
+                struct_result.append(uri_struct)
+
 
             return "\n".join(result_lines)
         except Exception as e:

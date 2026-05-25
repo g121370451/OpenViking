@@ -2,11 +2,14 @@ import os
 import sys
 import json
 import yaml
-import importlib 
+import importlib
 from argparse import ArgumentParser
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).parent))
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent / ".env")
 
 from src.core.logger import setup_logging
 # ==========================================
@@ -23,6 +26,7 @@ if os.path.exists(ov_config_path):
 try:
     from src.pipeline import BenchmarkPipeline 
     from src.core.vector_store import VikingStoreWrapper
+    from src.core.vector_store_with_relations import VikingStoreWithRelations
     from src.core.llm_client import LLMClientWrapper 
 except SyntaxError as e:
     print(f"\n[Fatal Error] Syntax error while importing modules: {e}")
@@ -143,23 +147,54 @@ def main():
             logger.error(f"Class '{class_name}' not found in module '{module_path}'. Please check your config 'adapter.class_name'. Error: {e}")
             raise e
         
-        # 2. Vector Store
+        # 2. LLM Client (created before vector store, may be needed for query expansion)
+        api_key = os.environ.get(
+            config['llm'].get('api_key_env_var', ''),
+            config['llm'].get('api_key')
+        )
+        api_key = os.path.expandvars(api_key) if api_key else api_key
+        if not api_key or api_key.startswith("${"):
+            logger.warning("No API Key found in config or environment variables!")
+        llm_client = LLMClientWrapper(config=config['llm'], api_key=api_key)
+
+        # 3. Vector Store
         use_nanobot = config.get('execution', {}).get('use_nanobot', False)
         if use_nanobot:
             vector_store = None
             logger.info("Nanobot mode: skipping VikingStoreWrapper initialization")
         else:
-            vector_store = VikingStoreWrapper(store_path=config['paths']['vector_store'])
-        
-        # 3. LLM Client
-        api_key = os.environ.get(
-            config['llm'].get('api_key_env_var', ''), 
-            config['llm'].get('api_key')
-        )
-        if not api_key:
-            logger.warning("No API Key found in config or environment variables!")
-            
-        llm_client = LLMClientWrapper(config=config['llm'], api_key=api_key)
+            use_relations = config.get('execution', {}).get('use_relations', False)
+            if use_relations:
+                relations_topk = config['execution'].get('relations_topk', 0)
+                use_query_expansion = config['execution'].get('use_query_expansion', False)
+                link_strategy = config['execution'].get('link_strategy', 'blind')
+
+                embedder = None
+                embedding_cfg = config.get('embedding', {})
+                emb_api_key = embedding_cfg.get('api_key', '')
+                emb_api_key = os.path.expandvars(emb_api_key) if emb_api_key else emb_api_key
+                if emb_api_key and not emb_api_key.startswith("${"):
+                    from src.core.embedder import VolcengineEmbedder
+                    embedder = VolcengineEmbedder(
+                        api_key=emb_api_key,
+                        base_url=embedding_cfg.get('base_url', 'https://ark.cn-beijing.volces.com/api/v3'),
+                        model=embedding_cfg.get('model', 'doubao-embedding-vision-250615'),
+                    )
+                    logger.info(f"Embedder initialized (model={embedding_cfg.get('model', 'doubao-embedding-vision-250615')})")
+                else:
+                    logger.warning("No embedding API key found, vector matching in relations will be disabled")
+
+                vector_store = VikingStoreWithRelations(
+                    store_path=config['paths']['vector_store'],
+                    relations_topk=relations_topk,
+                    use_query_expansion=use_query_expansion,
+                    llm=llm_client if use_query_expansion else None,
+                    embedder=embedder,
+                    strategy=link_strategy,
+                )
+                logger.info(f"Using VikingStoreWithRelations (relations_topk={relations_topk}, query_expansion={use_query_expansion}, link_strategy={link_strategy})")
+            else:
+                vector_store = VikingStoreWrapper(store_path=config['paths']['vector_store'])
 
         # 4. Pipeline
         pipeline = BenchmarkPipeline(

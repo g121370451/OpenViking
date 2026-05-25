@@ -309,6 +309,125 @@ class BenchmarkPipeline:
                     "Average Accuracy (normalization)": (sum(r['metrics']['Accuracy'] for r in eval_records) / total)/4,
                 }
             })
+
+            # Relations Usage report from vikingbot records
+            vb_records = [r for r in eval_records if 'vikingbot' in r]
+            if vb_records:
+                relations_hits_list = [r['vikingbot'].get('relations_hits', 0) for r in vb_records]
+                total_relations_list = [r['vikingbot'].get('total_relations_found', 0) for r in vb_records]
+                report_relations = {
+                    "Total Questions with Relations Hits": sum(1 for h in relations_hits_list if h > 0),
+                    "Total Relations Found": sum(total_relations_list),
+                    "Average Relations Found per Query": sum(total_relations_list) / len(total_relations_list),
+                    "Relations Utilization Rate": sum(1 for h in relations_hits_list if h > 0) / len(relations_hits_list),
+                }
+
+                # Link Construction Rate
+                enable_linking = self.config.get('vikingbot', {}).get('enable_linking', False)
+                if enable_linking:
+                    queries_with_links = 0
+                    total_links = 0
+                    queries_parse_failure = 0
+                    queries_link_parse_failed = 0
+                    for r in vb_records:
+                        tc_list = r['vikingbot'].get('tool_calls', [])
+                        if isinstance(tc_list, str):
+                            try:
+                                tc_list = json.loads(tc_list, strict=False)
+                            except (json.JSONDecodeError, TypeError):
+                                queries_parse_failure += 1
+                                continue
+                        if not isinstance(tc_list, list):
+                            queries_parse_failure += 1
+                            continue
+                        query_links = 0
+                        for tc in tc_list:
+                            if not isinstance(tc, dict):
+                                continue
+                            if tc.get('tool_name') == 'openviking_link':
+                                if not tc.get('execute_success', True):
+                                    queries_link_parse_failed += 1
+                                    continue
+                                args_data = tc.get('args', {})
+                                if isinstance(args_data, str):
+                                    try:
+                                        args_data = json.loads(args_data)
+                                    except (json.JSONDecodeError, TypeError):
+                                        queries_link_parse_failed += 1
+                                        continue
+                                if isinstance(args_data, dict):
+                                    to_uris = args_data.get('to_uris', [])
+                                    from_uris = args_data.get('from_uris', [])
+                                    query_links += len(from_uris) * len(to_uris)
+                        if query_links > 0:
+                            queries_with_links += 1
+                        total_links += query_links
+                    report_relations["Link Construction Rate"] = queries_with_links / len(vb_records)
+                    report_relations["Queries With Links Created"] = queries_with_links
+                    report_relations["Queries Without Links"] = len(vb_records) - queries_with_links
+                    report_relations["Total Links Created"] = total_links
+                    if queries_parse_failure > 0:
+                        report_relations["Queries Parse Failure"] = queries_parse_failure
+                    if queries_link_parse_failed > 0:
+                        report_relations["Link Parse Failed"] = queries_link_parse_failed
+
+                # Edge Coverage Rate
+                use_relations = self.config.get('vikingbot', {}).get('use_relations', False)
+                if use_relations:
+                    strategy = self.config.get('vikingbot', {}).get('link_strategy', 'blind')
+                    total_edges_count, all_edges = self._count_total_relations(strategy)
+                    hit_edges = set()
+                    for r in vb_records:
+                        tc_list = r['vikingbot'].get('tool_calls', [])
+                        if isinstance(tc_list, str):
+                            try:
+                                tc_list = json.loads(tc_list)
+                            except (json.JSONDecodeError, TypeError):
+                                tc_list = []
+                        for tc in (tc_list if isinstance(tc_list, list) else []):
+                            if not isinstance(tc, dict) or tc.get('tool_name') != 'openviking_search':
+                                continue
+                            result_data = tc.get('result')
+                            if not isinstance(result_data, list):
+                                continue
+                            for item in result_data:
+                                if not isinstance(item, dict):
+                                    continue
+                                mr = item.get('match_reason', '')
+                                if mr.startswith('relation_from:'):
+                                    src = mr.replace('relation_from:', '').strip()
+                                    tgt = item.get('uri', '')
+                                    if src and tgt:
+                                        hit_edges.add((min(src, tgt), max(src, tgt)))
+                    hit_count = len(hit_edges & all_edges) if all_edges else 0
+                    coverage = hit_count / total_edges_count if total_edges_count > 0 else 0.0
+                    report_relations["Total Edges in Store"] = total_edges_count
+                    report_relations["Unique Edges Hit"] = hit_count
+                    report_relations["Edge Coverage Rate"] = round(coverage, 4)
+
+                self._update_report({"Relations Usage": report_relations})
+
+                # VikingBot Iteration Metrics
+                vb_valid = [r for r in vb_records if r['vikingbot'].get('tool_calls')]
+                records_for_iters = vb_valid if vb_valid else vb_records
+
+                iters_total = [r['vikingbot'].get('iterations_used', 0) for r in records_for_iters]
+                iters_search = [r['vikingbot'].get('search_iterations', 0) for r in records_for_iters]
+                iters_read = [r['vikingbot'].get('read_iterations', 0) for r in records_for_iters]
+                iters_retrieval = [r['vikingbot'].get('retrieval_iterations', r['vikingbot'].get('iterations_used', 0)) for r in records_for_iters]
+
+                if records_for_iters:
+                    self._update_report({
+                        "VikingBot Iteration Metrics": {
+                            "Average Total Iterations": sum(iters_total) / len(iters_total),
+                            "Average Retrieval Iterations (excl. link/relations)": sum(iters_retrieval) / len(iters_retrieval),
+                            "Average Search Iterations": sum(iters_search) / len(iters_search),
+                            "Average Read Iterations": sum(iters_read) / len(iters_read),
+                            "Min Retrieval Iterations": min(iters_retrieval),
+                            "Max Retrieval Iterations": max(iters_retrieval),
+                            "Excluded Anomalous Records (tc=0)": len(vb_records) - len(vb_valid),
+                        }
+                    })
         self.checkpoint_manager.delete_checkpoint()
 
     def run_deletion(self):
@@ -335,6 +454,9 @@ class BenchmarkPipeline:
         tasks = []
         global_idx = 0
         max_queries = self.config['execution'].get('max_queries')
+        env_max = os.environ.get("RAG_MAX_QUERIES")
+        if env_max is not None:
+            max_queries = int(env_max)
         for sample in samples:
             for qa in sample.qa_pairs:
                 if max_queries is not None and global_idx >= max_queries:
@@ -367,6 +489,7 @@ class BenchmarkPipeline:
             total_time_sec = vikingbot_result.get("total_time_sec", 0)
             token_usage = vikingbot_result.get("token_usage", {})
             tools_used_names = vikingbot_result.get("tools_used_names", [])
+            tools_used_raw = vikingbot_result.get("tools_used", [])
             iterations_used = vikingbot_result.get("iterations_used", 0)
 
             # Align with current benchmark: VikingBot reports prompt/completion token usage.
@@ -396,6 +519,61 @@ class BenchmarkPipeline:
                     with open(trace_file, "w", encoding="utf-8") as f:
                         f.write(trace)
 
+            # Compute per-query relations/link metrics from tool_calls
+            search_iterations = 0
+            read_iterations = 0
+            relations_hits = 0
+            total_relations_found = 0
+            links_created = 0
+            relation_edges_hit = []
+            read_tool_names = {"openviking_multi_read", "openviking_read"}
+            tc_list = tools_used_raw if isinstance(tools_used_raw, list) else []
+            if isinstance(tools_used_raw, str):
+                try:
+                    tc_list = json.loads(tools_used_raw)
+                except (json.JSONDecodeError, TypeError):
+                    tc_list = []
+            for tc in tc_list:
+                if not isinstance(tc, dict):
+                    continue
+                tn = tc.get('tool_name', '')
+                if tn == 'openviking_search':
+                    search_iterations += 1
+                    rf = tc.get('relations_found', 0) or 0
+                    total_relations_found += rf
+                    if rf > 0:
+                        relations_hits += 1
+                    result_data = tc.get('result')
+                    if isinstance(result_data, list):
+                        for item in result_data:
+                            if not isinstance(item, dict):
+                                continue
+                            mr = item.get('match_reason', '')
+                            if mr.startswith('relation_from:'):
+                                src = mr.replace('relation_from:', '').strip()
+                                tgt = item.get('uri', '')
+                                if src and tgt:
+                                    relation_edges_hit.append((min(src, tgt), max(src, tgt)))
+                elif tn in read_tool_names:
+                    read_iterations += 1
+                elif tn == 'openviking_link':
+                    args_data = tc.get('args', {})
+                    if isinstance(args_data, str):
+                        try:
+                            args_data = json.loads(args_data)
+                        except (json.JSONDecodeError, TypeError):
+                            args_data = {}
+                    to_uris = args_data.get('to_uris', []) if isinstance(args_data, dict) else []
+                    if to_uris:
+                        from_uris = args_data.get('from_uris', [])
+                        links_created += len(from_uris) * len(to_uris)
+
+            # Calculate retrieval-only iterations (excluding link tool calls)
+            link_tools = {'openviking_link', 'openviking_relations'}
+            total_calls = len(tc_list) if tc_list else 1
+            non_link_call_count = sum(1 for tc in tc_list if isinstance(tc, dict) and tc.get('tool_name', '') not in link_tools)
+            retrieval_iterations = max(1, round(iterations_used * non_link_call_count / total_calls)) if iterations_used > 0 else iterations_used
+
             return {
                 "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
                 "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
@@ -403,11 +581,19 @@ class BenchmarkPipeline:
                 "llm": {"final_answer": ans},
                 "vikingbot": {
                     "iterations_used": iterations_used,
+                    "retrieval_iterations": retrieval_iterations,
+                    "search_iterations": search_iterations,
+                    "read_iterations": read_iterations,
                     "tools_used_names": tools_used_names,
+                    "tool_calls": tc_list,
                     "total_time_sec": total_time_sec,
                     "debug_log": vikingbot_result.get("debug_log", ""),
                     "session_id": vikingbot_result.get("session_id", ""),
                     "trace_file": trace_file,
+                    "relations_hits": relations_hits,
+                    "total_relations_found": total_relations_found,
+                    "links_created": links_created,
+                    "relation_edges_hit": relation_edges_hit,
                 },
                 "metrics": {"Recall": 0.0},
                 "token_usage": {
@@ -512,18 +698,12 @@ class BenchmarkPipeline:
                 self.logger.debug(f"[Query-{task['id']}] No retrieval instruction, using raw query")
             search_res = self.db.retrieve(query=enhanced_query, topk=self.config['execution']['retrieval_topk'])
             latency = time.time() - t0
-            
-            retrieved_texts = []
-            retrieved_uris = []
-            context_blocks = []
-            
-            for r in search_res.resources:
-                retrieved_uris.append(r.uri)
-                content = self.db.read_resource(r.uri) if getattr(r, 'level', 2) == 2 else f"{getattr(r, 'abstract', '')}\n{getattr(r, 'overview', '')}"
-                retrieved_texts.append(content)
-                clean = content[:8000]
-                context_blocks.append(clean)
-            
+
+            recall_texts = search_res["recall_texts"]
+            context_blocks = search_res["context_blocks"]
+            retrieved_uris = search_res["retrieved_uris"]
+
+            retrieved_texts = list(recall_texts.values())
             recall = MetricsCalculator.check_recall(retrieved_texts, qa.evidence)
             
             full_prompt, meta = self.adapter.build_prompt(qa, context_blocks)
@@ -630,3 +810,34 @@ class BenchmarkPipeline:
         with open(self.report_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=4, ensure_ascii=False)
         self.logger.info(f"Report updated -> {self.report_file}")
+
+    def _count_total_relations(self, strategy: str):
+        """Count total unique edge pairs in all .relations_{strategy}.jsonl files."""
+        vector_store_path = self.config.get('paths', {}).get('vector_store', '')
+        if not vector_store_path or not os.path.isdir(vector_store_path):
+            return 0, set()
+        viking_dir = os.path.join(vector_store_path, "viking")
+        if not os.path.isdir(viking_dir):
+            return 0, set()
+        filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
+        all_edges = set()
+        for root, _dirs, files in os.walk(viking_dir):
+            if filename in files:
+                fpath = os.path.join(root, filename)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                rec = json.loads(line)
+                                uri1 = rec.get("uri1", "")
+                                uri2 = rec.get("uri2", "")
+                                if uri1 and uri2:
+                                    all_edges.add((min(uri1, uri2), max(uri1, uri2)))
+                            except json.JSONDecodeError:
+                                continue
+                except Exception:
+                    continue
+        return len(all_edges), all_edges

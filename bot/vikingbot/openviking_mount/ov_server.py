@@ -1,15 +1,107 @@
 import asyncio
 import hashlib
+import json
+import os
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
+
+from vikingbot.openviking_mount.reference_store import ReferenceStore
 
 import openviking as ov
 from vikingbot.config.loader import load_config
 from vikingbot.openviking_mount.user_apikey_manager import UserApiKeyManager
 
 viking_resource_prefix = "viking://resources/"
+
+# --- Relation matching utilities ---
+
+_ENGLISH_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "it", "as", "be", "was", "were",
+    "been", "are", "am", "do", "did", "does", "has", "had", "have", "will",
+    "would", "could", "should", "may", "might", "shall", "can", "not", "no",
+    "nor", "so", "if", "then", "than", "that", "this", "these", "those",
+    "what", "which", "who", "whom", "how", "when", "where", "why",
+    "all", "each", "every", "both", "few", "more", "most", "other", "some",
+    "such", "only", "own", "same", "too", "very", "just", "about", "above",
+    "after", "again", "also", "any", "because", "before", "below", "between",
+    "during", "into", "its", "out", "over", "through", "under", "until",
+    "up", "down", "here", "there", "once", "further", "her", "his", "she",
+    "he", "him", "his", "her", "hers", "its", "they", "them", "their",
+    "theirs", "our", "ours", "your", "yours", "we", "you", "me", "my",
+    "myself", "yourself", "himself", "herself", "itself", "themselves",
+    "ourselves", "yourselves", "being", "having", "doing",
+})
+
+
+def _extract_keywords(text: str) -> set:
+    if not text:
+        return set()
+    tokens = text.lower().split()
+    result = set()
+    for t in tokens:
+        t = t.strip(".,;:!?\"'()[]{}—–-")
+        if len(t) <= 2 or t in _ENGLISH_STOPWORDS:
+            continue
+        result.add(t)
+    return result
+
+
+def _cosine_similarity(a: list, b: list) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+_embedder_cache = None
+_embedder_tried = False
+
+
+def _get_embedder():
+    global _embedder_cache, _embedder_tried
+    if _embedder_tried:
+        return _embedder_cache
+    _embedder_tried = True
+
+    api_key = os.environ.get("VIKINGBOT_EMBEDDING_API_KEY", "")
+    if not api_key:
+        logger.warning("[VikingClient] Embedder not configured (VIKINGBOT_EMBEDDING_API_KEY not set)")
+        return None
+    try:
+        from volcenginesdkarkruntime import Ark
+        model = os.environ.get("VIKINGBOT_EMBEDDING_MODEL", "doubao-embedding-vision-250615")
+        base_url = os.environ.get("VIKINGBOT_EMBEDDING_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
+        client = Ark(api_key=api_key, base_url=base_url)
+
+        class _Embedder:
+            def __init__(self):
+                self._cache: dict[str, list] = {}
+
+            def embed(self, text: str) -> list:
+                if text in self._cache:
+                    return self._cache[text]
+                resp = client.multimodal_embeddings.create(
+                    input=[{"type": "text", "text": text}], model=model
+                )
+                embedding = resp.data.embedding
+                self._cache[text] = embedding
+                return embedding
+
+        _embedder_cache = _Embedder()
+        logger.info(f"[VikingClient] Embedder initialized: model={model}")
+    except Exception as e:
+        logger.error(f"[VikingClient] Failed to initialize embedder: {e}")
+        _embedder_cache = None
+
+    return _embedder_cache
 
 
 class VikingClient:
@@ -46,6 +138,8 @@ class VikingClient:
                     account_id=openviking_config.account_id,
                 )
         self.mode = openviking_config.mode
+        workspace = config.storage_workspace or str(Path("~/.openviking/data").expanduser())
+        self._vikingfs_path = os.path.join(workspace, "viking")
 
     async def _initialize(self):
         """Initialize the client (must be called after construction)"""
@@ -357,6 +451,130 @@ class VikingClient:
             node_limit=node_limit,
             exclude_uri=exclude_uri,
         )
+
+    async def relations(self, uri: str, query: str = "", strategy: str = "blind") -> list[dict[str, Any]]:
+        """查询 uri 的关联文档，通过磁盘 JSONL 直接读取 + 双路匹配"""
+        parent_dir = self._uri_to_parent_path(uri)
+        relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
+        jsonl_path = os.path.join(parent_dir, relations_filename)
+        if not os.path.exists(jsonl_path):
+            return []
+
+        ref_store = ReferenceStore(parent_dir)
+        query_embedding = None
+        query_keywords = set()
+        if query:
+            query_keywords = _extract_keywords(query)
+            embedder = _get_embedder()
+            if embedder:
+                try:
+                    query_embedding = embedder.embed(query)
+                except Exception:
+                    pass
+
+        results = []
+        seen = set()
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                uri1, uri2 = rec.get("uri1", ""), rec.get("uri2", "")
+                if uri1 == uri2 or (uri1 != uri and uri2 != uri):
+                    continue
+                target = uri2 if uri1 == uri else uri1
+                if target in seen:
+                    continue
+
+                question_id = rec.get("question_id", "")
+                ref = ref_store.get(question_id) if question_id else None
+                rec_query = ref.get("question", "") if ref else rec.get("query_question", "")
+                rec_embedding = ref.get("embedding") if ref else rec.get("query_embedding")
+                rec_weight = rec.get("weight", 1.0)
+
+                if question_id == "":
+                    seen.add(target)
+                    results.append({"uri": target, "reason": rec.get("reason", rec_query), "weight": rec_weight})
+                    continue
+                if not query:
+                    seen.add(target)
+                    results.append({"uri": target, "reason": rec_query, "weight": rec_weight})
+                    continue
+
+                kw_matched = False
+                if query_keywords and rec_query:
+                    rec_kw = _extract_keywords(rec_query)
+                    if rec_kw and len(query_keywords & rec_kw) / len(query_keywords) > 0.7:
+                        kw_matched = True
+                vec_matched = False
+                if query_embedding and rec_embedding:
+                    if _cosine_similarity(query_embedding, rec_embedding) > 0.7:
+                        vec_matched = True
+
+                if kw_matched or vec_matched:
+                    seen.add(target)
+                    results.append({"uri": target, "reason": rec.get("reason", rec_query), "weight": rec_weight})
+
+        results.sort(key=lambda x: x.get("weight", 1.0), reverse=True)
+        return results
+
+    async def link(
+        self, from_uri: str, to_uris: Any, reason: str = "", query: str = "",
+        strategy: str = "blind", weight: float = 1.0,
+    ) -> None:
+        """创建 from_uri → uris 的关联边，直接写入磁盘 JSONL"""
+        if isinstance(to_uris, str):
+            to_uris = [to_uris]
+        for to_uri in to_uris:
+            if from_uri == to_uri:
+                continue
+            self._append_relation(from_uri, to_uri, query, reason, strategy=strategy, weight=weight)
+
+    def _uri_to_local_path(self, uri: str) -> str:
+        rel = uri[len("viking://"):] if uri.startswith("viking://") else uri
+        return os.path.join(self._vikingfs_path, rel)
+
+    def _uri_to_parent_path(self, uri: str) -> str:
+        local_path = self._uri_to_local_path(uri)
+        return local_path if os.path.isdir(local_path) else os.path.dirname(local_path)
+
+    def _append_relation(self, uri1: str, uri2: str, query: str, reason: str = "",
+                         strategy: str = "blind", weight: float = 1.0) -> None:
+        parent_dir = self._uri_to_parent_path(uri1)
+        os.makedirs(parent_dir, exist_ok=True)
+        relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
+        jsonl_path = os.path.join(parent_dir, relations_filename)
+
+        question_id = ""
+        if query:
+            ref_store = ReferenceStore(parent_dir)
+            embedder = _get_embedder()
+            question_id = ref_store.get_or_create(query, embedder=embedder)
+
+        key = (uri1, uri2, question_id)
+        existing = set()
+        if os.path.exists(jsonl_path):
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        existing.add((rec.get("uri1", ""), rec.get("uri2", ""), rec.get("question_id", "")))
+                    except json.JSONDecodeError:
+                        continue
+        if key in existing:
+            return
+
+        record = {"uri1": uri1, "uri2": uri2, "question_id": question_id, "reason": reason, "weight": weight}
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     async def glob(self, pattern: str, uri: Optional[str] = None) -> Dict[str, Any]:
         """通过 glob 模式匹配文件"""

@@ -140,7 +140,7 @@ class SubagentManager:
                         logger.debug(
                             f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}"
                         )
-                        result = await tools.execute(
+                        result, _tool_ctx = await tools.execute(
                             tool_call.name,
                             tool_call.arguments,
                             session_key=session_key,

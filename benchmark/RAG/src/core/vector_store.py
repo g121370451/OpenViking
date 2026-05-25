@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List
+from typing import Dict, List
 import sys
 from pathlib import Path
 
@@ -92,12 +92,49 @@ class VikingStoreWrapper:
             "embedding_tokens": total_embedding_tokens
         }
 
-    def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources"):
-        """Execute retrieval, only return L2 (leaf) results"""
-        search_res = self.client.find(query=query, limit=topk * 3, target_uri=target_uri)
-        if hasattr(search_res, 'resources'):
-            search_res.resources = [r for r in search_res.resources if r.level == 2][:topk]
-        return search_res
+    def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources") -> Dict:
+        """Retrieve relevant documents: search, filter L2, read content.
+
+        Returns:
+            Dict with keys:
+              - recall_texts: {uri: full_content}
+              - context_blocks: [truncated_content, ...]
+              - retrieved_uris: [uri, ...]
+              - retrieval_tokens: int
+        """
+        candidate_k = topk * 3
+        search_res = self.client.find(query=query, limit=candidate_k, target_uri=target_uri, telemetry=True)
+
+        retrieval_tokens = 0
+        if hasattr(search_res, 'telemetry') and search_res.telemetry:
+            retrieval_tokens = search_res.telemetry.get('summary', {}).get('tokens', {}).get('embedding', {}).get('total', 0)
+
+        candidates = (getattr(search_res, 'resources', []) or [])[:candidate_k]
+        l2_only = [
+            r for r in candidates
+            if getattr(r, 'level', 2) == 2
+            and not str(getattr(r, 'uri', '')).endswith(
+                ('/.abstract.md', '/.overview.md', '.abstract.md', '.overview.md')
+            )
+        ][:topk]
+
+        recall_texts = {}
+        context_blocks = []
+        retrieved_uris = []
+
+        for r in l2_only:
+            uri = r.uri
+            content = self.read_resource(uri)
+            retrieved_uris.append(uri)
+            recall_texts[uri] = content
+            context_blocks.append(content[:8000])
+
+        return {
+            "recall_texts": recall_texts,
+            "context_blocks": context_blocks,
+            "retrieved_uris": retrieved_uris,
+            "retrieval_tokens": retrieval_tokens,
+        }
 
     def read_resource(self, uri: str) -> str:
         """Read resource content"""

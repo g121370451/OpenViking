@@ -46,6 +46,7 @@ class SingleTurnChannel(BaseChannel):
         markdown: bool = True,
         eval: bool = False,
         sender: str | None = None,
+        output_file: str | None = None,
     ):
         super().__init__(config, bus, workspace_path)
         self.message = message
@@ -55,6 +56,7 @@ class SingleTurnChannel(BaseChannel):
         self._response_received = asyncio.Event()
         self._last_response: str | None = None
         self._eval = eval
+        self._output_file = output_file
 
     async def start(self) -> None:
         """Start the single-turn channel - send message and wait for response."""
@@ -100,13 +102,40 @@ class SingleTurnChannel(BaseChannel):
                     from vikingbot.cli.commands import console
                     console.print(json.dumps(msg.messages, ensure_ascii=False, default=str))
                 content = msg.content.replace('"', "'") if msg.content else ""
+                tools_used_slim = []
+                if msg.tools_used:
+                    for tc in msg.tools_used:
+                        if isinstance(tc, dict):
+                            tool_name = tc.get("tool_name", "")
+                            # Include result for search, link, and grep tools
+                            entry = {
+                                "tool_name": tool_name,
+                                "args": tc.get("args", ""),
+                                "reasoning": tc.get("reasoning", ""),
+                                "duration": tc.get("duration", 0),
+                                "execute_success": tc.get("execute_success", True),
+                                "relations_found": tc.get("relations_found", 0),
+                            }
+                            if tool_name in ("openviking_search", "openviking_link", "openviking_grep"):
+                                entry["result"] = tc.get("result", "")
+                            tools_used_slim.append(entry)
+                        else:
+                            tools_used_slim.append(tc)
                 output = {
                     "text": content,
                     "token_usage": msg.token_usage,
                     "time_cost": msg.time_cost,
-                    "iteration": msg.iteration,
+                    "total_iterations": msg.iteration,
                     "tools_used_names": msg.tools_used_names,
+                    "tools_used": tools_used_slim,
                 }
-                msg.content = json.dumps(output, ensure_ascii=False)
+                if self._output_file:
+                    # Write structured JSON to file (guaranteed valid)
+                    with open(self._output_file, "w", encoding="utf-8") as f:
+                        json.dump(output, f, ensure_ascii=False, default=str)
+                    # stdout only gets the plain text answer
+                    msg.content = msg.content or ""
+                else:
+                    msg.content = json.dumps(output, ensure_ascii=False, default=str)
             self._last_response = msg.content
             self._response_received.set()

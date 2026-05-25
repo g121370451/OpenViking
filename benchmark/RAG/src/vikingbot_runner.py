@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import sys
 import time
 import json
@@ -53,17 +54,7 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, sear
     if search_limit is not None:
         config['default_search_limit'] = search_limit
 
-    if llm_config:
-        if 'vlm' not in config or config.get('vlm') is None:
-            config['vlm'] = {}
-        if 'model' in llm_config:
-            config['vlm']['model'] = llm_config['model']
-        if 'api_key' in llm_config:
-            config['vlm']['api_key'] = llm_config['api_key']
-        if 'base_url' in llm_config:
-            config['vlm']['api_base'] = llm_config['base_url']
-        if 'temperature' in llm_config:
-            config['vlm']['temperature'] = llm_config['temperature']
+    # llm_config is for judge only, do not override ov's vlm config
 
     temp_dir = Path(__file__).parent.parent / ".temp"
     temp_dir.mkdir(exist_ok=True)
@@ -146,6 +137,14 @@ def _stop_openviking_server() -> None:
 
 atexit.register(_stop_openviking_server)
 
+import signal
+
+def _sigint_handler(signum, frame):
+    _stop_openviking_server()
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, _sigint_handler)
+
 
 def _wait_for_port_release(host: str, port: int, timeout: float = 5.0) -> None:
     deadline = time.time() + timeout
@@ -167,6 +166,26 @@ def _healthcheck_with_retry(url: str, retries: int = 3, interval: float = 2.0, t
             logger.debug(f"Healthcheck failed (attempt {attempt + 1}/{retries}), retrying in {interval}s...")
             time.sleep(interval)
     return False
+
+
+def _kill_locking_pid(log_text: str) -> bool:
+    """Parse DataDirectoryLocked PID from log and kill it. Returns True if killed."""
+    match = re.search(r"Another OpenViking process \(PID (\d+)\)", log_text)
+    if not match:
+        return False
+    pid = int(match.group(1))
+    logger.warning(f"Killing stale OpenViking process PID {pid} that holds the data directory lock")
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+        else:
+            import signal
+            os.kill(pid, signal.SIGKILL)
+        time.sleep(1)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to kill PID {pid}: {e}")
+        return False
 
 
 def _ensure_openviking_server(ov_conf_path: str) -> None:
@@ -194,7 +213,7 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
 
         env = os.environ.copy()
         env["OPENVIKING_CONFIG_FILE"] = ov_conf_path
-
+        
         temp_dir = Path(__file__).parent.parent / ".temp"
         temp_dir.mkdir(exist_ok=True)
         server_log_path = str(temp_dir / "openviking-server.log")
@@ -211,10 +230,42 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         )
         _CURRENT_OV_CONF_PATH = ov_conf_path
 
+        retried_lock = False
         deadline = time.time() + 20
         while time.time() < deadline:
             if _OPENVIKING_SERVER_PROCESS.poll() is not None:
-                raise RuntimeError("openviking-server exited unexpectedly")
+                exit_code = _OPENVIKING_SERVER_PROCESS.returncode
+                log_tail = ""
+                try:
+                    if _OPENVIKING_SERVER_LOG_FH:
+                        _OPENVIKING_SERVER_LOG_FH.flush()
+                    with open(server_log_path, "r", encoding="utf-8", errors="replace") as lf:
+                        lines = lf.readlines()
+                        log_tail = "".join(lines[-50:])
+                except Exception:
+                    pass
+                logger.error(f"openviking-server exited with code {exit_code}. Config: {ov_conf_path}")
+                if log_tail:
+                    logger.error(f"Server log (last 50 lines):\n{log_tail}")
+
+                if not retried_lock and "DataDirectoryLocked" in log_tail and _kill_locking_pid(log_tail):
+                    retried_lock = True
+                    logger.info("Retrying server start after killing stale process...")
+                    _wait_for_port_release(host, port)
+                    try:
+                        _OPENVIKING_SERVER_LOG_FH = open(server_log_path, "a", encoding="utf-8")
+                    except Exception:
+                        _OPENVIKING_SERVER_LOG_FH = None
+                    _OPENVIKING_SERVER_PROCESS = subprocess.Popen(
+                        ["openviking-server", "--config", ov_conf_path],
+                        stdout=_OPENVIKING_SERVER_LOG_FH or subprocess.DEVNULL,
+                        stderr=_OPENVIKING_SERVER_LOG_FH or subprocess.DEVNULL,
+                        env=env,
+                    )
+                    deadline = time.time() + 20
+                    continue
+
+                raise RuntimeError(f"openviking-server exited unexpectedly (code={exit_code})")
             if _healthcheck(health_url):
                 return
             time.sleep(0.3)
@@ -222,10 +273,22 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         raise RuntimeError("openviking-server did not become healthy in time")
 
 
-def _build_vikingbot_env(ov_conf_path: str, max_iterations: int) -> dict[str, str]:
+def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, use_relations: bool = False, embedding_config: dict = None, link_strategy: str = "blind", enable_reasoning: bool = True) -> dict[str, str]:
     env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env["OPENVIKING_CONFIG_FILE"] = ov_conf_path
     env["NANOBOT_AGENTS__MAX_TOOL_ITERATIONS"] = str(int(max_iterations))
+    env["VIKINGBOT_USE_RELATIONS"] = "1" if use_relations else "0"
+    env["VIKINGBOT_ENABLE_LINKING"] = "1" if enable_linking else "0"
+    env["VIKINGBOT_ENABLE_REASONING"] = "1" if enable_reasoning else "0"
+    env["VIKINGBOT_LINK_STRATEGY"] = link_strategy
+    if embedding_config:
+        raw_key = embedding_config.get("api_key", "")
+        resolved_key = os.path.expandvars(raw_key) if raw_key else ""
+        env["VIKINGBOT_EMBEDDING_API_KEY"] = resolved_key
+        env["VIKINGBOT_EMBEDDING_MODEL"] = embedding_config.get("model", "doubao-embedding-vision-250615")
+        env["VIKINGBOT_EMBEDDING_BASE_URL"] = embedding_config.get("base_url", "https://ark.cn-beijing.volces.com/api/v3")
 
     original_ov_conf_dir = os.path.dirname(_OV_CONF_PATH)
     ovcli_conf_path = os.path.join(original_ov_conf_dir, "ovcli.conf")
@@ -253,6 +316,10 @@ class VikingBotRunner:
         self.max_iterations = self.vikingbot_config.get('max_iterations', 50)
         self.log_tool_calls = self.vikingbot_config.get('log_tool_calls', True)
         self.search_limit = self.vikingbot_config.get('search_limit')
+        self.use_relations = self.vikingbot_config.get('use_relations', False)
+        self.enable_linking = self.vikingbot_config.get('enable_linking', False)
+        self.link_strategy = self.vikingbot_config.get('link_strategy', 'blind')
+        self.enable_reasoning = self.vikingbot_config.get('enable_reasoning', True)
         self.vector_store_path = config.get('paths', {}).get('vector_store')
         self.llm_config = config.get('llm', None)
         self.server_port = config.get('execution', {}).get('server_port', None)
@@ -277,8 +344,6 @@ class VikingBotRunner:
 
             _ensure_openviking_server(ov_conf_path)
 
-            allowed_target_uris = None
-
             if allowed_target_uris:
                 allowed_block = "\n".join(f"- {u}" for u in allowed_target_uris)
                 scope_line = (
@@ -300,7 +365,19 @@ class VikingBotRunner:
                 + scope_line
                 + f"\n\nQuestion: {question}"
             )
-            env = _build_vikingbot_env(ov_conf_path, self.max_iterations)
+            env = _build_vikingbot_env(
+                ov_conf_path, self.max_iterations, self.enable_linking, self.use_relations,
+                embedding_config=self.config.get('embedding'),
+                link_strategy=self.link_strategy,
+                enable_reasoning=self.enable_reasoning,
+            )
+
+            # Write bot JSON output to a temp file (avoids stdout escape issues)
+            safe_session = session_id.replace("/", "_").replace("\\", "_")
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output", "bot_json")
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, f"{safe_session}.json")
+
             cmd = [
                 "vikingbot",
                 "chat",
@@ -312,12 +389,16 @@ class VikingBotRunner:
                 "--no-markdown",
                 "-c",
                 ov_conf_path,
+                "-o",
+                output_file,
             ]
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=env,
             )
             pid = proc.pid
@@ -329,30 +410,52 @@ class VikingBotRunner:
                 raise subprocess.TimeoutExpired(cmd, 600)
             if proc.returncode != 0:
                 raise subprocess.CalledProcessError(proc.returncode, cmd, stdout, stderr)
+
+            # Read structured JSON from output file (guaranteed valid)
+            resp_json = None
+            try:
+                if os.path.exists(output_file):
+                    with open(output_file, "r", encoding="utf-8") as f:
+                        resp_json = json.load(f)
+                    logger.debug(f"Successfully read bot output from: {output_file}")
+                else:
+                    logger.warning(f"Output file not found: {output_file}, falling back to stdout parsing")
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to read output file: {e}, falling back to stdout parsing")
+
+            # Fallback to stdout parsing if file-based approach failed
             stdout = (stdout or "").strip()
-
-            json_start = stdout.rfind('{"text"')
-            if json_start == -1:
-                raise ValueError(f"No JSON output found in vikingbot stdout (len={len(stdout)})")
-
-            trace = stdout[:json_start].strip() if json_start > 0 else ""
-
-            import re
-            raw_json = stdout[json_start:]
-            raw_json = re.sub(r'[\x00-\x1f\x7f]', ' ', raw_json)
-            resp_json, _ = json.JSONDecoder().raw_decode(raw_json)
+            trace = ""
+            if resp_json is None:
+                json_start = stdout.rfind('{"text"')
+                if json_start == -1:
+                    raise ValueError(f"No JSON output found in vikingbot stdout (len={len(stdout)})")
+                trace = stdout[:json_start].strip() if json_start > 0 else ""
+                raw_json = stdout[json_start:]
+                raw_json = re.sub(r'[\x00-\x1f\x7f]', ' ', raw_json)
+                raw_json = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw_json)
+                try:
+                    resp_json, _ = json.JSONDecoder().raw_decode(raw_json)
+                except json.JSONDecodeError:
+                    resp_json, _ = json.JSONDecoder(strict=False).raw_decode(raw_json)
 
             result_dict = {
                 "answer": resp_json.get("text", "") or "",
                 "total_time_sec": float(resp_json.get("time_cost", time.time() - start_time)),
                 "token_usage": resp_json.get("token_usage") or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
                 "tools_used_names": resp_json.get("tools_used_names") or [],
-                "iterations_used": int(resp_json.get("iteration") or 0),
+                "tools_used": resp_json.get("tools_used") or [],
+                "iterations_used": int(resp_json.get("total_iterations", 0) or resp_json.get("iteration", 0) or 0),
                 "debug_log": f"vikingbot.debug.{pid}.log",
                 "session_id": session_id,
                 "trace": trace,
                 "stderr_output": (stderr or "").strip()[:10000],
             }
+
+            # Print bot stderr so loguru output from the subprocess is visible
+            if stderr and stderr.strip():
+                for line in stderr.strip().splitlines():
+                    logger.info(f"[bot-stderr] {line}")
 
             logger.info(f"VikingBot answer generated in {result_dict['total_time_sec']:.2f}s")
             return result_dict
