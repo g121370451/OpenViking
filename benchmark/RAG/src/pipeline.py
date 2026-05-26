@@ -4,6 +4,7 @@ import time
 import uuid
 import random
 import re
+import copy
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -155,14 +156,23 @@ class BenchmarkPipeline:
         remaining_tasks = [task for task in tasks if task["id"] not in completed_tasks]
         self.logger.info(f"Total tasks: {len(tasks)}, Remaining: {len(remaining_tasks)}")
         
-        use_vikingbot = self.config.get("execution", {}).get("use_vikingbot", False)
-        use_nanobot = self.config.get("execution", {}).get("use_nanobot", False)
-        if use_nanobot:
-            process_fn = self._process_nanobot_task
-        elif use_vikingbot:
-            process_fn = self._process_vikingbot_task
-        else:
-            process_fn = self._process_generation_task
+        mode = self.config.get("execution", {}).get("mode")
+        if mode is None:
+            if self.config.get("execution", {}).get("use_nanobot", False):
+                mode = "nanobot"
+            elif self.config.get("execution", {}).get("use_vikingbot", False):
+                mode = "vikingbot"
+            else:
+                mode = "standard"
+
+        mode_dispatch = {
+            "standard": self._process_generation_task,
+            "vikingbot": self._process_vikingbot_task,
+            "nanobot": self._process_nanobot_task,
+            "ov_fallback_bot": self._process_ov_fallback_bot_task,
+            "ov_fallback_bot_relations": self._process_ov_fallback_bot_relations_task,
+        }
+        process_fn = mode_dispatch[mode]
 
         if remaining_tasks:
             initial_completed = len(completed_tasks)
@@ -374,7 +384,7 @@ class BenchmarkPipeline:
                 # Edge Coverage Rate
                 use_relations = self.config.get('vikingbot', {}).get('use_relations', False)
                 if use_relations:
-                    strategy = self.config.get('vikingbot', {}).get('link_strategy', 'blind')
+                    strategy = self.config.get('vikingbot', {}).get('link_strategy', 'llm_review')
                     total_edges_count, all_edges = self._count_total_relations(strategy)
                     hit_edges = set()
                     for r in vb_records:
@@ -428,6 +438,48 @@ class BenchmarkPipeline:
                             "Excluded Anomalous Records (tc=0)": len(vb_records) - len(vb_valid),
                         }
                     })
+
+            # Fallback mode statistics
+            fallback_records = [r for r in eval_records if 'fallback' in r]
+            if fallback_records:
+                triggered = [r for r in fallback_records if r['fallback'].get('triggered')]
+                not_triggered = [r for r in fallback_records if not r['fallback'].get('triggered')]
+                fb_total = len(fallback_records)
+
+                avg_total_latency = sum(r['fallback']['total_latency_sec'] for r in fallback_records) / fb_total
+                avg_total_input = sum(r['fallback']['total_input_tokens'] for r in fallback_records) / fb_total
+                avg_total_output = sum(r['fallback']['total_output_tokens'] for r in fallback_records) / fb_total
+
+                avg_ov_latency = sum(r['fallback']['ov_retrieval_sec'] for r in fallback_records) / fb_total
+                avg_judge_latency = sum(r['fallback']['judge_latency_sec'] for r in fallback_records) / fb_total
+                avg_judge_tokens = sum(r['fallback']['judge_input_tokens'] + r['fallback']['judge_output_tokens'] for r in fallback_records) / fb_total
+
+                fallback_report = {
+                    "Total Queries": fb_total,
+                    "Fallback Trigger Rate": len(triggered) / fb_total,
+                    "Triggered Count": len(triggered),
+                    "Not Triggered Count": len(not_triggered),
+                    "Average Total Latency (s)": avg_total_latency,
+                    "Average Total Input Tokens": avg_total_input,
+                    "Average Total Output Tokens": avg_total_output,
+                    "Average OV Retrieval Latency (s)": avg_ov_latency,
+                    "Average Judge Latency (s)": avg_judge_latency,
+                    "Average Judge Tokens": avg_judge_tokens,
+                }
+
+                if triggered:
+                    avg_bot_latency = sum(r['fallback']['bot_latency_sec'] for r in triggered) / len(triggered)
+                    avg_bot_tokens = sum(r['fallback']['bot_input_tokens'] + r['fallback']['bot_output_tokens'] for r in triggered) / len(triggered)
+                    fallback_report["Average Bot Latency (triggered) (s)"] = avg_bot_latency
+                    fallback_report["Average Bot Tokens (triggered)"] = avg_bot_tokens
+                    fallback_report["Average Accuracy (triggered)"] = sum(r['metrics']['Accuracy'] for r in triggered) / len(triggered)
+
+                if not_triggered:
+                    fallback_report["Average Accuracy (not triggered)"] = sum(r['metrics']['Accuracy'] for r in not_triggered) / len(not_triggered)
+
+                fallback_report["Average Accuracy (overall)"] = sum(r['metrics']['Accuracy'] for r in fallback_records) / fb_total
+
+                self._update_report({"Fallback Mode Statistics": fallback_report})
         self.checkpoint_manager.delete_checkpoint()
 
     def run_deletion(self):
@@ -729,6 +781,235 @@ class BenchmarkPipeline:
                 "llm": {"final_answer": ans},
                 "metrics": {"Recall": recall}, "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens}
             }
+        except Exception:
+            self.monitor.worker_end(success=False)
+            raise
+
+    def _process_ov_fallback_bot_task(self, task):
+        return self._process_fallback_task(task, bot_use_relations=False)
+
+    def _process_ov_fallback_bot_relations_task(self, task):
+        return self._process_fallback_task(task, bot_use_relations=True)
+
+    def _process_fallback_task(self, task, bot_use_relations: bool):
+        self.monitor.worker_start()
+        try:
+            qa = task['qa']
+            fallback_config = self.config.get("execution", {}).get("fallback", {})
+            score_threshold = fallback_config.get("score_threshold", 2)
+
+            # --- Phase 1: OV retrieval + generation ---
+            t0 = time.time()
+            retrieval_instruction = self.config['execution'].get('retrieval_instruction', '')
+            enhanced_query = f"{retrieval_instruction} {qa.question}" if retrieval_instruction else qa.question
+            search_res = self.db.retrieve(query=enhanced_query, topk=self.config['execution']['retrieval_topk'])
+            ov_retrieval_sec = time.time() - t0
+
+            recall_texts = search_res["recall_texts"]
+            context_blocks = search_res["context_blocks"]
+            retrieved_uris = search_res["retrieved_uris"]
+
+            retrieved_texts = list(recall_texts.values())
+            recall = MetricsCalculator.check_recall(retrieved_texts, qa.evidence)
+
+            full_prompt, meta = self.adapter.build_prompt(qa, context_blocks)
+
+            t1 = time.time()
+            ans_raw = self.llm.generate(full_prompt)
+            ov_generation_sec = time.time() - t1
+
+            ov_answer = self.adapter.post_process_answer(qa, ans_raw, meta)
+
+            ov_in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
+            ov_out_tokens = self.db.count_tokens(ov_answer)
+
+            # --- Phase 2: LLM Judge ---
+            dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
+            judge_result = llm_grader(
+                self.llm.llm,
+                self.config['llm']['model'],
+                qa.question,
+                qa.gold_answers,
+                ov_answer,
+                dataset_name=dataset_name,
+            )
+            judge_score = judge_result["score"]
+            judge_input_tokens = judge_result.get("judge_input_tokens", 0)
+            judge_output_tokens = judge_result.get("judge_output_tokens", 0)
+            judge_latency_sec = judge_result.get("judge_latency_sec", 0)
+
+            # --- Phase 3: Fallback decision ---
+            fallback_triggered = judge_score < score_threshold
+            final_answer = ov_answer
+            bot_latency_sec = 0
+            bot_input_tokens = 0
+            bot_output_tokens = 0
+            bot_detail = None
+
+            if fallback_triggered:
+                self.logger.info(
+                    f"[Query-{task['id']}] Fallback triggered (score={judge_score} < {score_threshold}), "
+                    f"calling bot (relations={bot_use_relations})"
+                )
+                bot_config = copy.deepcopy(self.config)
+                bot_config.setdefault('vikingbot', {})['use_relations'] = bot_use_relations
+
+                session_id = f"fallback_{uuid.uuid4().hex}"
+                restrict_to_qa_doc = bool(self.config.get("execution", {}).get("restrict_to_qa_doc", False))
+                allowed_target_uris = self._resolve_target_uris(task, qa) if restrict_to_qa_doc else None
+
+                vikingbot_result = run_vikingbot_query(
+                    question=qa.question,
+                    config=bot_config,
+                    session_id=session_id,
+                    allowed_target_uris=allowed_target_uris,
+                )
+
+                final_answer = vikingbot_result.get("answer", "")
+                bot_latency_sec = vikingbot_result.get("total_time_sec", 0)
+                bot_token_usage = vikingbot_result.get("token_usage", {})
+                bot_input_tokens = int(bot_token_usage.get("prompt_tokens", bot_token_usage.get("input_tokens", 0)) or 0)
+                bot_output_tokens = int(bot_token_usage.get("completion_tokens", bot_token_usage.get("output_tokens", 0)) or 0)
+
+                # Extract bot detailed info for reporting
+                bot_tools_used_raw = vikingbot_result.get("tools_used", [])
+                bot_tc_list = bot_tools_used_raw if isinstance(bot_tools_used_raw, list) else []
+                if isinstance(bot_tools_used_raw, str):
+                    try:
+                        bot_tc_list = json.loads(bot_tools_used_raw)
+                    except (json.JSONDecodeError, TypeError):
+                        bot_tc_list = []
+
+                bot_search_iterations = 0
+                bot_read_iterations = 0
+                bot_relations_hits = 0
+                bot_total_relations_found = 0
+                bot_links_created = 0
+                bot_relation_edges_hit = []
+                read_tool_names = {"openviking_multi_read", "openviking_read"}
+                for tc in bot_tc_list:
+                    if not isinstance(tc, dict):
+                        continue
+                    tn = tc.get('tool_name', '')
+                    if tn == 'openviking_search':
+                        bot_search_iterations += 1
+                        rf = tc.get('relations_found', 0) or 0
+                        bot_total_relations_found += rf
+                        if rf > 0:
+                            bot_relations_hits += 1
+                        result_data = tc.get('result')
+                        if isinstance(result_data, list):
+                            for item in result_data:
+                                if not isinstance(item, dict):
+                                    continue
+                                mr = item.get('match_reason', '')
+                                if mr.startswith('relation_from:'):
+                                    src = mr.replace('relation_from:', '').strip()
+                                    tgt = item.get('uri', '')
+                                    if src and tgt:
+                                        bot_relation_edges_hit.append((min(src, tgt), max(src, tgt)))
+                    elif tn in read_tool_names:
+                        bot_read_iterations += 1
+                    elif tn == 'openviking_link':
+                        args_data = tc.get('args', {})
+                        if isinstance(args_data, str):
+                            try:
+                                args_data = json.loads(args_data)
+                            except (json.JSONDecodeError, TypeError):
+                                args_data = {}
+                        to_uris = args_data.get('to_uris', []) if isinstance(args_data, dict) else []
+                        if to_uris:
+                            from_uris = args_data.get('from_uris', [])
+                            bot_links_created += len(from_uris) * len(to_uris)
+
+                bot_iterations_used = vikingbot_result.get("iterations_used", 0)
+                link_tools = {'openviking_link', 'openviking_relations'}
+                total_calls = len(bot_tc_list) if bot_tc_list else 1
+                non_link_call_count = sum(1 for tc in bot_tc_list if isinstance(tc, dict) and tc.get('tool_name', '') not in link_tools)
+                bot_retrieval_iterations = max(1, round(bot_iterations_used * non_link_call_count / total_calls)) if bot_iterations_used > 0 else bot_iterations_used
+
+                # Save trace
+                bot_trace = vikingbot_result.get("trace", "")
+                bot_trace_file = ""
+                if bot_trace:
+                    trace_dir = os.path.join(self.output_dir, "traces")
+                    os.makedirs(trace_dir, exist_ok=True)
+                    bot_trace_file = os.path.join(trace_dir, f"query_{task['id']}_fallback_trace.txt")
+                    try:
+                        trace_data = json.loads(bot_trace, strict=False)
+                        with open(bot_trace_file, "w", encoding="utf-8") as f:
+                            json.dump(trace_data, f, ensure_ascii=False, indent=2, default=str)
+                    except json.JSONDecodeError:
+                        with open(bot_trace_file, "w", encoding="utf-8") as f:
+                            f.write(bot_trace)
+
+                bot_detail = {
+                    "iterations_used": bot_iterations_used,
+                    "retrieval_iterations": bot_retrieval_iterations,
+                    "search_iterations": bot_search_iterations,
+                    "read_iterations": bot_read_iterations,
+                    "tools_used_names": vikingbot_result.get("tools_used_names", []),
+                    "tool_calls": bot_tc_list,
+                    "total_time_sec": bot_latency_sec,
+                    "debug_log": vikingbot_result.get("debug_log", ""),
+                    "session_id": vikingbot_result.get("session_id", ""),
+                    "trace_file": bot_trace_file,
+                    "relations_hits": bot_relations_hits,
+                    "total_relations_found": bot_total_relations_found,
+                    "links_created": bot_links_created,
+                    "relation_edges_hit": bot_relation_edges_hit,
+                }
+
+            # --- Aggregate metrics ---
+            total_input_tokens = ov_in_tokens + bot_input_tokens
+            total_output_tokens = ov_out_tokens + bot_output_tokens
+            total_latency_sec = ov_retrieval_sec + bot_latency_sec
+
+            self.monitor.worker_end(tokens=total_input_tokens + total_output_tokens)
+            self.logger.info(
+                f"[Query-{task['id']}] Fallback={'YES' if fallback_triggered else 'NO'} | "
+                f"JudgeScore={judge_score} | Total: {total_latency_sec:.1f}s"
+            )
+
+            result = {
+                "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
+                "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
+                "retrieval": {"latency_sec": total_latency_sec, "uris": retrieved_uris},
+                "llm": {"final_answer": final_answer},
+                "metrics": {"Recall": recall},
+                "token_usage": {
+                    "total_input_tokens": total_input_tokens,
+                    "llm_output_tokens": total_output_tokens,
+                    "retrieval_embedding_tokens": 0,
+                    "prompt_tokens": total_input_tokens,
+                    "completion_tokens": total_output_tokens,
+                    "total_tokens": total_input_tokens + total_output_tokens,
+                },
+                "fallback": {
+                    "triggered": fallback_triggered,
+                    "bot_use_relations": bot_use_relations,
+                    "ov_judge_score": judge_score,
+                    "ov_judge_reasoning": judge_result.get("reasoning", ""),
+                    "score_threshold": score_threshold,
+                    "ov_answer": ov_answer,
+                    "ov_retrieval_sec": ov_retrieval_sec,
+                    "ov_generation_sec": ov_generation_sec,
+                    "judge_latency_sec": judge_latency_sec,
+                    "bot_latency_sec": bot_latency_sec,
+                    "ov_input_tokens": ov_in_tokens,
+                    "ov_output_tokens": ov_out_tokens,
+                    "judge_input_tokens": judge_input_tokens,
+                    "judge_output_tokens": judge_output_tokens,
+                    "bot_input_tokens": bot_input_tokens,
+                    "bot_output_tokens": bot_output_tokens,
+                    "total_latency_sec": total_latency_sec,
+                    "total_input_tokens": total_input_tokens,
+                    "total_output_tokens": total_output_tokens,
+                },
+            }
+            if bot_detail:
+                result["vikingbot"] = bot_detail
+            return result
         except Exception:
             self.monitor.worker_end(success=False)
             raise

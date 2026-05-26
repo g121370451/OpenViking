@@ -61,7 +61,7 @@ class VikingStoreWithRelations(VikingStoreWrapper):
 
     def __init__(self, store_path: str, relations_topk: int = 0,
                  use_query_expansion: bool = False, llm=None, embedder=None,
-                 strategy: str = "blind"):
+                 strategy: str = "llm_review"):
         super().__init__(store_path)
         self.relations_topk = relations_topk
         self._vikingfs_path = os.path.join(store_path, "viking")

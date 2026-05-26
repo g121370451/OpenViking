@@ -30,6 +30,8 @@ _OPENVIKING_SERVER_PROCESS: Optional[subprocess.Popen] = None
 _CURRENT_OV_CONF_PATH: Optional[str] = None
 _OPENVIKING_SERVER_LOG_FH: Optional[Any] = None
 _SERVER_LOCK = threading.Lock()
+_ACTIVE_BOT_PROCESSES: set = set()
+_BOT_PROC_LOCK = threading.Lock()
 
 
 def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, search_limit=None, llm_config: dict | None = None, server_port: int | None = None) -> str:
@@ -139,8 +141,21 @@ atexit.register(_stop_openviking_server)
 
 import signal
 
+
+def _kill_all_bot_processes():
+    with _BOT_PROC_LOCK:
+        procs = list(_ACTIVE_BOT_PROCESSES)
+    for proc in procs:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+
 def _sigint_handler(signum, frame):
     _stop_openviking_server()
+    _kill_all_bot_processes()
     sys.exit(1)
 
 signal.signal(signal.SIGINT, _sigint_handler)
@@ -199,6 +214,14 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
             _OPENVIKING_SERVER_PROCESS and
             _OPENVIKING_SERVER_PROCESS.poll() is None and
             _healthcheck_with_retry(health_url)):
+            return
+
+        # Check if another process (e.g. VikingStoreWrapper) already has a healthy
+        # server on this port. If so, reuse it without starting our own.
+        if _healthcheck(health_url):
+            logger.info(f"Reusing existing healthy server at {server_url}")
+            _CURRENT_OV_CONF_PATH = ov_conf_path
+            _OPENVIKING_SERVER_PROCESS = None
             return
 
         if _OPENVIKING_SERVER_PROCESS and _OPENVIKING_SERVER_PROCESS.poll() is None:
@@ -273,7 +296,7 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         raise RuntimeError("openviking-server did not become healthy in time")
 
 
-def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, use_relations: bool = False, embedding_config: dict = None, link_strategy: str = "blind", enable_reasoning: bool = True) -> dict[str, str]:
+def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, use_relations: bool = False, embedding_config: dict = None, link_strategy: str = "llm_review", enable_reasoning: bool = True) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -318,7 +341,7 @@ class VikingBotRunner:
         self.search_limit = self.vikingbot_config.get('search_limit')
         self.use_relations = self.vikingbot_config.get('use_relations', False)
         self.enable_linking = self.vikingbot_config.get('enable_linking', False)
-        self.link_strategy = self.vikingbot_config.get('link_strategy', 'blind')
+        self.link_strategy = self.vikingbot_config.get('link_strategy', 'llm_review')
         self.enable_reasoning = self.vikingbot_config.get('enable_reasoning', True)
         self.vector_store_path = config.get('paths', {}).get('vector_store')
         self.llm_config = config.get('llm', None)
@@ -401,6 +424,8 @@ class VikingBotRunner:
                 errors="replace",
                 env=env,
             )
+            with _BOT_PROC_LOCK:
+                _ACTIVE_BOT_PROCESSES.add(proc)
             pid = proc.pid
             try:
                 stdout, stderr = proc.communicate(timeout=600)
@@ -408,6 +433,9 @@ class VikingBotRunner:
                 proc.kill()
                 stdout, stderr = proc.communicate()
                 raise subprocess.TimeoutExpired(cmd, 600)
+            finally:
+                with _BOT_PROC_LOCK:
+                    _ACTIVE_BOT_PROCESSES.discard(proc)
             if proc.returncode != 0:
                 raise subprocess.CalledProcessError(proc.returncode, cmd, stdout, stderr)
 

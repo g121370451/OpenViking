@@ -452,12 +452,13 @@ class VikingClient:
             exclude_uri=exclude_uri,
         )
 
-    async def relations(self, uri: str, query: str = "", strategy: str = "blind") -> list[dict[str, Any]]:
+    async def relations(self, uri: str, query: str = "", strategy: str = "llm_review") -> list[dict[str, Any]]:
         """查询 uri 的关联文档，通过磁盘 JSONL 直接读取 + 双路匹配"""
         parent_dir = self._uri_to_parent_path(uri)
         relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
         jsonl_path = os.path.join(parent_dir, relations_filename)
         if not os.path.exists(jsonl_path):
+            logger.error(f"[Relations] No relations file for {uri}: {jsonl_path}")
             return []
 
         ref_store = ReferenceStore(parent_dir)
@@ -474,6 +475,7 @@ class VikingClient:
 
         results = []
         seen = set()
+        total_records = 0
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -484,6 +486,7 @@ class VikingClient:
                 except json.JSONDecodeError:
                     continue
 
+                total_records += 1
                 uri1, uri2 = rec.get("uri1", ""), rec.get("uri2", "")
                 if uri1 == uri2 or (uri1 != uri and uri2 != uri):
                     continue
@@ -521,11 +524,15 @@ class VikingClient:
                     results.append({"uri": target, "reason": rec.get("reason", rec_query), "weight": rec_weight})
 
         results.sort(key=lambda x: x.get("weight", 1.0), reverse=True)
+        logger.error(
+            f"[Relations] uri={uri} | file={jsonl_path} | "
+            f"records={total_records}, matched={len(results)} | strategy={strategy}"
+        )
         return results
 
     async def link(
         self, from_uri: str, to_uris: Any, reason: str = "", query: str = "",
-        strategy: str = "blind", weight: float = 1.0,
+        strategy: str = "llm_review", weight: float = 1.0,
     ) -> None:
         """创建 from_uri → uris 的关联边，直接写入磁盘 JSONL"""
         if isinstance(to_uris, str):
@@ -544,7 +551,7 @@ class VikingClient:
         return local_path if os.path.isdir(local_path) else os.path.dirname(local_path)
 
     def _append_relation(self, uri1: str, uri2: str, query: str, reason: str = "",
-                         strategy: str = "blind", weight: float = 1.0) -> None:
+                         strategy: str = "llm_review", weight: float = 1.0) -> None:
         parent_dir = self._uri_to_parent_path(uri1)
         os.makedirs(parent_dir, exist_ok=True)
         relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"

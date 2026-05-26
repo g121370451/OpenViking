@@ -141,10 +141,15 @@ class VikingSearchTool(OVFileTool):
             use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
             relations_found = 0
             if use_relations:
-                link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "blind")
+                link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "llm_review")
                 seen_uris = {r.get("uri", "") for r in resources_list}
+                initial_count = len(resources_list)
 
                 frontier = [r.get("uri", "") for r in resources_list if r.get("uri", "")]
+                logger.error(
+                    f"[Search] Relations expansion starting: "
+                    f"frontier={len(frontier)} URIs, strategy={link_strategy}"
+                )
 
                 while frontier:
                     rel_tasks = [client.relations(uri, query=query, strategy=link_strategy) for uri in frontier]
@@ -189,6 +194,11 @@ class VikingSearchTool(OVFileTool):
                             next_frontier.append(rel_uri)
 
                     frontier = next_frontier
+
+                logger.error(
+                    f"[Search] Relations expansion done: "
+                    f"{relations_found} related docs found, total results={len(resources_list)} (was {initial_count})"
+                )
 
             if tool_context:
                 tool_context.structured_result = resources_list

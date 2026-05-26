@@ -1,5 +1,6 @@
 import json
 import re
+import time
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -19,7 +20,10 @@ def llm_grader(
     {
         "score": int,          # LoCoMo: 0 or 4; Qasper/Generic: 0~4
         "reasoning": str,      # grading explanation or fallback parse info
-        "prompt_type": str     # which prompt template was used
+        "prompt_type": str,    # which prompt template was used
+        "judge_input_tokens": int,
+        "judge_output_tokens": int,
+        "judge_latency_sec": float
     }
     """
 
@@ -112,9 +116,17 @@ Respond ONLY with a JSON object: {{"score": 0 to 4, "reasoning": "string"}}
     # -------------------------
     # 2) Unified invoke + parse
     # -------------------------
+    judge_input_tokens = 0
+    judge_output_tokens = 0
+    t_start = time.time()
+
     try:
         resp = llm_client.invoke(messages)
         content = resp.content if resp and hasattr(resp, "content") else ""
+
+        if resp and hasattr(resp, "usage_metadata") and resp.usage_metadata:
+            judge_input_tokens = int(resp.usage_metadata.get("input_tokens", 0) or 0)
+            judge_output_tokens = int(resp.usage_metadata.get("output_tokens", 0) or 0)
 
         result = json.loads(content)
         score = int(result.get("score", 0))
@@ -144,11 +156,16 @@ Respond ONLY with a JSON object: {{"score": 0 to 4, "reasoning": "string"}}
                 score = int(match.group(1))
             else:
                 score = 0
-                
+
         score = max(0, min(4, score))
+
+    judge_latency_sec = time.time() - t_start
 
     return {
         "score": score,
         "reasoning": reasoning,
         "prompt_type": prompt_type,
+        "judge_input_tokens": judge_input_tokens,
+        "judge_output_tokens": judge_output_tokens,
+        "judge_latency_sec": judge_latency_sec,
     }

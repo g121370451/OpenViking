@@ -3,6 +3,7 @@
 """Semantic DAG executor with event-driven lazy dispatch."""
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
 
@@ -34,6 +35,7 @@ class DirNode:
     pending: int
     dispatched: bool = False
     overview_scheduled: bool = False
+    done_count: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -164,6 +166,13 @@ class SemanticDagExecutor:
             await self._release_lifecycle_lock()
             raise
 
+        stats = self.get_stats()
+        logger.info(
+            f"[Semantic] DAG complete for {root_uri}: "
+            f"{stats.done_nodes} nodes processed, "
+            f"{self._vectorize_task_count} vectorize tasks queued"
+        )
+
         original_on_complete = self._create_on_complete_callback()
 
         # Wrap on_complete to release lifecycle lock after all processing
@@ -254,6 +263,11 @@ class SemanticDagExecutor:
             self._nodes[dir_uri] = node
             self._stats.total_nodes += 1
             self._stats.pending_nodes += 1
+
+            logger.info(
+                f"[Semantic] Dispatching: {dir_uri} "
+                f"({len(file_paths)} files, {len(children_dirs)} subdirs)"
+            )
 
             if pending == 0:
                 self._schedule_overview(dir_uri)
@@ -432,6 +446,9 @@ class SemanticDagExecutor:
         """Generate file summary and notify parent completion."""
 
         file_name = file_path.split("/")[-1]
+        node = self._nodes.get(parent_uri)
+        total = len(node.file_paths) if node else 0
+        t0 = time.time()
         need_vectorize = True
         try:
             summary_dict = None
@@ -452,8 +469,26 @@ class SemanticDagExecutor:
                     file_path, llm_sem=self._llm_sem, ctx=self._ctx
                 )
         except Exception as e:
-            logger.warning(f"Failed to generate summary for {file_path}: {e}")
+            elapsed = time.time() - t0
+            if node:
+                async with node.lock:
+                    node.done_count += 1
+                    progress = node.done_count
+                logger.warning(
+                    f"[Semantic] [{progress}/{total}] {file_name} FAILED ({elapsed:.1f}s): {e}"
+                )
+            else:
+                logger.warning(f"[Semantic] {file_name} FAILED ({elapsed:.1f}s): {e}")
             summary_dict = {"name": file_name, "summary": ""}
+        else:
+            elapsed = time.time() - t0
+            if node:
+                async with node.lock:
+                    node.done_count += 1
+                    progress = node.done_count
+                logger.info(
+                    f"[Semantic] [{progress}/{total}] {file_name} done ({elapsed:.1f}s)"
+                )
         finally:
             self._stats.done_nodes += 1
             self._stats.in_progress_nodes = max(0, self._stats.in_progress_nodes - 1)
@@ -550,6 +585,7 @@ class SemanticDagExecutor:
         need_vectorize = True
         children_changed = True
         abstract = ""
+        logger.info(f"[Semantic] Generating overview for: {dir_uri}")
         try:
             overview = None
             abstract = None
@@ -599,6 +635,7 @@ class SemanticDagExecutor:
         finally:
             self._stats.done_nodes += 1
             self._stats.in_progress_nodes = max(0, self._stats.in_progress_nodes - 1)
+            logger.info(f"[Semantic] Overview done for: {dir_uri}")
 
         self._dir_change_status[dir_uri] = children_changed
 

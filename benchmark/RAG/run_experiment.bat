@@ -21,19 +21,19 @@ echo  Step: %STEP%
 echo ==========================================
 
 echo.
-echo [1/5] Non-bot baseline: %DATASET%_config.yaml
+echo [1/7] Non-bot baseline: %DATASET%_config.yaml
 echo ------------------------------------------
 python run.py --config "%CONFIG_DIR%\%DATASET%_config.yaml" --step %STEP%
 if errorlevel 1 goto :error
 
 echo.
-echo [2/5] Bot baseline: %DATASET%_bot_config.yaml
+echo [2/7] Bot baseline: %DATASET%_bot_config.yaml
 echo ------------------------------------------
 python run.py --config "%CONFIG_DIR%\%DATASET%_bot_config.yaml" --step gen+eval
 if errorlevel 1 goto :error
 
 echo.
-echo [3/5] Bot build_links_review x%BUILD_COUNT%: %DATASET%_bot_config_build_links_review.yaml
+echo [3/7] Bot build_links_review x%BUILD_COUNT%: %DATASET%_bot_config_build_links_review.yaml
 echo ------------------------------------------
 for /l %%i in (1,1,%BUILD_COUNT%) do (
     echo   ^>^> Build round %%i / %BUILD_COUNT%
@@ -42,15 +42,27 @@ for /l %%i in (1,1,%BUILD_COUNT%) do (
 )
 
 echo.
-echo [4/5] Non-bot relations_review: %DATASET%_config_relations_review.yaml
+echo [4/7] Non-bot relations_review: %DATASET%_config_relations_review.yaml
 echo ------------------------------------------
 python run.py --config "%CONFIG_DIR%\%DATASET%_config_relations_review.yaml" --step gen+eval
 if errorlevel 1 goto :error
 
 echo.
-echo [5/5] Bot relations_review: %DATASET%_bot_config_relations_review.yaml
+echo [5/7] Bot relations_review: %DATASET%_bot_config_relations_review.yaml
 echo ------------------------------------------
 python run.py --config "%CONFIG_DIR%\%DATASET%_bot_config_relations_review.yaml" --step gen+eval
+if errorlevel 1 goto :error
+
+echo.
+echo [6/7] OV fallback bot: %DATASET%_ov_fallback_bot_config.yaml
+echo ------------------------------------------
+python run.py --config "%CONFIG_DIR%\%DATASET%_ov_fallback_bot_config.yaml" --step gen+eval
+if errorlevel 1 goto :error
+
+echo.
+echo [7/7] OV fallback bot relations: %DATASET%_ov_fallback_bot_relations_config.yaml
+echo ------------------------------------------
+python run.py --config "%CONFIG_DIR%\%DATASET%_ov_fallback_bot_relations_config.yaml" --step gen+eval
 if errorlevel 1 goto :error
 
 echo.

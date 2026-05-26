@@ -24,10 +24,10 @@ if os.path.exists(ov_config_path):
     print(f"[Init] Auto-detected OpenViking config: {ov_config_path}")
 
 try:
-    from src.pipeline import BenchmarkPipeline 
-    from src.core.vector_store import VikingStoreWrapper
+    from src.pipeline import BenchmarkPipeline
+    from src.core.vector_store import VikingStoreWrapper, VikingStoreHTTPWrapper
     from src.core.vector_store_with_relations import VikingStoreWithRelations
-    from src.core.llm_client import LLMClientWrapper 
+    from src.core.llm_client import LLMClientWrapper
 except SyntaxError as e:
     print(f"\n[Fatal Error] Syntax error while importing modules: {e}")
     sys.exit(1)
@@ -57,7 +57,7 @@ def resolve_path(path_str, base_path):
         return path_str
     return os.path.normpath(os.path.join(base_path, path_str))
 
-from src.vikingbot_runner import _generate_temp_ov_conf
+from src.vikingbot_runner import _generate_temp_ov_conf, _ensure_openviking_server, _load_server_url_and_key
 
 # ==========================================
 # 3. Main Program
@@ -158,16 +158,37 @@ def main():
         llm_client = LLMClientWrapper(config=config['llm'], api_key=api_key)
 
         # 3. Vector Store
-        use_nanobot = config.get('execution', {}).get('use_nanobot', False)
-        if use_nanobot:
+        mode = config.get('execution', {}).get('mode')
+        if mode is None:
+            if config.get('execution', {}).get('use_nanobot', False):
+                mode = "nanobot"
+            elif config.get('execution', {}).get('use_vikingbot', False):
+                mode = "vikingbot"
+            else:
+                mode = "standard"
+
+        if mode == "nanobot":
             vector_store = None
             logger.info("Nanobot mode: skipping VikingStoreWrapper initialization")
+        elif mode in ("ov_fallback_bot", "ov_fallback_bot_relations"):
+            vector_store_path = config['paths']['vector_store']
+            search_limit = config['execution'].get('retrieval_topk', 10) * 3
+            fallback_conf_path = _generate_temp_ov_conf(
+                ov_config_path, vector_store_path,
+                search_limit=search_limit,
+                llm_config=config.get('llm'),
+                server_port=config.get('execution', {}).get('server_port'),
+            )
+            _ensure_openviking_server(fallback_conf_path)
+            server_url, api_key = _load_server_url_and_key(fallback_conf_path)
+            vector_store = VikingStoreHTTPWrapper(server_url=server_url, api_key=api_key)
+            logger.info(f"Fallback mode ({mode}): using HTTP wrapper at {server_url}")
         else:
             use_relations = config.get('execution', {}).get('use_relations', False)
             if use_relations:
                 relations_topk = config['execution'].get('relations_topk', 0)
                 use_query_expansion = config['execution'].get('use_query_expansion', False)
-                link_strategy = config['execution'].get('link_strategy', 'blind')
+                link_strategy = config['execution'].get('link_strategy', 'llm_review')
 
                 embedder = None
                 embedding_cfg = config.get('embedding', {})

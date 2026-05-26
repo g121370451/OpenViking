@@ -1,5 +1,9 @@
 import os
+import json
 import time
+import urllib.request
+import urllib.error
+import urllib.parse
 from typing import Dict, List
 import sys
 from pathlib import Path
@@ -146,3 +150,94 @@ class VikingStoreWrapper:
     def clear(self):
         """Clear the store"""
         self.client.rm("viking://resources", recursive=True)
+
+
+class VikingStoreHTTPWrapper:
+    """HTTP-based vector store wrapper that connects to an existing OV server.
+
+    Used in fallback modes where the OV server is already running (started by
+    vikingbot_runner) to avoid DataDirectoryLocked conflicts.
+    """
+
+    def __init__(self, server_url: str, api_key: str = ""):
+        self.server_url = server_url.rstrip("/")
+        self.api_key = api_key
+        try:
+            self.enc = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            self.enc = None
+
+    def count_tokens(self, text: str) -> int:
+        if not text or not self.enc:
+            return 0
+        return len(self.enc.encode(str(text)))
+
+    def _request(self, method: str, path: str, data: dict = None) -> dict:
+        url = f"{self.server_url}{path}"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        if data is not None:
+            body = json.dumps(data).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        else:
+            req = urllib.request.Request(url, headers=headers, method=method)
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources") -> Dict:
+        candidate_k = topk * 3
+        resp = self._request("POST", "/api/v1/search/find", {
+            "query": query,
+            "limit": candidate_k,
+            "target_uri": target_uri,
+            "telemetry": True,
+        })
+
+        retrieval_tokens = 0
+        telemetry = resp.get("telemetry")
+        if telemetry:
+            retrieval_tokens = (
+                telemetry.get("summary", {})
+                .get("tokens", {})
+                .get("embedding", {})
+                .get("total", 0)
+            )
+
+        result = resp.get("result", {})
+        candidates = (result.get("resources", []) or [])[:candidate_k]
+        l2_only = [
+            r for r in candidates
+            if r.get("level", 2) == 2
+            and not str(r.get("uri", "")).endswith(
+                ("/.abstract.md", "/.overview.md", ".abstract.md", ".overview.md")
+            )
+        ][:topk]
+
+        recall_texts = {}
+        context_blocks = []
+        retrieved_uris = []
+
+        for r in l2_only:
+            uri = r.get("uri", "")
+            content = self.read_resource(uri)
+            retrieved_uris.append(uri)
+            recall_texts[uri] = content
+            context_blocks.append(content[:8000])
+
+        return {
+            "recall_texts": recall_texts,
+            "context_blocks": context_blocks,
+            "retrieved_uris": retrieved_uris,
+            "retrieval_tokens": retrieval_tokens,
+        }
+
+    def read_resource(self, uri: str) -> str:
+        encoded_uri = urllib.parse.quote(uri, safe="")
+        resp = self._request("GET", f"/api/v1/content/read?uri={encoded_uri}")
+        return str(resp.get("result", ""))
+
+    def close(self):
+        pass
