@@ -26,7 +26,7 @@ if os.path.exists(ov_config_path):
 try:
     from src.pipeline import BenchmarkPipeline
     from src.core.vector_store import VikingStoreWrapper, VikingStoreHTTPWrapper
-    from src.core.vector_store_with_relations import VikingStoreWithRelations
+    from src.core.vector_store_with_relations import VikingStoreWithRelations, VikingStoreHTTPWithRelations
     from src.core.llm_client import LLMClientWrapper
 except SyntaxError as e:
     print(f"\n[Fatal Error] Syntax error while importing modules: {e}")
@@ -181,8 +181,30 @@ def main():
             )
             _ensure_openviking_server(fallback_conf_path)
             server_url, api_key = _load_server_url_and_key(fallback_conf_path)
-            vector_store = VikingStoreHTTPWrapper(server_url=server_url, api_key=api_key)
-            logger.info(f"Fallback mode ({mode}): using HTTP wrapper at {server_url}")
+            if mode == "ov_fallback_bot_relations":
+                embedder = None
+                embedding_cfg = config.get('embedding', {})
+                emb_api_key = embedding_cfg.get('api_key', '')
+                emb_api_key = os.path.expandvars(emb_api_key) if emb_api_key else emb_api_key
+                if emb_api_key and not emb_api_key.startswith("${"):
+                    from src.core.embedder import VolcengineEmbedder
+                    embedder = VolcengineEmbedder(
+                        api_key=emb_api_key,
+                        base_url=embedding_cfg.get('base_url', 'https://ark.cn-beijing.volces.com/api/v3'),
+                        model=embedding_cfg.get('model', 'doubao-embedding-vision-250615'),
+                    )
+                link_strategy = config.get('execution', {}).get('link_strategy', 'llm_review')
+                vector_store = VikingStoreHTTPWithRelations(
+                    server_url=server_url,
+                    api_key=api_key,
+                    store_path=vector_store_path,
+                    embedder=embedder,
+                    strategy=link_strategy,
+                )
+                logger.info(f"Fallback mode ({mode}): using HTTP wrapper with relations at {server_url}")
+            else:
+                vector_store = VikingStoreHTTPWrapper(server_url=server_url, api_key=api_key)
+                logger.info(f"Fallback mode ({mode}): using HTTP wrapper at {server_url}")
         else:
             use_relations = config.get('execution', {}).get('use_relations', False)
             if use_relations:
