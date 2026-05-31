@@ -61,6 +61,8 @@ set(LEVELDB_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(LEVELDB_INSTALL OFF CACHE BOOL "" FORCE)
 set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+# Disable tcmalloc to avoid malloc/free ABI conflicts with Python's allocator
+set(HAVE_TCMALLOC OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(../third_party/leveldb-1.23 ${CMAKE_BINARY_DIR}/leveldb_build)
 if(TARGET leveldb)
