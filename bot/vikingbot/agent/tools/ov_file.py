@@ -129,15 +129,6 @@ class VikingSearchTool(OVFileTool):
             if not resources_list:
                 return str(results)
 
-            resources_list = [
-                r for r in resources_list
-                if not r.get("uri", "").endswith(".abstract.md")
-                and not r.get("uri", "").endswith(".overview.md")
-            ]
-
-            if not resources_list:
-                return f"No results found for query: {query}"
-
             use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
             relations_found = 0
             if use_relations:
@@ -162,8 +153,6 @@ class VikingSearchTool(OVFileTool):
                         for rel in rels:
                             rel_uri = rel.get("uri", "")
                             if not rel_uri:
-                                continue
-                            if rel_uri.endswith(".abstract.md") or rel_uri.endswith(".overview.md"):
                                 continue
                             if rel_uri in seen_uris:
                                 for existing in resources_list:

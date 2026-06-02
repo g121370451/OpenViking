@@ -11,10 +11,9 @@ class LLMClientWrapper:
             api_key=api_key,
             base_url=config['base_url']
         )
-        self.retry_count = 3
+        self.retry_count = 10
 
     def generate(self, prompt: str) -> str:
-        """Call LLM to generate answer with simple exponential backoff retry"""
         last_err = None
         for attempt in range(self.retry_count):
             try:
@@ -22,8 +21,13 @@ class LLMClientWrapper:
                 return resp.content
             except Exception as e:
                 last_err = e
-                if attempt < self.retry_count - 1:
-                    time.sleep(1.5 * (attempt + 1))
+                if "429" in str(e) or "RateLimit" in str(e) or "TooManyRequests" in str(e) or "TPM" in str(e):
+                    delay = 5.0 * (2 ** min(attempt, 6))
+                    print(f"[LLM] Rate limited, retry {attempt + 1}/{self.retry_count} after {delay:.1f}s")
+                    time.sleep(delay)
+                else:
+                    if attempt < self.retry_count - 1:
+                        time.sleep(1.5 * (attempt + 1))
 
         raise RuntimeError(
             f"LLM generate failed after {self.retry_count} retries: {type(last_err).__name__}: {last_err}"

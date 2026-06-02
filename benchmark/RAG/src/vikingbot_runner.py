@@ -56,7 +56,15 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, sear
     if search_limit is not None:
         config['default_search_limit'] = search_limit
 
-    # llm_config is for judge only, do not override ov's vlm config
+    if llm_config:
+        if 'vlm' not in config or config.get('vlm') is None:
+            config['vlm'] = {}
+        if 'model' in llm_config:
+            config['vlm']['model'] = llm_config['model']
+        if 'base_url' in llm_config:
+            config['vlm']['api_base'] = llm_config['base_url']
+        if 'temperature' in llm_config:
+            config['vlm']['temperature'] = llm_config['temperature']
 
     temp_dir = Path(__file__).parent.parent / ".temp"
     temp_dir.mkdir(exist_ok=True)
@@ -254,7 +262,7 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         _CURRENT_OV_CONF_PATH = ov_conf_path
 
         retried_lock = False
-        deadline = time.time() + 20
+        deadline = time.time() + 60
         while time.time() < deadline:
             if _OPENVIKING_SERVER_PROCESS.poll() is not None:
                 exit_code = _OPENVIKING_SERVER_PROCESS.returncode

@@ -120,44 +120,55 @@ Respond ONLY with a JSON object: {{"score": 0 to 4, "reasoning": "string"}}
     judge_output_tokens = 0
     t_start = time.time()
 
-    try:
-        resp = llm_client.invoke(messages)
-        content = resp.content if resp and hasattr(resp, "content") else ""
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            resp = llm_client.invoke(messages)
+            content = resp.content if resp and hasattr(resp, "content") else ""
 
-        if resp and hasattr(resp, "usage_metadata") and resp.usage_metadata:
-            judge_input_tokens = int(resp.usage_metadata.get("input_tokens", 0) or 0)
-            judge_output_tokens = int(resp.usage_metadata.get("output_tokens", 0) or 0)
+            if resp and hasattr(resp, "usage_metadata") and resp.usage_metadata:
+                judge_input_tokens = int(resp.usage_metadata.get("input_tokens", 0) or 0)
+                judge_output_tokens = int(resp.usage_metadata.get("output_tokens", 0) or 0)
 
-        result = json.loads(content)
-        score = int(result.get("score", 0))
-        reasoning = result.get("reasoning", "No reasoning provided.")
+            result = json.loads(content)
+            score = int(result.get("score", 0))
+            reasoning = result.get("reasoning", "No reasoning provided.")
 
-        score = max(0, min(4, score))
+            score = max(0, min(4, score))
+            break
 
-    except Exception:
-        # -------------------------
-        # 3) Unified fallback parse
-        # -------------------------
-        text = (content or "").strip()
-        reasoning = (
-            f"Parse fallback from raw output: {text}"
-            if text
-            else "Parse failed or model invocation failed. Defaulted to 0."
-        )
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RateLimit" in err_str or "TooManyRequests" in err_str or "TPM" in err_str:
+                delay = 5.0 * (2 ** min(attempt, 6))
+                print(f"[Judge] Rate limited, retry {attempt + 1}/{max_retries} after {delay:.1f}s")
+                time.sleep(delay)
+                continue
 
-        # First try: JSON-like score field
-        match = re.search(r'"score"\s*:\s*([0-4])', text)
-        if match:
-            score = int(match.group(1))
-        else:
-            # Second try: any standalone integer 0~4 in text
-            match = re.search(r'\b([0-4])\b', text)
+            # -------------------------
+            # 3) Unified fallback parse
+            # -------------------------
+            text = (content or "").strip()
+            reasoning = (
+                f"Parse fallback from raw output: {text}"
+                if text
+                else "Parse failed or model invocation failed. Defaulted to 0."
+            )
+
+            # First try: JSON-like score field
+            match = re.search(r'"score"\s*:\s*([0-4])', text)
             if match:
                 score = int(match.group(1))
             else:
-                score = 0
+                # Second try: any standalone integer 0~4 in text
+                match = re.search(r'\b([0-4])\b', text)
+                if match:
+                    score = int(match.group(1))
+                else:
+                    score = 0
 
-        score = max(0, min(4, score))
+            score = max(0, min(4, score))
+            break
 
     judge_latency_sec = time.time() - t_start
 

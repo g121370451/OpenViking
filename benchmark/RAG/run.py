@@ -172,7 +172,7 @@ def main():
             logger.info("Nanobot mode: skipping VikingStoreWrapper initialization")
         elif mode in ("ov_fallback_bot", "ov_fallback_bot_relations"):
             vector_store_path = config['paths']['vector_store']
-            search_limit = config['execution'].get('retrieval_topk', 10) * 3
+            search_limit = config.get('vikingbot', {}).get('search_limit')
             fallback_conf_path = _generate_temp_ov_conf(
                 ov_config_path, vector_store_path,
                 search_limit=search_limit,
