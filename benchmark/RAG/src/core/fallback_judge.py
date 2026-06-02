@@ -22,19 +22,23 @@ class JudgeVerdict:
     reasoning: str
 
 
-def judge_answer(answer: str, refusal_patterns: List[str] = None) -> JudgeVerdict:
-    patterns = refusal_patterns or REFUSAL_PATTERNS
-    answer = answer.strip()
-
-    answer_lower = answer.lower()
-    for pattern in patterns:
+def _check_refusal_patterns(answer: str) -> JudgeVerdict:
+    answer_lower = answer.strip().lower()
+    for pattern in REFUSAL_PATTERNS:
         if pattern in answer_lower:
             return JudgeVerdict(
                 should_fallback=True,
                 reasoning=f"Refusal pattern detected: '{pattern}'",
             )
+    return JudgeVerdict(should_fallback=False, reasoning="Answer looks valid")
 
-    return JudgeVerdict(
-        should_fallback=False,
-        reasoning="Answer looks valid",
-    )
+
+def judge_answer(sufficient: bool, answer: str, reasoning: str = "") -> JudgeVerdict:
+    if not sufficient:
+        return JudgeVerdict(
+            should_fallback=True,
+            reasoning=f"LLM assessed context as insufficient: {reasoning}" if reasoning else "LLM assessed context as insufficient",
+        )
+    if not answer.strip():
+        return JudgeVerdict(should_fallback=True, reasoning="Empty answer")
+    return _check_refusal_patterns(answer)
