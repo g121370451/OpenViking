@@ -33,7 +33,20 @@ from typing import List, Dict, Any
 from .base import BaseAdapter, StandardDoc, StandardSample, StandardQA
 
 # Rule for when answer cannot be found
-MISSING_RULE = "If no information is available to answer the question, write 'Not mentioned'."
+ASSESSMENT_INSTRUCTION = """IMPORTANT: Answer strictly based on the provided context above. Do NOT use external knowledge or information not present in the context.
+
+First, assess whether the context contains sufficient information to fully and accurately answer the question. Consider:
+- Does the context directly address the question? Or is the key information missing?
+- Is the information complete? Or are important details absent?
+- Is there conflicting information from different sources?
+- Would answering require significant speculation or guessing?
+
+If the context is INSUFFICIENT (missing key facts, conflicting information, or would require guessing), set "sufficient" to false. The question will be automatically forwarded to a more powerful agent — do NOT guess or fabricate.
+
+If the context is SUFFICIENT, provide a concise and accurate answer.
+
+Respond in the following JSON format:
+{"sufficient": true/false, "answer": "<your answer>", "reasoning": "<brief explanation of why the context is sufficient or insufficient>"}"""
 
 # Specific instructions for different categories
 CATEGORY_INSTRUCTIONS = {
@@ -461,9 +474,9 @@ class SyllabusQAAdapter(BaseAdapter):
         context_text = "\n\n".join(context_blocks)
         
         if category_instruction:
-            full_prompt = f"{context_text}\n\n{category_instruction}\n\n{MISSING_RULE}\n\nQuestion: {eff_q}\n\nAnswer:"
+            full_prompt = f"{context_text}\n\n{category_instruction}\n\n{ASSESSMENT_INSTRUCTION}\n\nQuestion: {eff_q}"
         else:
-            full_prompt = f"{context_text}\n\n{MISSING_RULE}\n\nQuestion: {eff_q}\n\nAnswer:"
+            full_prompt = f"{context_text}\n\n{ASSESSMENT_INSTRUCTION}\n\nQuestion: {eff_q}"
 
         meta = {"id": qa.metadata.get("id", "")}
         return full_prompt, meta

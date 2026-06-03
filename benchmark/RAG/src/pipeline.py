@@ -2,8 +2,6 @@ import os
 import json
 import time
 import uuid
-import random
-import re
 import copy
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +18,8 @@ from core.vector_store import VikingStoreWrapper
 from core.monitor import BenchmarkMonitor
 from core.metrics import MetricsCalculator
 from core.judge_util import llm_grader
+from core.fallback_judge import judge_answer
+from core.response_parser import parse_llm_response
 from core.checkpoint import CheckpointManager
 from vikingbot_runner import run_vikingbot_query
 from nanobot_runner import run_nanobot_query
@@ -451,8 +451,6 @@ class BenchmarkPipeline:
                 avg_total_output = sum(r['fallback']['total_output_tokens'] for r in fallback_records) / fb_total
 
                 avg_ov_latency = sum(r['fallback']['ov_retrieval_sec'] for r in fallback_records) / fb_total
-                avg_judge_latency = sum(r['fallback']['judge_latency_sec'] for r in fallback_records) / fb_total
-                avg_judge_tokens = sum(r['fallback']['judge_input_tokens'] + r['fallback']['judge_output_tokens'] for r in fallback_records) / fb_total
 
                 fallback_report = {
                     "Total Queries": fb_total,
@@ -463,8 +461,6 @@ class BenchmarkPipeline:
                     "Average Total Input Tokens": avg_total_input,
                     "Average Total Output Tokens": avg_total_output,
                     "Average OV Retrieval Latency (s)": avg_ov_latency,
-                    "Average Judge Latency (s)": avg_judge_latency,
-                    "Average Judge Tokens": avg_judge_tokens,
                 }
 
                 if triggered:
@@ -763,22 +759,23 @@ class BenchmarkPipeline:
             recall = MetricsCalculator.check_recall(retrieved_texts, qa.evidence)
             
             full_prompt, meta = self.adapter.build_prompt(qa, context_blocks)
-            
-            ans_raw = self.llm.generate(full_prompt)
 
-            ans = self.adapter.post_process_answer(qa, ans_raw, meta)
+            ans_raw = self.llm.generate(full_prompt)
+            parsed = parse_llm_response(ans_raw)
+
+            ans = self.adapter.post_process_answer(qa, parsed.answer, meta)
 
             in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
             out_tokens = self.db.count_tokens(ans)
             self.monitor.worker_end(tokens=in_tokens + out_tokens)
-            
-            self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Recall: {recall:.2f} | Latency: {latency:.2f}s")
+
+            self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Recall: {recall:.2f} | Sufficient: {parsed.sufficient} | Latency: {latency:.2f}s")
 
             return {
                 "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
                 "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
                 "retrieval": {"latency_sec": latency, "uris": retrieved_uris},
-                "llm": {"final_answer": ans},
+                "llm": {"final_answer": ans, "sufficient": parsed.sufficient, "reasoning": parsed.reasoning},
                 "metrics": {"Recall": recall}, "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens}
             }
         except Exception:
@@ -795,8 +792,6 @@ class BenchmarkPipeline:
         self.monitor.worker_start()
         try:
             qa = task['qa']
-            fallback_config = self.config.get("execution", {}).get("fallback", {})
-            score_threshold = fallback_config.get("score_threshold", 2)
 
             # --- Phase 1: OV retrieval + generation ---
             t0 = time.time()
@@ -818,28 +813,17 @@ class BenchmarkPipeline:
             ans_raw = self.llm.generate(full_prompt)
             ov_generation_sec = time.time() - t1
 
-            ov_answer = self.adapter.post_process_answer(qa, ans_raw, meta)
+            parsed = parse_llm_response(ans_raw)
+            ov_answer = self.adapter.post_process_answer(qa, parsed.answer, meta)
 
             ov_in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
             ov_out_tokens = self.db.count_tokens(ov_answer)
 
-            # --- Phase 2: LLM Judge ---
-            dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
-            judge_result = llm_grader(
-                self.llm.llm,
-                self.config['llm']['model'],
-                qa.question,
-                qa.gold_answers,
-                ov_answer,
-                dataset_name=dataset_name,
-            )
-            judge_score = judge_result["score"]
-            judge_input_tokens = judge_result.get("judge_input_tokens", 0)
-            judge_output_tokens = judge_result.get("judge_output_tokens", 0)
-            judge_latency_sec = judge_result.get("judge_latency_sec", 0)
+            # --- Phase 2: Fallback Judge ---
+            verdict = judge_answer(parsed.sufficient, ov_answer, parsed.reasoning)
 
             # --- Phase 3: Fallback decision ---
-            fallback_triggered = judge_score < score_threshold
+            fallback_triggered = verdict.should_fallback
             final_answer = ov_answer
             bot_latency_sec = 0
             bot_input_tokens = 0
@@ -848,7 +832,7 @@ class BenchmarkPipeline:
 
             if fallback_triggered:
                 self.logger.info(
-                    f"[Query-{task['id']}] Fallback triggered (score={judge_score} < {score_threshold}), "
+                    f"[Query-{task['id']}] Fallback triggered ({verdict.reasoning}), "
                     f"calling bot (relations={bot_use_relations})"
                 )
                 bot_config = copy.deepcopy(self.config)
@@ -968,14 +952,14 @@ class BenchmarkPipeline:
             self.monitor.worker_end(tokens=total_input_tokens + total_output_tokens)
             self.logger.info(
                 f"[Query-{task['id']}] Fallback={'YES' if fallback_triggered else 'NO'} | "
-                f"JudgeScore={judge_score} | Total: {total_latency_sec:.1f}s"
+                f"{verdict.reasoning} | Total: {total_latency_sec:.1f}s"
             )
 
             result = {
                 "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
                 "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
                 "retrieval": {"latency_sec": total_latency_sec, "uris": retrieved_uris},
-                "llm": {"final_answer": final_answer},
+                "llm": {"final_answer": final_answer, "sufficient": parsed.sufficient, "reasoning": parsed.reasoning},
                 "metrics": {"Recall": recall},
                 "token_usage": {
                     "total_input_tokens": total_input_tokens,
@@ -988,18 +972,13 @@ class BenchmarkPipeline:
                 "fallback": {
                     "triggered": fallback_triggered,
                     "bot_use_relations": bot_use_relations,
-                    "ov_judge_score": judge_score,
-                    "ov_judge_reasoning": judge_result.get("reasoning", ""),
-                    "score_threshold": score_threshold,
+                    "judge_reasoning": verdict.reasoning,
                     "ov_answer": ov_answer,
                     "ov_retrieval_sec": ov_retrieval_sec,
                     "ov_generation_sec": ov_generation_sec,
-                    "judge_latency_sec": judge_latency_sec,
                     "bot_latency_sec": bot_latency_sec,
                     "ov_input_tokens": ov_in_tokens,
                     "ov_output_tokens": ov_out_tokens,
-                    "judge_input_tokens": judge_input_tokens,
-                    "judge_output_tokens": judge_output_tokens,
                     "bot_input_tokens": bot_input_tokens,
                     "bot_output_tokens": bot_output_tokens,
                     "total_latency_sec": total_latency_sec,
