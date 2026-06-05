@@ -28,6 +28,7 @@ QA_PROMPT = """Based on the financial document excerpts above, answer the follow
 If the answer involves a numerical value, include the unit (e.g., USD millions, %, etc.).
 
 Question: {}"""
+Question: {}"""
 
 ASSESSMENT_INSTRUCTION = EVIDENCE_BASED_ASSESSMENT_INSTRUCTION
 

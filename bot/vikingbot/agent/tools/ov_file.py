@@ -148,9 +148,6 @@ class VikingSearchTool(OVFileTool):
             if not resources_list:
                 return str(results)
 
-            if not resources_list:
-                return f"No results found for query: {query}"
-
             use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
             relations_found = 0
             if use_relations:

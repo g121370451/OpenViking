@@ -1,5 +1,6 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import asyncio
 import json
 import os
 from typing import Any
@@ -233,8 +234,20 @@ class LiteLLMProvider(LLMProvider):
                         metadata=metadata,
                     )
 
-            response = await acompletion(**kwargs)
-            llm_response = self._parse_response(response)
+            max_retries = 10
+            for attempt in range(max_retries):
+                try:
+                    response = await acompletion(**kwargs)
+                    llm_response = self._parse_response(response)
+                    break
+                except Exception as call_err:
+                    err_str = str(call_err)
+                    if "429" in err_str or "RateLimit" in err_str or "TooManyRequests" in err_str or "TPM" in err_str:
+                        delay = 5.0 * (2 ** min(attempt, 6))
+                        logger.warning(f"[LiteLLM] Rate limited, retry {attempt + 1}/{max_retries} after {delay:.1f}s")
+                        await asyncio.sleep(delay)
+                        continue
+                    raise
 
             # Update and end Langfuse observation
             if langfuse_observation:

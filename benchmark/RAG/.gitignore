@@ -11,6 +11,10 @@ ov_storage_content_only/
 ov_storage_raw/
 # Evaluation output results
 Output/
+Output_half/
+Output_double/
+Output_sl5/
+Output_sl20/
 
 # Python
 __pycache__/
