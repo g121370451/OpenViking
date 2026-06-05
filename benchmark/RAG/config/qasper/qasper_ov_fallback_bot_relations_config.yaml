@@ -1,10 +1,10 @@
 project_name: "RAG_Benchmark"
 
-dataset_name: "SyllabusQA"
+dataset_name: "Qasper"
 
 adapter:
-  module: "src.adapters.syllabusqa_adapter"
-  class_name: "SyllabusQAAdapter"
+  module: "src.adapters.qasper_adapter"
+  class_name: "QasperAdapter"
 
 execution:
   max_workers: 10
@@ -14,11 +14,10 @@ execution:
   ingest_mode: "directory"
   retrieval_instruction: ""
   mode: "ov_fallback_bot_relations"
-  fallback:
-    score_threshold: 2
+  fallback: {}
 
 vikingbot:
-  max_iterations: 50
+  max_iterations: 15
   log_tool_calls: true
   use_relations: true
   enable_linking: false

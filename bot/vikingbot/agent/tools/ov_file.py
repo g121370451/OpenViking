@@ -1,6 +1,7 @@
 """OpenViking file system tools: read, write, list, search resources."""
 
 import asyncio
+import json
 import os
 from abc import ABC
 from pathlib import Path
@@ -11,6 +12,24 @@ from loguru import logger
 
 from vikingbot.agent.tools.base import Tool, ToolContext
 from vikingbot.openviking_mount.ov_server import VikingClient
+
+
+def _parse_relation_reason(reason: Any) -> dict[str, Any] | None:
+    """Return structured relation reason only when it is valid JSON."""
+    if isinstance(reason, dict):
+        return reason
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    try:
+        parsed = json.loads(reason)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _short_text(value: Any, limit: int = 240) -> str:
+    text = str(value or "").replace("\n", " ").strip()
+    return text[:limit]
 
 
 class OVFileTool(Tool, ABC):
@@ -160,17 +179,24 @@ class VikingSearchTool(OVFileTool):
                             if rel_uri in seen_uris:
                                 for existing in resources_list:
                                     if existing.get("uri") == rel_uri and not existing.get("match_reason"):
+                                        reason_json = _parse_relation_reason(rel.get("reason", ""))
                                         existing["match_reason"] = f"relation_from: {from_uri}"
-                                        existing["relation_reason"] = rel.get("reason", "")
+                                        existing["relation_from"] = from_uri
+                                        existing["relation_question_id"] = rel.get("question_id", "")
+                                        existing["is_priority"] = True
+                                        existing["relation_reason"] = rel.get("reason", "") if reason_json else ""
+                                        if reason_json:
+                                            existing["relation_reason_json"] = reason_json
                                         relations_found += 1
                                         break
                                 continue
                             seen_uris.add(rel_uri)
+                            reason_json = _parse_relation_reason(rel.get("reason", ""))
                             try:
                                 abstract = await client.read_content(rel_uri, level="abstract")
                             except Exception:
                                 abstract = ""
-                            resources_list.append({
+                            item = {
                                 "uri": rel_uri,
                                 "context_type": "ContextType.RESOURCE",
                                 "is_leaf": False,
@@ -179,9 +205,15 @@ class VikingSearchTool(OVFileTool):
                                 "category": "",
                                 "score": 0,
                                 "match_reason": f"relation_from: {from_uri}",
-                                "relation_reason": rel.get("reason", ""),
+                                "relation_from": from_uri,
+                                "relation_question_id": rel.get("question_id", ""),
+                                "is_priority": True,
+                                "relation_reason": rel.get("reason", "") if reason_json else "",
                                 "relations": [],
-                            })
+                            }
+                            if reason_json:
+                                item["relation_reason_json"] = reason_json
+                            resources_list.append(item)
                             relations_found += 1
                             next_frontier.append(rel_uri)
 
@@ -201,42 +233,86 @@ class VikingSearchTool(OVFileTool):
                 search_results = []
                 for r in resources_list:
                     if r.get("match_reason", "").startswith("relation_from:"):
+                        r["is_priority"] = True
+                        if "relation_from" not in r:
+                            r["relation_from"] = r.get("match_reason", "").replace("relation_from:", "").strip()
+                        reason_json = _parse_relation_reason(r.get("relation_reason", ""))
+                        if reason_json:
+                            r["relation_reason_json"] = reason_json
+                        else:
+                            r["relation_reason"] = ""
+                            r.pop("relation_reason_json", None)
                         relation_results.append(r)
                     else:
                         search_results.append(r)
+                for priority_rank, r in enumerate(relation_results, 1):
+                    r["priority_rank"] = priority_rank
 
                 result_strs = []
                 idx = 1
 
-                reason_groups: dict[str, list[str]] = {}
+                reason_groups: dict[str, dict[str, Any]] = {}
                 for r in relation_results:
-                    reason = r.get("relation_reason", "")
-                    if reason and reason not in reason_groups:
-                        reason_groups[reason] = []
-                    if reason:
-                        reason_groups[reason].append(r.get("uri", ""))
+                    reason_json = r.get("relation_reason_json")
+                    if not isinstance(reason_json, dict):
+                        continue
+                    key = r.get("relation_question_id") or reason_json.get("question_id")
+                    if not key:
+                        key = json.dumps(reason_json, ensure_ascii=False, sort_keys=True)
+                    if key not in reason_groups:
+                        reason_groups[key] = {"reason": reason_json, "uris": []}
+                    reason_groups[key]["uris"].append(r.get("uri", ""))
 
                 result_strs.append("=== PRIORITY (pre-explored results) ===")
                 result_strs.append("")
-                result_strs.append("[RECORD OF PREVIOUS SESSION]")
-                result_strs.append("A previous bot session already searched and answered THIS EXACT SAME QUESTION:")
+                result_strs.append("[PRIORITY PROTOCOL]")
+                result_strs.append("The PRIORITY documents below are the complete historical useful resource list for this matched question.")
+                result_strs.append("Before using SEARCH RESULTS, read ALL PRIORITY documents in one openviking_multi_read call.")
+                result_strs.append("After reading them, answer directly if the evidence is sufficient; only continue search/grep if the PRIORITY documents are insufficient.")
+                result_strs.append("")
+                result_strs.append("[STRUCTURED HISTORY SUMMARY]")
 
-                for reason_text in reason_groups:
+                if reason_groups:
+                    for group in reason_groups.values():
+                        reason = group["reason"]
+                        result_strs.append("")
+                        result_strs.append(f"Question: {_short_text(reason.get('question'), 320)}")
+                        result_strs.append(f"Historical answer: {_short_text(reason.get('answer'), 500)}")
+                        if reason.get("sufficient") is not None:
+                            result_strs.append(f"Sufficient: {reason.get('sufficient')}")
+                        tool_path = reason.get("tool_path")
+                        if isinstance(tool_path, list) and tool_path:
+                            path_items = []
+                            for step in tool_path[:8]:
+                                if not isinstance(step, dict):
+                                    continue
+                                tool_name = step.get("tool", "")
+                                if step.get("query"):
+                                    path_items.append(f"{tool_name}({str(step.get('query'))[:60]})")
+                                elif step.get("uri"):
+                                    path_items.append(f"{tool_name}({step.get('uri')})")
+                                else:
+                                    path_items.append(str(tool_name))
+                            if path_items:
+                                result_strs.append(f"Historical path: {' -> '.join(path_items)}")
+                        evidence_summary = reason.get("evidence_summary")
+                        if evidence_summary:
+                            result_strs.append(f"Evidence summary: {_short_text(evidence_summary, 500)}")
+                else:
                     result_strs.append("")
-                    result_strs.append(reason_text)
-                    result_strs.append("")
+                    result_strs.append("No valid structured history summary is available for these priority documents.")
 
                 result_strs.append("Documents selected as useful by that session:")
                 for r in relation_results:
                     rel_uri = r.get("uri", "")
                     rel_abstract = r.get("abstract", "")[:200]
-                    result_strs.append(f"  {idx}. [{rel_uri}] {rel_abstract}")
+                    result_strs.append(f"  PRIORITY-{r.get('priority_rank', idx)}. [{rel_uri}] {rel_abstract}")
                     idx += 1
                 result_strs.append("")
                 result_strs.append("[YOUR STRATEGY]")
-                result_strs.append("(1) Batch-read ONLY the PRIORITY documents in a SINGLE openviking_multi_read call.")
+                result_strs.append("(1) Batch-read ALL PRIORITY documents above in a SINGLE openviking_multi_read call.")
                 result_strs.append("(2) Answer immediately from the content. Only read SEARCH RESULTS if PRIORITY documents are insufficient.")
-                result_strs.append("(3) The Path above shows exactly how the previous session found the answer — skip those steps.")
+                result_strs.append("(3) Use the structured history summary only as guidance; verify the answer from the documents you read.")
                 result_strs.append("")
                 result_strs.append("=== SEARCH RESULTS ===")
                 for r in search_results:

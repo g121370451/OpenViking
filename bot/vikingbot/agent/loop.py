@@ -54,8 +54,8 @@ def _extract_uris_from_args(args_raw) -> list[str]:
 
 
 def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, final_content: str) -> str:
-    """为 from→tgt 这条边构建执行路径摘要（纯字符串拼接，无 LLM）。"""
-    path_parts = []
+    """Build a structured relation reason for future relation-guided search."""
+    tool_path: list[dict[str, str]] = []
     for tool in tools_used:
         tool_name = tool.get("tool_name", "")
         if not tool.get("execute_success"):
@@ -94,10 +94,10 @@ def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, fina
         if tool_name == "openviking_search":
             args_obj = json.loads(args) if isinstance(args, str) else args
             query = args_obj.get("query", "") if isinstance(args_obj, dict) else ""
-            path_parts.append(f'search("{query[:50]}")')
+            tool_path.append({"tool": "openviking_search", "query": query})
 
         elif tool_name in ("openviking_read", "openviking_multi_read"):
-            path_parts.append(f"read({tgt_uri})")
+            tool_path.append({"tool": tool_name, "uri": tgt_uri})
 
         elif tool_name == "openviking_grep":
             args_obj = json.loads(args) if isinstance(args, str) else args
@@ -109,12 +109,20 @@ def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, fina
                         grep_hits.append(f"L{item.get('line', '?')}: {item.get('content', '')[:60]}")
             hit_str = "; ".join(grep_hits[:3])
             if hit_str:
-                path_parts.append(f'grep("{pattern[:30]}") -> {hit_str}')
+                tool_path.append({"tool": "openviking_grep", "pattern": pattern, "hits": hit_str})
             else:
-                path_parts.append(f'grep("{pattern[:30]}")')
+                tool_path.append({"tool": "openviking_grep", "pattern": pattern})
 
-    path_str = " -> ".join(path_parts) if path_parts else "direct relation"
-    return f"Q: {original_query}\nPath: {path_str}\nAnswer: {final_content}"
+    reason = {
+        "version": 1,
+        "question": original_query,
+        "answer": final_content,
+        "target_uri": tgt_uri,
+        "tool_path": tool_path,
+        "evidence_summary": final_content[:800],
+        "sufficient": True,
+    }
+    return json.dumps(reason, ensure_ascii=False)
 
 
 class AgentLoop:
@@ -482,6 +490,15 @@ class AgentLoop:
                     if display_result is None:
                         display_result = result
 
+                    relations_found = 0
+                    if tool_call.name == "openviking_search" and isinstance(display_result, list):
+                        relations_found = sum(
+                            1
+                            for item in display_result
+                            if isinstance(item, dict)
+                            and str(item.get("match_reason", "")).startswith("relation_from:")
+                        )
+
                     tool_used_dict = {
                         "tool_name": tool_call.name,
                         "args": args_obj,
@@ -493,6 +510,8 @@ class AgentLoop:
                         "input_token": tool_call.tokens,
                         "output_token": cal_str_tokens(result, text_type="mixed"),
                     }
+                    if relations_found:
+                        tool_used_dict["relations_found"] = relations_found
                     tools_used.append(tool_used_dict)
 
                 messages.append(

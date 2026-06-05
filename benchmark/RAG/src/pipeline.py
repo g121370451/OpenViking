@@ -64,6 +64,47 @@ class BenchmarkPipeline:
             return int(usage.get("completion_tokens", 0) or 0)
         return int(usage.get("llm_output_tokens", 0) or 0)
 
+    def _parse_relation_reason_json(self, reason):
+        if isinstance(reason, dict):
+            return reason
+        if not isinstance(reason, str) or not reason.strip():
+            return None
+        try:
+            parsed = json.loads(reason)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _normalize_relation_tool_calls(self, tool_calls):
+        if not isinstance(tool_calls, list):
+            return tool_calls
+        for tc in tool_calls:
+            if not isinstance(tc, dict) or tc.get('tool_name') != 'openviking_search':
+                continue
+            result_data = tc.get('result')
+            if not isinstance(result_data, list):
+                continue
+            priority_rank = 1
+            for item in result_data:
+                if not isinstance(item, dict):
+                    continue
+                mr = item.get('match_reason', '')
+                if not isinstance(mr, str) or not mr.startswith('relation_from:'):
+                    continue
+                relation_from = mr.replace('relation_from:', '').strip()
+                item['is_priority'] = True
+                item['priority_rank'] = item.get('priority_rank') or priority_rank
+                item['relation_from'] = item.get('relation_from') or relation_from
+                item['relation_question_id'] = item.get('relation_question_id') or ""
+                priority_rank += 1
+                reason_json = self._parse_relation_reason_json(item.get('relation_reason', ''))
+                if reason_json:
+                    item['relation_reason_json'] = reason_json
+                else:
+                    item['relation_reason'] = ""
+                    item.pop('relation_reason_json', None)
+        return tool_calls
+
     def _save_partial_results(self, results_map: dict):
         # Persist partial generation results so we can resume safely after interruption.
         with self._file_lock:
@@ -408,7 +449,7 @@ class BenchmarkPipeline:
                                     src = mr.replace('relation_from:', '').strip()
                                     tgt = item.get('uri', '')
                                     if src and tgt:
-                                        hit_edges.add((min(src, tgt), max(src, tgt)))
+                                        hit_edges.add((src, tgt))
                     hit_count = len(hit_edges & all_edges) if all_edges else 0
                     coverage = hit_count / total_edges_count if total_edges_count > 0 else 0.0
                     report_relations["Total Edges in Store"] = total_edges_count
@@ -585,16 +626,15 @@ class BenchmarkPipeline:
                     tc_list = json.loads(tools_used_raw)
                 except (json.JSONDecodeError, TypeError):
                     tc_list = []
+            tc_list = self._normalize_relation_tool_calls(tc_list)
             for tc in tc_list:
                 if not isinstance(tc, dict):
                     continue
                 tn = tc.get('tool_name', '')
                 if tn == 'openviking_search':
                     search_iterations += 1
-                    rf = tc.get('relations_found', 0) or 0
-                    total_relations_found += rf
-                    if rf > 0:
-                        relations_hits += 1
+                    rf = int(tc.get('relations_found', 0) or 0)
+                    result_relation_count = 0
                     result_data = tc.get('result')
                     if isinstance(result_data, list):
                         for item in result_data:
@@ -602,10 +642,16 @@ class BenchmarkPipeline:
                                 continue
                             mr = item.get('match_reason', '')
                             if mr.startswith('relation_from:'):
+                                result_relation_count += 1
                                 src = mr.replace('relation_from:', '').strip()
                                 tgt = item.get('uri', '')
                                 if src and tgt:
-                                    relation_edges_hit.append((min(src, tgt), max(src, tgt)))
+                                    relation_edges_hit.append((src, tgt))
+                    if rf <= 0:
+                        rf = result_relation_count
+                    total_relations_found += rf
+                    if rf > 0:
+                        relations_hits += 1
                 elif tn in read_tool_names:
                     read_iterations += 1
                 elif tn == 'openviking_link':
@@ -765,8 +811,8 @@ class BenchmarkPipeline:
 
             ans = self.adapter.post_process_answer(qa, parsed.answer, meta)
 
-            in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
-            out_tokens = self.db.count_tokens(ans)
+            in_tokens = self.db.count_tokens(full_prompt)
+            out_tokens = self.db.count_tokens(ans_raw)
             self.monitor.worker_end(tokens=in_tokens + out_tokens)
 
             self.logger.info(f"[Query-{task['id']}] Q: {qa.question[:30]}... | Recall: {recall:.2f} | Sufficient: {parsed.sufficient} | Latency: {latency:.2f}s")
@@ -775,7 +821,13 @@ class BenchmarkPipeline:
                 "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
                 "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
                 "retrieval": {"latency_sec": latency, "uris": retrieved_uris},
-                "llm": {"final_answer": ans, "sufficient": parsed.sufficient, "reasoning": parsed.reasoning},
+                "llm": {
+                    "final_answer": ans,
+                    "sufficient": parsed.sufficient,
+                    "reasoning": parsed.reasoning,
+                    "evidence_analysis": parsed.evidence_analysis,
+                    "missing_info": parsed.missing_info,
+                },
                 "metrics": {"Recall": recall}, "token_usage": {"total_input_tokens": in_tokens, "llm_output_tokens": out_tokens}
             }
         except Exception:
@@ -816,8 +868,8 @@ class BenchmarkPipeline:
             parsed = parse_llm_response(ans_raw)
             ov_answer = self.adapter.post_process_answer(qa, parsed.answer, meta)
 
-            ov_in_tokens = self.db.count_tokens(full_prompt) + self.db.count_tokens(qa.question)
-            ov_out_tokens = self.db.count_tokens(ov_answer)
+            ov_in_tokens = self.db.count_tokens(full_prompt)
+            ov_out_tokens = self.db.count_tokens(ans_raw)
 
             # --- Phase 2: Fallback Judge ---
             verdict = judge_answer(parsed.sufficient, ov_answer, parsed.reasoning)
@@ -863,6 +915,7 @@ class BenchmarkPipeline:
                         bot_tc_list = json.loads(bot_tools_used_raw)
                     except (json.JSONDecodeError, TypeError):
                         bot_tc_list = []
+                bot_tc_list = self._normalize_relation_tool_calls(bot_tc_list)
 
                 bot_search_iterations = 0
                 bot_read_iterations = 0
@@ -877,10 +930,8 @@ class BenchmarkPipeline:
                     tn = tc.get('tool_name', '')
                     if tn == 'openviking_search':
                         bot_search_iterations += 1
-                        rf = tc.get('relations_found', 0) or 0
-                        bot_total_relations_found += rf
-                        if rf > 0:
-                            bot_relations_hits += 1
+                        rf = int(tc.get('relations_found', 0) or 0)
+                        result_relation_count = 0
                         result_data = tc.get('result')
                         if isinstance(result_data, list):
                             for item in result_data:
@@ -888,10 +939,16 @@ class BenchmarkPipeline:
                                     continue
                                 mr = item.get('match_reason', '')
                                 if mr.startswith('relation_from:'):
+                                    result_relation_count += 1
                                     src = mr.replace('relation_from:', '').strip()
                                     tgt = item.get('uri', '')
                                     if src and tgt:
-                                        bot_relation_edges_hit.append((min(src, tgt), max(src, tgt)))
+                                        bot_relation_edges_hit.append((src, tgt))
+                        if rf <= 0:
+                            rf = result_relation_count
+                        bot_total_relations_found += rf
+                        if rf > 0:
+                            bot_relations_hits += 1
                     elif tn in read_tool_names:
                         bot_read_iterations += 1
                     elif tn == 'openviking_link':
@@ -959,7 +1016,13 @@ class BenchmarkPipeline:
                 "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
                 "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
                 "retrieval": {"latency_sec": total_latency_sec, "uris": retrieved_uris},
-                "llm": {"final_answer": final_answer, "sufficient": parsed.sufficient, "reasoning": parsed.reasoning},
+                "llm": {
+                    "final_answer": final_answer,
+                    "sufficient": parsed.sufficient,
+                    "reasoning": parsed.reasoning,
+                    "evidence_analysis": parsed.evidence_analysis,
+                    "missing_info": parsed.missing_info,
+                },
                 "metrics": {"Recall": recall},
                 "token_usage": {
                     "total_input_tokens": total_input_tokens,
@@ -1098,8 +1161,8 @@ class BenchmarkPipeline:
                                 rec = json.loads(line)
                                 uri1 = rec.get("uri1", "")
                                 uri2 = rec.get("uri2", "")
-                                if uri1 and uri2:
-                                    all_edges.add((min(uri1, uri2), max(uri1, uri2)))
+                                if uri1 and uri2 and uri1 != uri2:
+                                    all_edges.add((uri1, uri2))
                             except json.JSONDecodeError:
                                 continue
                 except Exception:

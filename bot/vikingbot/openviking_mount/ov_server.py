@@ -488,9 +488,9 @@ class VikingClient:
 
                 total_records += 1
                 uri1, uri2 = rec.get("uri1", ""), rec.get("uri2", "")
-                if uri1 == uri2 or (uri1 != uri and uri2 != uri):
+                if uri1 == uri2 or uri1 != uri:
                     continue
-                target = uri2 if uri1 == uri else uri1
+                target = uri2
                 if target in seen:
                     continue
 
@@ -502,11 +502,21 @@ class VikingClient:
 
                 if question_id == "":
                     seen.add(target)
-                    results.append({"uri": target, "reason": rec.get("reason", rec_query), "weight": rec_weight})
+                    results.append({
+                        "uri": target,
+                        "reason": rec.get("reason", rec_query),
+                        "weight": rec_weight,
+                        "question_id": question_id,
+                    })
                     continue
                 if not query:
                     seen.add(target)
-                    results.append({"uri": target, "reason": rec_query, "weight": rec_weight})
+                    results.append({
+                        "uri": target,
+                        "reason": rec_query,
+                        "weight": rec_weight,
+                        "question_id": question_id,
+                    })
                     continue
 
                 kw_matched = False
@@ -521,7 +531,12 @@ class VikingClient:
 
                 if kw_matched or vec_matched:
                     seen.add(target)
-                    results.append({"uri": target, "reason": rec.get("reason", rec_query), "weight": rec_weight})
+                    results.append({
+                        "uri": target,
+                        "reason": rec.get("reason", rec_query),
+                        "weight": rec_weight,
+                        "question_id": question_id,
+                    })
 
         results.sort(key=lambda x: x.get("weight", 1.0), reverse=True)
         logger.error(
