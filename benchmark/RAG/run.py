@@ -18,10 +18,7 @@ from src.core.logger import setup_logging
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = SCRIPT_DIR
 
-ov_config_path = os.path.join(SCRIPT_DIR, "ov.conf")
-if os.path.exists(ov_config_path):
-    os.environ["OPENVIKING_CONFIG_FILE"] = ov_config_path
-    print(f"[Init] Auto-detected OpenViking config: {ov_config_path}")
+# ov_config_path will be determined in main() based on --ov-conf argument
 
 try:
     from src.pipeline import BenchmarkPipeline
@@ -75,8 +72,23 @@ def main():
 
     parser.add_argument("--resume", action="store_true",
                         help="Resume from checkpoint if available")
-    
+
+    parser.add_argument("--ov-conf", type=str, default=None,
+                        help="Path to ov.conf file (default: benchmark/RAG/ov.conf)")
+
     args = parser.parse_args()
+
+    # --- A. Determine ov.conf path ---
+    if args.ov_conf:
+        ov_config_path = resolve_path(args.ov_conf, SCRIPT_DIR)
+    else:
+        ov_config_path = os.path.join(SCRIPT_DIR, "ov.conf")
+
+    if os.path.exists(ov_config_path):
+        os.environ["OPENVIKING_CONFIG_FILE"] = ov_config_path
+        print(f"[Init] Using OpenViking config: {ov_config_path}")
+    else:
+        print(f"[Warning] OpenViking config not found: {ov_config_path}")
 
     # --- B. Load and Parse Config ---
     config_path = os.path.abspath(args.config)

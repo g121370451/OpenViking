@@ -61,3 +61,6 @@ ENV/
 ovcli.conf
 *.backup
 *.backup_*
+
+# Dataset-specific ov config files (contain API keys)
+ov.*.conf
