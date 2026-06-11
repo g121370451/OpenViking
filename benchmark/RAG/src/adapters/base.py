@@ -12,19 +12,19 @@ from core.logger import get_logger
 EVIDENCE_BASED_ASSESSMENT_INSTRUCTION = """IMPORTANT: Answer strictly based on the provided context above. Do NOT use external knowledge or information not present in the context.
 
 Before answering, audit the provided context against the question. Provide a concise evidence analysis that can be checked:
-- Point 1: identify the strongest evidence found in the context and what part of the question it supports.
-- Point 2: identify any additional evidence, constraints, dates, entities, numbers, or multi-hop links needed for the answer.
-- Point 3: state whether any key information is missing or conflicting.
+- Point 1: Quote the exact sentence(s) from the context that directly answer the question, focusing on content that matches the question's key terms.
+- Point 2: Identify any additional evidence, constraints, dates, entities, numbers, or multi-hop links needed for the answer.
+- Point 3: State whether any key information is missing or conflicting.
 
 If the context is INSUFFICIENT (missing key facts, conflicting information, or would require guessing), set "sufficient" to false, list the missing information, and set "answer" to "Not mentioned". Do NOT guess or fabricate.
 
-If the context is SUFFICIENT, set "sufficient" to true and provide a concise, direct final answer in the "answer" field.
+If the context is SUFFICIENT, set "sufficient" to true and provide a complete answer in the "answer" field. Include all relevant details (dates, ranges, names) rather than oversimplifying.
 
 Respond ONLY as a JSON object in the following format:
 {
   "sufficient": true/false,
   "evidence_analysis": [
-    "Point 1: ...",
+    "Point 1: [Quote] ...",
     "Point 2: ...",
     "Point 3: ..."
   ],
