@@ -341,7 +341,7 @@ def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking:
 
 
 class VikingBotRunner:
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], ov_conf_path: str = None):
         self.config = config
         self.vikingbot_config = config.get('vikingbot', {})
         self.max_iterations = self.vikingbot_config.get('max_iterations', 50)
@@ -354,6 +354,7 @@ class VikingBotRunner:
         self.vector_store_path = config.get('paths', {}).get('vector_store')
         self.llm_config = config.get('llm', None)
         self.server_port = config.get('execution', {}).get('server_port', None)
+        self.ov_conf_path = ov_conf_path or config.get('_ov_conf_path') or _OV_CONF_PATH
 
     def generate_answer(
         self,
@@ -366,10 +367,10 @@ class VikingBotRunner:
         start_time = time.time()
 
         try:
-            ov_conf_path = _OV_CONF_PATH
+            ov_conf_path = self.ov_conf_path
             temp_conf_path = None
             if self.vector_store_path:
-                temp_conf_path = _generate_temp_ov_conf(_OV_CONF_PATH, self.vector_store_path, search_limit=self.search_limit, llm_config=self.llm_config, server_port=self.server_port)
+                temp_conf_path = _generate_temp_ov_conf(self.ov_conf_path, self.vector_store_path, search_limit=self.search_limit, llm_config=self.llm_config, server_port=self.server_port)
                 ov_conf_path = temp_conf_path
                 logger.info(f"Using vector store: {self.vector_store_path}")
 
@@ -514,6 +515,7 @@ def run_vikingbot_query(
     config: Dict[str, Any],
     session_id: Optional[str] = None,
     allowed_target_uris: Optional[List[str]] = None,
+    ov_conf_path: str = None,
 ) -> Dict[str, Any]:
-    runner = VikingBotRunner(config)
+    runner = VikingBotRunner(config, ov_conf_path=ov_conf_path)
     return runner.generate_answer(question, session_id, allowed_target_uris=allowed_target_uris)

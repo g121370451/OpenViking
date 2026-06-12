@@ -104,14 +104,14 @@ def main():
     print(f"[Init] Resolving paths relative to Project Root: {PROJECT_ROOT}")
     dataset_name = config.get('dataset_name', 'UnknownDataset')
     retrieval_topk = config.get('execution', {}).get('retrieval_topk', 5)
-    
+
     format_vars = {
         'dataset_name': dataset_name,
         'retrieval_topk': retrieval_topk,
         'search_limit': config.get('vikingbot', {}).get('search_limit', ''),
         'max_iterations': config.get('vikingbot', {}).get('max_iterations', ''),
     }
-    
+
     path_keys = ['dataset_path', 'output_dir', 'vector_store', 'log_file', 'doc_output_dir']
     for key in path_keys:
         if key in config.get('paths', {}):
@@ -120,6 +120,9 @@ def main():
             resolved = resolve_path(rendered_path, PROJECT_ROOT)
             config['paths'][key] = resolved
             # print(f"  - {key}: {resolved}")
+
+    # Store ov_config_path in config for vikingbot_runner to use
+    config['_ov_conf_path'] = ov_config_path
 
     # --- D. Initialize Components ---
     try:
