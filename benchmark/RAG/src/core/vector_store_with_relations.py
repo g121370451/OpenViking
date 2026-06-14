@@ -151,9 +151,10 @@ class VikingStoreWithRelations(VikingStoreWrapper):
 
                 uri1 = rec.get("uri1", "")
                 uri2 = rec.get("uri2", "")
-                if uri1 == uri2 or (uri1 != uri and uri2 != uri):
+                # 单向边：只有当 uri == uri1 时，uri2 才是有用的目标
+                if uri1 != uri or uri1 == uri2:
                     continue
-                target = uri2 if uri1 == uri else uri1
+                target = uri2
                 if target in seen:
                     continue
 
@@ -377,9 +378,10 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
 
                 uri1 = rec.get("uri1", "")
                 uri2 = rec.get("uri2", "")
-                if uri1 == uri2 or (uri1 != uri and uri2 != uri):
+                # 单向边：只有当 uri == uri1 时，uri2 才是有用的目标
+                if uri1 != uri or uri1 == uri2:
                     continue
-                target = uri2 if uri1 == uri else uri1
+                target = uri2
                 if target in seen:
                     continue
 

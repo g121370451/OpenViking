@@ -856,6 +856,20 @@ class BenchmarkPipeline:
             context_blocks = search_res["context_blocks"]
             retrieved_uris = search_res["retrieved_uris"]
 
+            # Extract Phase 1 relations info
+            ov_relations_uris = search_res.get("relations_uris", [])
+            ov_relations_found = search_res.get("relations_found", 0)
+            ov_relations_added = search_res.get("relations_added", 0)
+
+            # Calculate token counts for original docs vs relations docs
+            # context_blocks = relations_blocks + original_blocks (see vector_store_with_relations.py)
+            num_relations_blocks = len(ov_relations_uris)
+            relations_blocks = context_blocks[:num_relations_blocks] if num_relations_blocks > 0 else []
+            original_blocks = context_blocks[num_relations_blocks:] if num_relations_blocks > 0 else context_blocks
+
+            ov_original_doc_tokens = sum(self.db.count_tokens(block) for block in original_blocks)
+            ov_relations_doc_tokens = sum(self.db.count_tokens(block) for block in relations_blocks)
+
             retrieved_texts = list(recall_texts.values())
             recall = MetricsCalculator.check_recall(retrieved_texts, qa.evidence)
 
@@ -1047,6 +1061,12 @@ class BenchmarkPipeline:
                     "total_latency_sec": total_latency_sec,
                     "total_input_tokens": total_input_tokens,
                     "total_output_tokens": total_output_tokens,
+                    # Phase 1 relations info
+                    "ov_relations_found": ov_relations_found,
+                    "ov_relations_added": ov_relations_added,
+                    "ov_relations_uris": ov_relations_uris,
+                    "ov_original_doc_tokens": ov_original_doc_tokens,
+                    "ov_relations_doc_tokens": ov_relations_doc_tokens,
                 },
             }
             if bot_detail:
