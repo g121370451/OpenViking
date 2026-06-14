@@ -81,7 +81,7 @@ class VersionRAGAdapter(BaseAdapter):
                     self._pdf_to_markdown(raw_path, md_path)
                 docs.append(StandardDoc(sample_id=name, doc_path=md_path))
 
-        self.logger.info(f"[VersionRAG] Prepared {len(docs)} documents for ingestion ({len([d for d in docs if d.doc_paths[0].endswith('.md')])} md)")
+        self.logger.info(f"[VersionRAG] Prepared {len(docs)} documents for ingestion ({len([d for d in docs if d.doc_path[0].endswith('.md')])} md)")
         return docs
 
     def _pdf_to_markdown(self, pdf_path: str, md_path: str):
