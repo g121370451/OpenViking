@@ -1,0 +1,45 @@
+project_name: "RAG_Benchmark"
+
+# ===========Modify Configuration================
+dataset_name: "VersionRAG"
+
+adapter:
+  module: "src.adapters.versionrag_adapter"
+  class_name: "VersionRAGAdapter"
+
+execution:
+  max_workers: 10
+  ingest_workers: 8
+  retrieval_topk: 1
+  max_queries: null
+  ingest_mode: "directory"
+  retrieval_instruction: ""
+  use_vikingbot: true
+  link_strategy: "llm_review"
+# ==================================
+
+# ===========VikingBot Configuration============
+vikingbot:
+  max_iterations: 15
+  log_tool_calls: true
+  use_relations: true
+  enable_linking: true
+
+embedding:
+  api_key: "${VOLCENGINE_API_KEY}"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  model: "doubao-embedding-vision-250615"
+
+paths:
+  dataset_path: "datasets/{dataset_name}/data/test/evaluation_set.csv"
+  doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
+  output_dir: "Output/{dataset_name}/experiment_test_bot_build_links_top_{retrieval_topk}"
+  log_file: "Output/{dataset_name}/experiment_test_bot_build_links_top_{retrieval_topk}/benchmark.log"
+
+
+llm:
+  model: "doubao-seed-1-8-251228"
+  temperature: 0
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
