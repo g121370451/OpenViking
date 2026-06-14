@@ -71,7 +71,7 @@ class VersionRAGAdapter(BaseAdapter):
                 # 直接复制 Markdown 文件
                 dst_path = os.path.join(doc_dir, filename)
                 shutil.copy2(raw_path, dst_path)
-                docs.append(StandardDoc(sample_id=name, doc_paths=dst_path))
+                docs.append(StandardDoc(sample_id=name, doc_path=dst_path))
 
             elif ext_lower == ".pdf":
                 # PDF -> Markdown 转换
@@ -79,7 +79,7 @@ class VersionRAGAdapter(BaseAdapter):
                 md_path = os.path.join(doc_dir, md_filename)
                 if not os.path.exists(md_path):
                     self._pdf_to_markdown(raw_path, md_path)
-                docs.append(StandardDoc(sample_id=name, doc_paths=md_path))
+                docs.append(StandardDoc(sample_id=name, doc_path=md_path))
 
         self.logger.info(f"[VersionRAG] Prepared {len(docs)} documents for ingestion ({len([d for d in docs if d.doc_paths[0].endswith('.md')])} md)")
         return docs
