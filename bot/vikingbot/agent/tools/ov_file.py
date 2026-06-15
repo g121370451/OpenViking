@@ -133,7 +133,13 @@ class VikingSearchTool(OVFileTool):
         try:
             client = await self._get_client(tool_context)
             search_client = getattr(client, 'admin_user_client', client)
-            results = await search_client.search(query, target_uri=target_uri)
+            # Get default limit from config, then request 3x to ensure enough L2 results after filtering
+            try:
+                from openviking_cli.utils.config import get_openviking_config
+                default_limit = get_openviking_config().default_search_limit
+            except Exception:
+                default_limit = 10
+            results = await search_client.search(query, target_uri=target_uri, limit=default_limit * 3)
 
             if not results:
                 return f"No results found for query: {query}"
@@ -147,6 +153,19 @@ class VikingSearchTool(OVFileTool):
 
             if not resources_list:
                 return str(results)
+
+            # Filter out L0 (abstract) and L1 (overview) documents - only keep L2 content
+            resources_list = [
+                r for r in resources_list
+                if not r.get("uri", "").endswith(".abstract.md")
+                and not r.get("uri", "").endswith(".overview.md")
+            ]
+
+            if not resources_list:
+                return f"No L2 content results found for query: {query}"
+
+            # Keep only top `default_limit` results by score
+            resources_list = sorted(resources_list, key=lambda r: r.get("score", 0), reverse=True)[:default_limit]
 
             use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
             relations_found = 0
@@ -172,6 +191,9 @@ class VikingSearchTool(OVFileTool):
                         for rel in rels:
                             rel_uri = rel.get("uri", "")
                             if not rel_uri:
+                                continue
+                            # Skip L0 (abstract) and L1 (overview) documents
+                            if rel_uri.endswith(".abstract.md") or rel_uri.endswith(".overview.md"):
                                 continue
                             if rel_uri in seen_uris:
                                 for existing in resources_list:

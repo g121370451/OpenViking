@@ -249,6 +249,9 @@ class VikingStoreWithRelations(VikingStoreWrapper):
                 try:
                     rels = self._query_relations(uri, query)
                     for r in rels:
+                        # Skip L0 (abstract) and L1 (overview) documents
+                        if r.endswith(".abstract.md") or r.endswith(".overview.md"):
+                            continue
                         if r not in seen_uris and r not in related_uris_set:
                             related_uris.append((r, uri))
                             related_uris_set.add(r)
@@ -450,6 +453,9 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
                 try:
                     rels = self._query_relations(uri, query)
                     for r in rels:
+                        # Skip L0 (abstract) and L1 (overview) documents
+                        if r.endswith(".abstract.md") or r.endswith(".overview.md"):
+                            continue
                         if r not in seen_uris and r not in related_uris_set:
                             related_uris.append((r, uri))
                             related_uris_set.add(r)

@@ -106,13 +106,24 @@ class VikingStoreWrapper:
               - retrieved_uris: [uri, ...]
               - retrieval_tokens: int
         """
-        search_res = self.client.find(query=query, limit=topk, target_uri=target_uri, telemetry=True)
+        # Request 3x documents to ensure enough L2 results after filtering L0/L1
+        search_res = self.client.find(query=query, limit=topk * 3, target_uri=target_uri, telemetry=True)
 
         retrieval_tokens = 0
         if hasattr(search_res, 'telemetry') and search_res.telemetry:
             retrieval_tokens = search_res.telemetry.get('summary', {}).get('tokens', {}).get('embedding', {}).get('total', 0)
 
         resources = getattr(search_res, 'resources', []) or []
+
+        # Filter out L0 (abstract) and L1 (overview) documents
+        resources = [
+            r for r in resources
+            if not r.uri.endswith(".abstract.md")
+            and not r.uri.endswith(".overview.md")
+        ]
+
+        # Sort by score (descending) and keep only top `topk` results
+        resources = sorted(resources, key=lambda r: getattr(r, 'score', 0), reverse=True)[:topk]
 
         recall_texts = {}
         context_blocks = []
@@ -180,9 +191,10 @@ class VikingStoreHTTPWrapper:
             return json.loads(resp.read().decode("utf-8"))
 
     def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources") -> Dict:
+        # Request 3x documents to ensure enough L2 results after filtering L0/L1
         resp = self._request("POST", "/api/v1/search/find", {
             "query": query,
-            "limit": topk,
+            "limit": topk * 3,
             "target_uri": target_uri,
             "telemetry": True,
         })
@@ -199,6 +211,16 @@ class VikingStoreHTTPWrapper:
 
         result = resp.get("result", {})
         resources = result.get("resources", []) or []
+
+        # Filter out L0 (abstract) and L1 (overview) documents
+        resources = [
+            r for r in resources
+            if not r.get("uri", "").endswith(".abstract.md")
+            and not r.get("uri", "").endswith(".overview.md")
+        ]
+
+        # Sort by score (descending) and keep only top `topk` results
+        resources = sorted(resources, key=lambda r: r.get("score", 0), reverse=True)[:topk]
 
         recall_texts = {}
         context_blocks = []
