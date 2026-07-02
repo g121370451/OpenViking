@@ -60,10 +60,13 @@ paths:
 # Large language model configuration for answer generation and evaluation
 llm:
   # Model name
-  model: "doubao-seed-2-0-pro-260215"
+  model: "doubao-seed-1-8-251228"
   # Generation temperature (0 means deterministic output, higher values mean more randomness)
   temperature: 0
   # API base URL
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   # API key (keep this secure, do not commit to code repositories)
   api_key: "${VOLCENGINE_API_KEY}"
+question_rewrites:
+  enabled: true
+  cache_root: "rewrites"

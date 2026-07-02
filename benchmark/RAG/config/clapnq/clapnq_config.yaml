@@ -31,4 +31,6 @@ llm:
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   api_key: "${VOLCENGINE_API_KEY}"
-
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"

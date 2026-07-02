@@ -304,7 +304,17 @@ def _ensure_openviking_server(ov_conf_path: str) -> None:
         raise RuntimeError("openviking-server did not become healthy in time")
 
 
-def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking: bool = False, use_relations: bool = False, embedding_config: dict = None, link_strategy: str = "llm_review", enable_reasoning: bool = True) -> dict[str, str]:
+def _build_vikingbot_env(
+    ov_conf_path: str,
+    max_iterations: int,
+    enable_linking: bool = False,
+    use_relations: bool = False,
+    embedding_config: dict = None,
+    link_strategy: str = "llm_review",
+    enable_reasoning: bool = True,
+    relations_topk: int = 0,
+    relations_similarity_threshold: float | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
@@ -314,6 +324,9 @@ def _build_vikingbot_env(ov_conf_path: str, max_iterations: int, enable_linking:
     env["VIKINGBOT_ENABLE_LINKING"] = "1" if enable_linking else "0"
     env["VIKINGBOT_ENABLE_REASONING"] = "1" if enable_reasoning else "0"
     env["VIKINGBOT_LINK_STRATEGY"] = link_strategy
+    env["VIKINGBOT_RELATIONS_TOPK"] = str(int(relations_topk or 0))
+    if relations_similarity_threshold is not None:
+        env["VIKINGBOT_RELATIONS_SIMILARITY_THRESHOLD"] = str(relations_similarity_threshold)
     if embedding_config:
         raw_key = embedding_config.get("api_key", "")
         resolved_key = os.path.expandvars(raw_key) if raw_key else ""
@@ -351,6 +364,14 @@ class VikingBotRunner:
         self.enable_linking = self.vikingbot_config.get('enable_linking', False)
         self.link_strategy = self.vikingbot_config.get('link_strategy', 'llm_review')
         self.enable_reasoning = self.vikingbot_config.get('enable_reasoning', True)
+        self.relations_topk = self.vikingbot_config.get(
+            'relations_topk',
+            config.get('execution', {}).get('relations_topk', 0),
+        )
+        self.relations_similarity_threshold = self.vikingbot_config.get(
+            'relations_similarity_threshold',
+            config.get('execution', {}).get('relations_similarity_threshold'),
+        )
         self.vector_store_path = config.get('paths', {}).get('vector_store')
         self.llm_config = config.get('llm', None)
         self.server_port = config.get('execution', {}).get('server_port', None)
@@ -402,6 +423,8 @@ class VikingBotRunner:
                 embedding_config=self.config.get('embedding'),
                 link_strategy=self.link_strategy,
                 enable_reasoning=self.enable_reasoning,
+                relations_topk=self.relations_topk,
+                relations_similarity_threshold=self.relations_similarity_threshold,
             )
 
             # Write bot JSON output to a temp file (avoids stdout escape issues)

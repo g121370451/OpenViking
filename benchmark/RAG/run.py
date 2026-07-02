@@ -197,6 +197,8 @@ def main():
             _ensure_openviking_server(fallback_conf_path)
             server_url, api_key = _load_server_url_and_key(fallback_conf_path)
             if mode == "ov_fallback_bot_relations":
+                relations_topk = config.get('execution', {}).get('relations_topk', 0)
+                relations_similarity_threshold = config.get('execution', {}).get('relations_similarity_threshold')
                 embedder = None
                 embedding_cfg = config.get('embedding', {})
                 emb_api_key = embedding_cfg.get('api_key', '')
@@ -215,8 +217,14 @@ def main():
                     store_path=vector_store_path,
                     embedder=embedder,
                     strategy=link_strategy,
+                    relations_topk=relations_topk,
+                    similarity_threshold=relations_similarity_threshold,
                 )
-                logger.info(f"Fallback mode ({mode}): using HTTP wrapper with relations at {server_url}")
+                logger.info(
+                    f"Fallback mode ({mode}): using HTTP wrapper with relations at {server_url} "
+                    f"(relations_topk={relations_topk}, "
+                    f"relations_similarity_threshold={relations_similarity_threshold})"
+                )
             else:
                 vector_store = VikingStoreHTTPWrapper(server_url=server_url, api_key=api_key)
                 logger.info(f"Fallback mode ({mode}): using HTTP wrapper at {server_url}")
@@ -224,6 +232,7 @@ def main():
             use_relations = config.get('execution', {}).get('use_relations', False)
             if use_relations:
                 relations_topk = config['execution'].get('relations_topk', 0)
+                relations_similarity_threshold = config['execution'].get('relations_similarity_threshold')
                 use_query_expansion = config['execution'].get('use_query_expansion', False)
                 link_strategy = config['execution'].get('link_strategy', 'llm_review')
 
@@ -249,8 +258,14 @@ def main():
                     llm=llm_client if use_query_expansion else None,
                     embedder=embedder,
                     strategy=link_strategy,
+                    similarity_threshold=relations_similarity_threshold,
                 )
-                logger.info(f"Using VikingStoreWithRelations (relations_topk={relations_topk}, query_expansion={use_query_expansion}, link_strategy={link_strategy})")
+                logger.info(
+                    f"Using VikingStoreWithRelations "
+                    f"(relations_topk={relations_topk}, "
+                    f"relations_similarity_threshold={relations_similarity_threshold}, "
+                    f"query_expansion={use_query_expansion}, link_strategy={link_strategy})"
+                )
             else:
                 vector_store = VikingStoreWrapper(store_path=config['paths']['vector_store'])
 

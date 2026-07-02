@@ -9,20 +9,18 @@ adapter:
 execution:
   max_workers: 10
   ingest_workers: 8
-  retrieval_topk: 10
+  retrieval_topk: 5
   max_queries: null
   ingest_mode: "directory"
   retrieval_instruction: ""
   mode: "ov_fallback_bot"
-  fallback:
-    score_threshold: 2
+  fallback: {}
 
 vikingbot:
-  max_iterations: 50
+  max_iterations: 15
   log_tool_calls: true
   use_relations: false
   enable_linking: false
-
 paths:
   dataset_path: "datasets/{dataset_name}"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
@@ -35,3 +33,6 @@ llm:
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   api_key: "${VOLCENGINE_API_KEY}"
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"

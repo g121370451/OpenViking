@@ -7,36 +7,7 @@ from core.vector_store import VikingStoreWrapper, VikingStoreHTTPWrapper
 
 # --- Relation matching utilities ---
 
-_ENGLISH_STOPWORDS = frozenset({
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
-    "of", "with", "by", "from", "is", "it", "as", "be", "was", "were",
-    "been", "are", "am", "do", "did", "does", "has", "had", "have", "will",
-    "would", "could", "should", "may", "might", "shall", "can", "not", "no",
-    "nor", "so", "if", "then", "than", "that", "this", "these", "those",
-    "what", "which", "who", "whom", "how", "when", "where", "why",
-    "all", "each", "every", "both", "few", "more", "most", "other", "some",
-    "such", "only", "own", "same", "too", "very", "just", "about", "above",
-    "after", "again", "also", "any", "because", "before", "below", "between",
-    "during", "into", "its", "out", "over", "through", "under", "until",
-    "up", "down", "here", "there", "once", "further", "her", "his", "she",
-    "he", "him", "his", "her", "hers", "its", "they", "them", "their",
-    "theirs", "our", "ours", "your", "yours", "we", "you", "me", "my",
-    "myself", "yourself", "himself", "herself", "itself", "themselves",
-    "ourselves", "yourselves", "being", "having", "doing",
-})
-
-
-def _extract_keywords(text: str) -> set:
-    if not text:
-        return set()
-    tokens = text.lower().split()
-    result = set()
-    for t in tokens:
-        t = t.strip(".,;:!?\"'()[]{}—–-")
-        if len(t) <= 2 or t in _ENGLISH_STOPWORDS:
-            continue
-        result.add(t)
-    return result
+_DEFAULT_RELATION_SIMILARITY_THRESHOLD = 0.6
 
 
 def _cosine_similarity(a: list, b: list) -> float:
@@ -50,6 +21,35 @@ def _cosine_similarity(a: list, b: list) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _select_top_relation_groups(group_scores: dict[str, float], topk: int) -> dict[str, float]:
+    if topk <= 0:
+        return dict(group_scores)
+    ranked_groups = sorted(group_scores.items(), key=lambda x: (-x[1], x[0]))
+    return dict(ranked_groups[:topk])
+
+
+def _update_active_relation_groups(
+    active_group_scores: dict[str, float],
+    candidates: list[dict],
+    topk: int,
+) -> tuple[set[str] | None, set[str]]:
+    if topk <= 0:
+        return None, set()
+
+    group_scores = dict(active_group_scores)
+    for item in candidates:
+        group_key = item["group_key"]
+        similarity = item["similarity"]
+        if similarity > group_scores.get(group_key, -1.0):
+            group_scores[group_key] = similarity
+
+    selected_scores = _select_top_relation_groups(group_scores, topk)
+    active_group_scores.clear()
+    active_group_scores.update(selected_scores)
+    selected_groups = set(selected_scores)
+    return selected_groups, set(group_scores) - selected_groups
+
+
 class VikingStoreWithRelations(VikingStoreWrapper):
     """Vector store enhanced with .relations_{strategy}.jsonl edges.
 
@@ -61,9 +61,14 @@ class VikingStoreWithRelations(VikingStoreWrapper):
 
     def __init__(self, store_path: str, relations_topk: int = 0,
                  use_query_expansion: bool = False, llm=None, embedder=None,
-                 strategy: str = "llm_review"):
+                 strategy: str = "llm_review",
+                 similarity_threshold: float = _DEFAULT_RELATION_SIMILARITY_THRESHOLD):
         super().__init__(store_path)
-        self.relations_topk = relations_topk
+        self.relations_topk = int(relations_topk or 0)
+        self.relations_similarity_threshold = float(
+            similarity_threshold if similarity_threshold is not None
+            else _DEFAULT_RELATION_SIMILARITY_THRESHOLD
+        )
         self._vikingfs_path = os.path.join(store_path, "viking")
         self.use_query_expansion = use_query_expansion
         self._llm = llm
@@ -124,21 +129,19 @@ class VikingStoreWithRelations(VikingStoreWrapper):
         cache = self._load_ref_cache(parent_dir)
         return cache.get(question_id)
 
-    def _query_relations(self, uri: str, query: str) -> List[str]:
+    def _collect_relation_candidates(
+        self,
+        uri: str,
+        query: str,
+        query_embedding,
+    ) -> list[dict]:
         parent_dir = self._uri_to_parent_path(uri)
         jsonl_path = os.path.join(parent_dir, self._relations_filename)
         if not os.path.exists(jsonl_path):
             return []
 
-        query_embedding = None
-        query_keywords = set()
-        if query:
-            query_keywords = _extract_keywords(query)
-            query_embedding = self._embed_text(query)
-
         ref_cache: dict[str, dict | None] = {}
-        results = []
-        seen = set()
+        candidates: list[dict] = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -155,7 +158,7 @@ class VikingStoreWithRelations(VikingStoreWrapper):
                 if uri1 != uri or uri1 == uri2:
                     continue
                 target = uri2
-                if target in seen:
+                if target.endswith(".abstract.md") or target.endswith(".overview.md"):
                     continue
 
                 rec_weight = rec.get("weight", 1.0)
@@ -173,37 +176,101 @@ class VikingStoreWithRelations(VikingStoreWrapper):
                     rec_query = rec.get("query_question", "")
                     rec_embedding = rec.get("query_embedding")
 
-                qid = rec.get("question_id", "")
-                if qid == "" and "question_id" in rec:
-                    seen.add(target)
-                    results.append((target, rec_weight))
-                    continue
-
                 if not query:
-                    seen.add(target)
-                    results.append((target, rec_weight))
+                    group_key = rec.get("question_id", "") or rec_query or target
+                    candidates.append({
+                        "target": target,
+                        "source_uri": uri,
+                        "weight": rec_weight,
+                        "similarity": 0.0,
+                        "group_key": group_key,
+                    })
                     continue
 
-                kw_matched = False
-                if query_keywords and rec_query:
-                    rec_keywords = _extract_keywords(rec_query)
-                    if rec_keywords:
-                        overlap = len(query_keywords & rec_keywords)
-                        if overlap / len(query_keywords) > 0.7:
-                            kw_matched = True
-
-                vec_matched = False
                 if query_embedding and rec_embedding:
                     sim = _cosine_similarity(query_embedding, rec_embedding)
-                    if sim > 0.7:
-                        vec_matched = True
+                    if sim > self.relations_similarity_threshold:
+                        group_key = rec.get("question_id", "") or rec_query or target
+                        candidates.append({
+                            "target": target,
+                            "source_uri": uri,
+                            "weight": rec_weight,
+                            "similarity": sim,
+                            "group_key": group_key,
+                        })
 
-                if kw_matched or vec_matched:
-                    seen.add(target)
-                    results.append((target, rec_weight))
+        return candidates
 
-        results.sort(key=lambda x: x[1], reverse=True)
-        return [uri for uri, _ in results]
+    def _expand_relation_beam(self, seed_uris: list[str], query: str) -> list[tuple[str, str]]:
+        query_embedding = self._embed_text(query) if query else None
+        if query and not query_embedding:
+            return []
+
+        active_group_scores: dict[str, float] = {}
+        pruned_groups: set[str] = set()
+        seed_uri_set = set(seed_uris)
+        seen_uris = set(seed_uris)
+        relation_records: dict[str, dict] = {}
+        frontier = list(seed_uris)
+
+        while frontier:
+            candidates: list[dict] = []
+            for uri in frontier:
+                try:
+                    candidates.extend(self._collect_relation_candidates(uri, query, query_embedding))
+                except Exception:
+                    continue
+
+            if self.relations_topk > 0:
+                candidates = [
+                    item for item in candidates
+                    if item["group_key"] not in pruned_groups
+                ]
+                selected_groups, newly_pruned = _update_active_relation_groups(
+                    active_group_scores,
+                    candidates,
+                    self.relations_topk,
+                )
+                pruned_groups.update(newly_pruned)
+            else:
+                selected_groups = None
+
+            next_frontier = []
+            for item in sorted(candidates, key=lambda x: (-x["similarity"], x["target"])):
+                if selected_groups is not None and item["group_key"] not in selected_groups:
+                    continue
+
+                target = item["target"]
+                if target in seed_uri_set:
+                    continue
+
+                existing = relation_records.get(target)
+                if existing:
+                    existing_is_active = (
+                        selected_groups is None
+                        or existing["group_key"] in selected_groups
+                    )
+                    if existing_is_active and item["similarity"] <= existing["similarity"]:
+                        continue
+                relation_records[target] = item
+
+                if target not in seen_uris:
+                    seen_uris.add(target)
+                    next_frontier.append(target)
+
+            frontier = next_frontier
+
+        if self.relations_topk > 0:
+            active_groups = set(active_group_scores)
+            final_records = [
+                item for item in relation_records.values()
+                if item["group_key"] in active_groups
+            ]
+        else:
+            final_records = list(relation_records.values())
+
+        final_records.sort(key=lambda x: (-x["similarity"], x["target"]))
+        return [(item["target"], item["source_uri"]) for item in final_records]
 
     def _generate_search_queries(self, query: str) -> List[str]:
         if not self._llm:
@@ -236,30 +303,7 @@ class VikingStoreWithRelations(VikingStoreWrapper):
         ret = super().retrieve(vector_query, topk, target_uri)
 
         vector_uris = list(ret["retrieved_uris"])
-        vector_uris_set = set(vector_uris)
-
-        related_uris = []
-        related_uris_set = set()
-        frontier = list(vector_uris)
-        seen_uris = set(vector_uris)
-
-        while frontier:
-            next_frontier = []
-            for uri in frontier:
-                try:
-                    rels = self._query_relations(uri, query)
-                    for r in rels:
-                        # Skip L0 (abstract) and L1 (overview) documents
-                        if r.endswith(".abstract.md") or r.endswith(".overview.md"):
-                            continue
-                        if r not in seen_uris and r not in related_uris_set:
-                            related_uris.append((r, uri))
-                            related_uris_set.add(r)
-                            next_frontier.append(r)
-                except Exception:
-                    continue
-            seen_uris.update(next_frontier)
-            frontier = next_frontier
+        related_uris = self._expand_relation_beam(vector_uris, query)
 
         relations_uris = []
         relations_blocks = []
@@ -294,12 +338,18 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
     """
 
     def __init__(self, server_url: str, api_key: str = "", store_path: str = "",
-                 embedder=None, strategy: str = "llm_review"):
+                 embedder=None, strategy: str = "llm_review", relations_topk: int = 0,
+                 similarity_threshold: float = _DEFAULT_RELATION_SIMILARITY_THRESHOLD):
         super().__init__(server_url, api_key)
         self._store_path = store_path
         self._vikingfs_path = os.path.join(store_path, "viking") if store_path else ""
         self._embedder = embedder
         self._strategy = strategy
+        self.relations_topk = int(relations_topk or 0)
+        self.relations_similarity_threshold = float(
+            similarity_threshold if similarity_threshold is not None
+            else _DEFAULT_RELATION_SIMILARITY_THRESHOLD
+        )
         self._relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
         self._embed_cache: dict[str, list] = {}
         self._ref_caches: dict[str, dict[str, dict]] = {}
@@ -354,21 +404,19 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
         cache = self._load_ref_cache(parent_dir)
         return cache.get(question_id)
 
-    def _query_relations(self, uri: str, query: str) -> List[str]:
+    def _collect_relation_candidates(
+        self,
+        uri: str,
+        query: str,
+        query_embedding,
+    ) -> list[dict]:
         parent_dir = self._uri_to_parent_path(uri)
         jsonl_path = os.path.join(parent_dir, self._relations_filename)
         if not os.path.exists(jsonl_path):
             return []
 
-        query_embedding = None
-        query_keywords = set()
-        if query:
-            query_keywords = _extract_keywords(query)
-            query_embedding = self._embed_text(query)
-
         ref_cache: dict[str, dict | None] = {}
-        results = []
-        seen = set()
+        candidates: list[dict] = []
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -385,7 +433,7 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
                 if uri1 != uri or uri1 == uri2:
                     continue
                 target = uri2
-                if target in seen:
+                if target.endswith(".abstract.md") or target.endswith(".overview.md"):
                     continue
 
                 rec_weight = rec.get("weight", 1.0)
@@ -403,37 +451,101 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
                     rec_query = rec.get("query_question", "")
                     rec_embedding = rec.get("query_embedding")
 
-                qid = rec.get("question_id", "")
-                if qid == "" and "question_id" in rec:
-                    seen.add(target)
-                    results.append((target, rec_weight))
-                    continue
-
                 if not query:
-                    seen.add(target)
-                    results.append((target, rec_weight))
+                    group_key = rec.get("question_id", "") or rec_query or target
+                    candidates.append({
+                        "target": target,
+                        "source_uri": uri,
+                        "weight": rec_weight,
+                        "similarity": 0.0,
+                        "group_key": group_key,
+                    })
                     continue
 
-                kw_matched = False
-                if query_keywords and rec_query:
-                    rec_keywords = _extract_keywords(rec_query)
-                    if rec_keywords:
-                        overlap = len(query_keywords & rec_keywords)
-                        if overlap / len(query_keywords) > 0.7:
-                            kw_matched = True
-
-                vec_matched = False
                 if query_embedding and rec_embedding:
                     sim = _cosine_similarity(query_embedding, rec_embedding)
-                    if sim > 0.7:
-                        vec_matched = True
+                    if sim > self.relations_similarity_threshold:
+                        group_key = rec.get("question_id", "") or rec_query or target
+                        candidates.append({
+                            "target": target,
+                            "source_uri": uri,
+                            "weight": rec_weight,
+                            "similarity": sim,
+                            "group_key": group_key,
+                        })
 
-                if kw_matched or vec_matched:
-                    seen.add(target)
-                    results.append((target, rec_weight))
+        return candidates
 
-        results.sort(key=lambda x: x[1], reverse=True)
-        return [uri for uri, _ in results]
+    def _expand_relation_beam(self, seed_uris: list[str], query: str) -> list[tuple[str, str]]:
+        query_embedding = self._embed_text(query) if query else None
+        if query and not query_embedding:
+            return []
+
+        active_group_scores: dict[str, float] = {}
+        pruned_groups: set[str] = set()
+        seed_uri_set = set(seed_uris)
+        seen_uris = set(seed_uris)
+        relation_records: dict[str, dict] = {}
+        frontier = list(seed_uris)
+
+        while frontier:
+            candidates: list[dict] = []
+            for uri in frontier:
+                try:
+                    candidates.extend(self._collect_relation_candidates(uri, query, query_embedding))
+                except Exception:
+                    continue
+
+            if self.relations_topk > 0:
+                candidates = [
+                    item for item in candidates
+                    if item["group_key"] not in pruned_groups
+                ]
+                selected_groups, newly_pruned = _update_active_relation_groups(
+                    active_group_scores,
+                    candidates,
+                    self.relations_topk,
+                )
+                pruned_groups.update(newly_pruned)
+            else:
+                selected_groups = None
+
+            next_frontier = []
+            for item in sorted(candidates, key=lambda x: (-x["similarity"], x["target"])):
+                if selected_groups is not None and item["group_key"] not in selected_groups:
+                    continue
+
+                target = item["target"]
+                if target in seed_uri_set:
+                    continue
+
+                existing = relation_records.get(target)
+                if existing:
+                    existing_is_active = (
+                        selected_groups is None
+                        or existing["group_key"] in selected_groups
+                    )
+                    if existing_is_active and item["similarity"] <= existing["similarity"]:
+                        continue
+                relation_records[target] = item
+
+                if target not in seen_uris:
+                    seen_uris.add(target)
+                    next_frontier.append(target)
+
+            frontier = next_frontier
+
+        if self.relations_topk > 0:
+            active_groups = set(active_group_scores)
+            final_records = [
+                item for item in relation_records.values()
+                if item["group_key"] in active_groups
+            ]
+        else:
+            final_records = list(relation_records.values())
+
+        final_records.sort(key=lambda x: (-x["similarity"], x["target"]))
+        return [(item["target"], item["source_uri"]) for item in final_records]
 
     def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources"):
         ret = super().retrieve(query, topk, target_uri)
@@ -442,28 +554,7 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
             return ret
 
         vector_uris = list(ret["retrieved_uris"])
-        related_uris = []
-        related_uris_set = set()
-        frontier = list(vector_uris)
-        seen_uris = set(vector_uris)
-
-        while frontier:
-            next_frontier = []
-            for uri in frontier:
-                try:
-                    rels = self._query_relations(uri, query)
-                    for r in rels:
-                        # Skip L0 (abstract) and L1 (overview) documents
-                        if r.endswith(".abstract.md") or r.endswith(".overview.md"):
-                            continue
-                        if r not in seen_uris and r not in related_uris_set:
-                            related_uris.append((r, uri))
-                            related_uris_set.add(r)
-                            next_frontier.append(r)
-                except Exception:
-                    continue
-            seen_uris.update(next_frontier)
-            frontier = next_frontier
+        related_uris = self._expand_relation_beam(vector_uris, query)
 
         relations_uris = []
         relations_blocks = []

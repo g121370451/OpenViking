@@ -125,6 +125,30 @@ def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, fina
     return json.dumps(reason, ensure_ascii=False)
 
 
+def _collect_relation_derived_uris(tools_used: list) -> set[str]:
+    """Return URIs that were surfaced by relation-guided search."""
+    relation_uris: set[str] = set()
+    for tool in tools_used or []:
+        if not isinstance(tool, dict) or tool.get("tool_name") != "openviking_search":
+            continue
+        result = tool.get("result")
+        if not isinstance(result, list):
+            continue
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            if not (
+                item.get("is_priority")
+                or item.get("relation_from")
+                or str(item.get("match_reason", "")).startswith("relation_from:")
+            ):
+                continue
+            uri = item.get("uri", "")
+            if uri:
+                relation_uris.add(_normalize_uri(uri))
+    return relation_uris
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -558,7 +582,16 @@ class AgentLoop:
             f"original_query={bool(original_query)}"
         )
         if _enable_linking == "1" and tools_used and original_query:
+            _post_link_start = time.time()
+            relation_derived_uris = _collect_relation_derived_uris(tools_used)
+            if relation_derived_uris:
+                logger.info(
+                    f"[LLMReview] relation-derived search URIs detected: "
+                    f"{len(relation_derived_uris)}; only matching to_uris will be skipped"
+                )
+
             # Collect read_uris and uri_content
+            _collect_start = time.time()
             read_uris: set[str] = set()
             uri_content: dict[str, str] = {}
             for tool in tools_used:
@@ -617,14 +650,17 @@ class AgentLoop:
                             if u not in search_uri_meta:
                                 search_uri_meta[u] = {"abstract": "", "score": 0}
             search_uris = set(search_uri_meta.keys())
+            _collect_duration = (time.time() - _collect_start) * 1000
 
             logger.info(
-                f"[LLMReview] collected: read_uris={len(read_uris)}, search_uris={len(search_uris)}, "
+                f"[LLMReview][PROFILE] collect_ms={_collect_duration:.0f}, "
+                f"read_uris={len(read_uris)}, search_uris={len(search_uris)}, "
                 f"search_uri_meta={len(search_uri_meta)}"
             )
 
             if read_uris or search_uris:
                 # Build review prompt
+                _prompt_build_start = time.time()
                 if read_uris:
                     candidate_uris = set(read_uris)
                     uri_list_lines = []
@@ -671,13 +707,16 @@ class AgentLoop:
                     )
                     mode = "search-only"
 
+                _prompt_build_duration = (time.time() - _prompt_build_start) * 1000
                 logger.info(
-                    f"[LLMReview] candidate_uris={len(candidate_uris)}, "
-                    f"mode={mode}, search_uris={len(search_uris)}"
+                    f"[LLMReview][PROFILE] prompt_build_ms={_prompt_build_duration:.0f}, "
+                    f"candidate_uris={len(candidate_uris)}, mode={mode}, "
+                    f"search_uris={len(search_uris)}, prompt_chars={len(review_prompt)}"
                 )
 
                 try:
                     # Call LLM for review
+                    _llm_review_start = time.time()
                     review_messages = [
                         {"role": "system", "content": "You are a document relation analyst. Output only valid JSON."},
                         {"role": "user", "content": review_prompt},
@@ -688,6 +727,8 @@ class AgentLoop:
                         model=self.model,
                         session_id=session_key.safe_name(),
                     )
+                    _llm_review_duration = (time.time() - _llm_review_start) * 1000
+                    logger.info(f"[LLMReview][TIMING] LLM review call took {_llm_review_duration:.0f}ms")
 
                     if review_response.usage:
                         token_usage["prompt_tokens"] += review_response.usage.get("prompt_tokens", 0)
@@ -695,12 +736,14 @@ class AgentLoop:
                         token_usage["total_tokens"] += review_response.usage.get("total_tokens", 0)
 
                     # Parse LLM output
+                    _parse_start = time.time()
                     raw_output = review_response.content or ""
                     cleaned = re.sub(r'```(?:json)?\s*', '', raw_output).strip()
                     cleaned = re.sub(r'```\s*$', '', cleaned).strip()
 
                     json_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
                     useful_uris: list[str] = []
+                    skipped_relation_to_uris: list[str] = []
                     parse_method = "none"
 
                     logger.info(f"[LLMReview] raw_output={raw_output[:300]}")
@@ -750,24 +793,60 @@ class AgentLoop:
                             f"[LLMReview] LLM returned empty, forced fallback: {useful_uris}"
                         )
 
+                    parsed_useful_count = len(useful_uris)
+                    if useful_uris and relation_derived_uris:
+                        skipped_relation_to_uris = [
+                            u for u in useful_uris
+                            if _normalize_uri(u) in relation_derived_uris
+                        ]
+                        if skipped_relation_to_uris:
+                            useful_uris = [
+                                u for u in useful_uris
+                                if _normalize_uri(u) not in relation_derived_uris
+                            ]
+                            logger.info(
+                                f"[LLMReview] Skipped {len(skipped_relation_to_uris)} "
+                                f"relation-derived to_uri(s); remaining_to_uris={len(useful_uris)}"
+                            )
+
                     if useful_uris:
-                        logger.info(f"[LLMReview] Parsed {len(useful_uris)} useful doc(s) via {parse_method}")
+                        logger.info(
+                            f"[LLMReview] Parsed {parsed_useful_count} useful doc(s) via {parse_method}; "
+                            f"linkable_to_uris={len(useful_uris)}"
+                        )
+                    elif skipped_relation_to_uris:
+                        logger.info(
+                            f"[LLMReview] All parsed useful docs were relation-derived to_uris; "
+                            f"skipped_to_uris={len(skipped_relation_to_uris)}"
+                        )
                     else:
                         logger.warning(
                             f"[LLMReview] 0 useful docs extracted. "
                             f"candidate_uris={len(candidate_uris)}, raw_output={raw_output[:300]}"
                         )
+                    _parse_duration = (time.time() - _parse_start) * 1000
+                    logger.info(
+                        f"[LLMReview][PROFILE] parse_ms={_parse_duration:.0f}, "
+                        f"parsed_useful_uris={parsed_useful_count}, "
+                        f"linkable_to_uris={len(useful_uris)}, "
+                        f"skipped_relation_to_uris={len(skipped_relation_to_uris)}, "
+                        f"parse_method={parse_method}"
+                    )
 
                     # Create edges
                     if useful_uris:
                         from vikingbot.openviking_mount.ov_server import VikingClient
                         workspace_id = self.sandbox_manager.to_workspace_id(session_key) if self.sandbox_manager else None
+                        _client_create_start = time.time()
                         rv_client = await VikingClient.create(workspace_id)
+                        _client_create_duration = (time.time() - _client_create_start) * 1000
+                        logger.info(f"[LLMReview][TIMING] VikingClient.create took {_client_create_duration:.0f}ms")
                         try:
                             linked = 0
                             seen_pairs: set[tuple[str, str]] = set()
 
                             # Search top5 to expand from_uris
+                            _top5_search_start = time.time()
                             try:
                                 search_result = await rv_client.search(original_query)
                                 top5_resources = search_result.get("resources", [])[:5]
@@ -777,8 +856,10 @@ class AgentLoop:
                                     if uri:
                                         top5_uris.add(_normalize_uri(uri))
                                 all_search_uris = search_uris | top5_uris
+                                _top5_search_duration = (time.time() - _top5_search_start) * 1000
                                 logger.info(
-                                    f"[LLMReview] top5 search added {len(top5_uris)} URIs to from_uris "
+                                    f"[LLMReview][TIMING] top5 search took {_top5_search_duration:.0f}ms, "
+                                    f"added {len(top5_uris)} URIs to from_uris "
                                     f"(total search_uris: {len(search_uris)} -> {len(all_search_uris)})"
                                 )
                             except Exception as e:
@@ -789,8 +870,14 @@ class AgentLoop:
                             if not from_uris:
                                 from_uris = all_search_uris
 
+                            _link_start = time.time()
+                            _link_count = 0
+                            _link_ms_values: list[float] = []
+                            _edge_reason_total_ms = 0.0
                             for tgt in useful_uris:
+                                _edge_reason_start = time.time()
                                 edge_reason = _build_edge_reason(original_query, tgt, tools_used, final_content)
+                                _edge_reason_total_ms += (time.time() - _edge_reason_start) * 1000
                                 for src in from_uris:
                                     if src == tgt:
                                         continue
@@ -799,10 +886,28 @@ class AgentLoop:
                                         continue
                                     seen_pairs.add(pair)
                                     try:
+                                        _single_link_start = time.time()
                                         await rv_client.link(src, [tgt], reason=edge_reason, query=original_query, strategy="llm_review", weight=1.0)
+                                        _single_link_duration = (time.time() - _single_link_start) * 1000
+                                        _link_ms_values.append(_single_link_duration)
+                                        _link_count += 1
                                         linked += 1
+                                        if _link_count <= 3:  # 只打印前3个避免刷屏
+                                            logger.debug(f"[LLMReview][TIMING] single link #{_link_count} took {_single_link_duration:.0f}ms")
                                     except Exception as e:
                                         logger.warning(f"[LLMReview] Link failed: {e}")
+                            _link_total_duration = (time.time() - _link_start) * 1000
+                            _link_avg_ms = sum(_link_ms_values) / max(len(_link_ms_values), 1)
+                            _link_max_ms = max(_link_ms_values) if _link_ms_values else 0.0
+                            _link_min_ms = min(_link_ms_values) if _link_ms_values else 0.0
+                            _post_link_duration = (time.time() - _post_link_start) * 1000
+                            logger.info(
+                                f"[LLMReview][PROFILE] link_pairs={linked}, from_uris={len(from_uris)}, "
+                                f"to_uris={len(useful_uris)}, edge_reason_ms={_edge_reason_total_ms:.0f}, "
+                                f"link_total_ms={_link_total_duration:.0f}, "
+                                f"link_avg_ms={_link_avg_ms:.0f}, link_min_ms={_link_min_ms:.0f}, "
+                                f"link_max_ms={_link_max_ms:.0f}, post_link_total_ms={_post_link_duration:.0f}"
+                            )
 
                             iteration += 1
                             tools_used.append({
@@ -810,23 +915,81 @@ class AgentLoop:
                                 "args": {
                                     "from_uris": sorted(from_uris),
                                     "to_uris": useful_uris,
+                                    "skipped_to_uris": skipped_relation_to_uris,
                                 },
                                 "reasoning": "(precise review step)",
-                                "result": f"Created {linked} relation(s) from {len(from_uris)} from_uris to {len(useful_uris)} useful docs, parse={parse_method}",
-                                "duration": 0,
+                                "result": (
+                                    f"Created {linked} relation(s) from {len(from_uris)} from_uris "
+                                    f"to {len(useful_uris)} useful docs, "
+                                    f"skipped_relation_to_uris={len(skipped_relation_to_uris)}, "
+                                    f"parse={parse_method}"
+                                ),
+                                "duration": int(_post_link_duration),
                                 "execute_success": True,
                                 "input_token": 0,
                                 "output_token": 0,
                                 "iteration": iteration,
                                 "relations_found": linked,
+                                "skipped_relation_to_uris": skipped_relation_to_uris,
+                                "profile": {
+                                    "collect_ms": int(_collect_duration),
+                                    "prompt_build_ms": int(_prompt_build_duration),
+                                    "llm_review_ms": int(_llm_review_duration),
+                                    "parse_ms": int(_parse_duration),
+                                    "client_create_ms": int(_client_create_duration),
+                                    "top5_search_ms": int(_top5_search_duration) if "_top5_search_duration" in locals() else None,
+                                    "edge_reason_ms": int(_edge_reason_total_ms),
+                                    "link_total_ms": int(_link_total_duration),
+                                    "post_link_total_ms": int(_post_link_duration),
+                                    "skipped_relation_to_uris": len(skipped_relation_to_uris),
+                                },
                             })
                             logger.info(
                                 f"[LLMReview] post_link DONE: created {linked} edge(s), "
                                 f"from {len(from_uris)} from_uris to {len(useful_uris)} useful_docs, "
-                                f"parse={parse_method}"
+                                f"skipped_relation_to_uris={len(skipped_relation_to_uris)}, "
+                                f"parse={parse_method}, total_ms={_post_link_duration:.0f}"
                             )
                         finally:
                             await rv_client.close()
+                    elif skipped_relation_to_uris:
+                        _post_link_duration = (time.time() - _post_link_start) * 1000
+                        logger.info(
+                            f"[LLMReview] post_link SKIPPED - all selected to_uris were "
+                            f"relation-derived. skipped_to_uris={len(skipped_relation_to_uris)}, "
+                            f"total_ms={_post_link_duration:.0f}"
+                        )
+                        iteration += 1
+                        tools_used.append({
+                            "tool_name": "openviking_link",
+                            "args": {
+                                "from_uris": sorted(search_uris),
+                                "to_uris": [],
+                                "skipped_to_uris": skipped_relation_to_uris,
+                            },
+                            "reasoning": "(skipped - relation-derived to_uris)",
+                            "result": (
+                                "Skipped link creation because all useful to_uris were "
+                                "retrieved through existing relations"
+                            ),
+                            "duration": int(_post_link_duration),
+                            "execute_success": True,
+                            "input_token": 0,
+                            "output_token": 0,
+                            "iteration": iteration,
+                            "relations_found": 0,
+                            "parse_method": parse_method,
+                            "skipped_reason": "relation_derived_to_uris_only",
+                            "skipped_relation_to_uris": skipped_relation_to_uris,
+                            "profile": {
+                                "collect_ms": int(_collect_duration),
+                                "prompt_build_ms": int(_prompt_build_duration),
+                                "llm_review_ms": int(_llm_review_duration),
+                                "parse_ms": int(_parse_duration),
+                                "post_link_total_ms": int(_post_link_duration),
+                                "skipped_relation_to_uris": len(skipped_relation_to_uris),
+                            },
+                        })
                     else:
                         logger.warning(
                             f"[LLMReview] post_link SKIPPED - no useful docs parsed. "

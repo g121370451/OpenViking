@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from abc import ABC
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -11,7 +12,7 @@ import httpx
 from loguru import logger
 
 from vikingbot.agent.tools.base import Tool, ToolContext
-from vikingbot.openviking_mount.ov_server import VikingClient
+from vikingbot.openviking_mount.ov_server import VikingClient, update_active_relation_groups
 
 
 def _parse_relation_reason(reason: Any) -> dict[str, Any] | None:
@@ -131,6 +132,7 @@ class VikingSearchTool(OVFileTool):
         **kwargs: Any,
     ) -> str:
         try:
+            search_total_start = time.time()
             client = await self._get_client(tool_context)
             search_client = getattr(client, 'admin_user_client', client)
             # Get default limit from config, then request 3x to ensure enough L2 results after filtering
@@ -139,7 +141,14 @@ class VikingSearchTool(OVFileTool):
                 default_limit = get_openviking_config().default_search_limit
             except Exception:
                 default_limit = 10
+            semantic_search_start = time.time()
             results = await search_client.search(query, target_uri=target_uri, limit=default_limit * 3)
+            semantic_search_ms = (time.time() - semantic_search_start) * 1000
+            logger.info(
+                f"[Search][PROFILE] semantic_search_ms={semantic_search_ms:.0f}, "
+                f"default_limit={default_limit}, target_uri={target_uri or '<all>'}, "
+                f"query_len={len(query or '')}"
+            )
 
             if not results:
                 return f"No results found for query: {query}"
@@ -154,93 +163,255 @@ class VikingSearchTool(OVFileTool):
             if not resources_list:
                 return str(results)
 
+            raw_count = len(resources_list)
+            filter_start = time.time()
             # Filter out L0 (abstract) and L1 (overview) documents - only keep L2 content
             resources_list = [
                 r for r in resources_list
                 if not r.get("uri", "").endswith(".abstract.md")
                 and not r.get("uri", "").endswith(".overview.md")
             ]
+            l2_count = len(resources_list)
 
             if not resources_list:
                 return f"No L2 content results found for query: {query}"
 
             # Keep only top `default_limit` results by score
             resources_list = sorted(resources_list, key=lambda r: r.get("score", 0), reverse=True)[:default_limit]
+            filter_ms = (time.time() - filter_start) * 1000
 
             use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
             relations_found = 0
+            logger.info(
+                f"[Search][PROFILE] filter_ms={filter_ms:.0f}, raw_count={raw_count}, "
+                f"l2_count={l2_count}, kept={len(resources_list)}, use_relations={use_relations}"
+            )
             if use_relations:
                 link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "llm_review")
                 seen_uris = {r.get("uri", "") for r in resources_list}
+                initial_search_uris = set(seen_uris)
                 initial_count = len(resources_list)
+                try:
+                    relations_topk = max(0, int(os.environ.get("VIKINGBOT_RELATIONS_TOPK", "0")))
+                except (TypeError, ValueError):
+                    relations_topk = 0
+                active_group_scores: dict[str, float] = {}
+                pruned_relation_groups: set[str] = set()
+                relation_total_start = time.time()
+                relation_call_total_ms = 0.0
+                abstract_total_ms = 0.0
+                relation_errors = 0
+                relation_depth = 0
 
                 frontier = [r.get("uri", "") for r in resources_list if r.get("uri", "")]
-                logger.error(
+                logger.info(
                     f"[Search] Relations expansion starting: "
-                    f"frontier={len(frontier)} URIs, strategy={link_strategy}"
+                    f"frontier={len(frontier)} URIs, strategy={link_strategy}, "
+                    f"relations_topk={relations_topk}"
                 )
 
                 while frontier:
-                    rel_tasks = [client.relations(uri, query=query, strategy=link_strategy) for uri in frontier]
+                    relation_depth += 1
+                    depth_start = time.time()
+                    depth_frontier_count = len(frontier)
+                    rel_call_start = time.time()
+                    rel_tasks = [
+                        client.relations(
+                            uri,
+                            query=query,
+                            strategy=link_strategy,
+                            include_match_meta=True,
+                        )
+                        for uri in frontier
+                    ]
                     rel_results = await asyncio.gather(*rel_tasks, return_exceptions=True)
+                    rel_call_ms = (time.time() - rel_call_start) * 1000
+                    relation_call_total_ms += rel_call_ms
 
+                    depth_candidates: list[tuple[str, dict[str, Any]]] = []
                     next_frontier = []
+                    depth_records = 0
+                    depth_new_docs = 0
+                    depth_existing_hits = 0
+                    depth_skipped = 0
+                    depth_abstract_reads = 0
+                    depth_abstract_ms = 0.0
                     for from_uri, rels in zip(frontier, rel_results):
                         if isinstance(rels, Exception):
+                            relation_errors += 1
                             continue
+                        depth_records += len(rels)
                         for rel in rels:
                             rel_uri = rel.get("uri", "")
                             if not rel_uri:
+                                depth_skipped += 1
                                 continue
                             # Skip L0 (abstract) and L1 (overview) documents
                             if rel_uri.endswith(".abstract.md") or rel_uri.endswith(".overview.md"):
+                                depth_skipped += 1
                                 continue
-                            if rel_uri in seen_uris:
-                                for existing in resources_list:
-                                    if existing.get("uri") == rel_uri and not existing.get("match_reason"):
-                                        reason_json = _parse_relation_reason(rel.get("reason", ""))
-                                        existing["match_reason"] = f"relation_from: {from_uri}"
-                                        existing["relation_from"] = from_uri
-                                        existing["relation_question_id"] = rel.get("question_id", "")
-                                        existing["is_priority"] = True
-                                        existing["relation_reason"] = rel.get("reason", "") if reason_json else ""
-                                        if reason_json:
-                                            existing["relation_reason_json"] = reason_json
-                                        relations_found += 1
-                                        break
+                            group_key = rel.get("group_key") or rel.get("question_id") or rel_uri
+                            rel["group_key"] = group_key
+                            if relations_topk > 0 and group_key in pruned_relation_groups:
+                                depth_skipped += 1
                                 continue
-                            seen_uris.add(rel_uri)
-                            reason_json = _parse_relation_reason(rel.get("reason", ""))
-                            try:
-                                abstract = await client.read_content(rel_uri, level="abstract")
-                            except Exception:
-                                abstract = ""
-                            item = {
-                                "uri": rel_uri,
-                                "context_type": "ContextType.RESOURCE",
-                                "is_leaf": False,
-                                "abstract": abstract or "",
-                                "overview": None,
-                                "category": "",
-                                "score": 0,
-                                "match_reason": f"relation_from: {from_uri}",
-                                "relation_from": from_uri,
-                                "relation_question_id": rel.get("question_id", ""),
-                                "is_priority": True,
-                                "relation_reason": rel.get("reason", "") if reason_json else "",
-                                "relations": [],
-                            }
-                            if reason_json:
-                                item["relation_reason_json"] = reason_json
-                            resources_list.append(item)
-                            relations_found += 1
-                            next_frontier.append(rel_uri)
+                            depth_candidates.append((from_uri, rel))
 
+                    if relations_topk > 0:
+                        selected_groups, newly_pruned = update_active_relation_groups(
+                            active_group_scores,
+                            [rel for _, rel in depth_candidates],
+                            relations_topk,
+                        )
+                        pruned_relation_groups.update(newly_pruned)
+                    else:
+                        selected_groups = None
+
+                    for from_uri, rel in depth_candidates:
+                        rel_uri = rel.get("uri", "")
+                        group_key = rel.get("group_key") or rel.get("question_id") or rel_uri
+                        if selected_groups is not None and group_key not in selected_groups:
+                            depth_skipped += 1
+                            continue
+                        if rel_uri in seen_uris:
+                            for existing in resources_list:
+                                if existing.get("uri") != rel_uri:
+                                    continue
+                                existing_match = str(existing.get("match_reason", ""))
+                                should_update = not existing_match
+                                if (
+                                    not should_update
+                                    and selected_groups is not None
+                                    and existing_match.startswith("relation_from:")
+                                ):
+                                    existing_group = (
+                                        existing.get("relation_group_key")
+                                        or existing.get("relation_question_id")
+                                        or ""
+                                    )
+                                    try:
+                                        existing_similarity = float(existing.get("relation_similarity", 0.0) or 0.0)
+                                    except (TypeError, ValueError):
+                                        existing_similarity = 0.0
+                                    should_update = (
+                                        existing_group not in selected_groups
+                                        or float(rel.get("similarity", 0.0) or 0.0) > existing_similarity
+                                    )
+                                if should_update:
+                                    reason_json = _parse_relation_reason(rel.get("reason", ""))
+                                    existing["match_reason"] = f"relation_from: {from_uri}"
+                                    existing["relation_from"] = from_uri
+                                    existing["relation_question_id"] = rel.get("question_id", "")
+                                    existing["relation_group_key"] = group_key
+                                    existing["relation_similarity"] = rel.get("similarity", 0.0)
+                                    existing["is_priority"] = True
+                                    existing["relation_reason"] = rel.get("reason", "") if reason_json else ""
+                                    if reason_json:
+                                        existing["relation_reason_json"] = reason_json
+                                    else:
+                                        existing.pop("relation_reason_json", None)
+                                    if not existing_match:
+                                        relations_found += 1
+                                        depth_existing_hits += 1
+                                break
+                            continue
+                        seen_uris.add(rel_uri)
+                        reason_json = _parse_relation_reason(rel.get("reason", ""))
+                        abstract_start = time.time()
+                        try:
+                            abstract = await client.read_content(rel_uri, level="abstract")
+                        except Exception:
+                            abstract = ""
+                        abstract_ms = (time.time() - abstract_start) * 1000
+                        abstract_total_ms += abstract_ms
+                        depth_abstract_ms += abstract_ms
+                        depth_abstract_reads += 1
+                        item = {
+                            "uri": rel_uri,
+                            "context_type": "ContextType.RESOURCE",
+                            "is_leaf": False,
+                            "abstract": abstract or "",
+                            "overview": None,
+                            "category": "",
+                            "score": 0,
+                            "match_reason": f"relation_from: {from_uri}",
+                            "relation_from": from_uri,
+                            "relation_question_id": rel.get("question_id", ""),
+                            "relation_group_key": group_key,
+                            "relation_similarity": rel.get("similarity", 0.0),
+                            "is_priority": True,
+                            "relation_reason": rel.get("reason", "") if reason_json else "",
+                            "relations": [],
+                        }
+                        if reason_json:
+                            item["relation_reason_json"] = reason_json
+                        resources_list.append(item)
+                        relations_found += 1
+                        depth_new_docs += 1
+                        next_frontier.append(rel_uri)
+
+                    depth_ms = (time.time() - depth_start) * 1000
+                    logger.info(
+                        f"[Search][PROFILE] relations_depth={relation_depth}, "
+                        f"frontier={depth_frontier_count}, rel_call_ms={rel_call_ms:.0f}, "
+                        f"rel_records={depth_records}, new_docs={depth_new_docs}, "
+                        f"existing_hits={depth_existing_hits}, skipped={depth_skipped}, "
+                        f"abstract_reads={depth_abstract_reads}, abstract_ms={depth_abstract_ms:.0f}, "
+                        f"next_frontier={len(next_frontier)}, depth_ms={depth_ms:.0f}, "
+                        f"active_groups={len(active_group_scores)}, total_results={len(resources_list)}"
+                    )
                     frontier = next_frontier
 
-                logger.error(
-                    f"[Search] Relations expansion done: "
-                    f"{relations_found} related docs found, total results={len(resources_list)} (was {initial_count})"
+                if relations_topk > 0:
+                    active_groups = set(active_group_scores)
+                    filtered_resources = []
+                    removed_relation_docs = 0
+                    demoted_search_hits = 0
+                    for item in resources_list:
+                        match_reason = str(item.get("match_reason", ""))
+                        if match_reason.startswith("relation_from:"):
+                            group_key = item.get("relation_group_key") or item.get("relation_question_id") or ""
+                            if group_key not in active_groups:
+                                if item.get("uri", "") in initial_search_uris:
+                                    for key in (
+                                        "relation_from",
+                                        "relation_question_id",
+                                        "relation_group_key",
+                                        "relation_similarity",
+                                        "is_priority",
+                                        "relation_reason",
+                                        "relation_reason_json",
+                                        "priority_rank",
+                                    ):
+                                        item.pop(key, None)
+                                    item["match_reason"] = ""
+                                    filtered_resources.append(item)
+                                    demoted_search_hits += 1
+                                else:
+                                    removed_relation_docs += 1
+                                continue
+                        filtered_resources.append(item)
+                    resources_list = filtered_resources
+                    if removed_relation_docs or demoted_search_hits:
+                        logger.info(
+                            f"[Search][PROFILE] relation_beam_final_filter "
+                            f"active_groups={len(active_groups)}, removed_relation_docs={removed_relation_docs}, "
+                            f"demoted_search_hits={demoted_search_hits}"
+                        )
+
+                relations_found = sum(
+                    1
+                    for item in resources_list
+                    if str(item.get("match_reason", "")).startswith("relation_from:")
+                )
+                relation_total_ms = (time.time() - relation_total_start) * 1000
+                logger.info(
+                    f"[Search][PROFILE] relations_total_ms={relation_total_ms:.0f}, "
+                    f"depth={relation_depth}, relation_call_ms={relation_call_total_ms:.0f}, "
+                    f"abstract_ms={abstract_total_ms:.0f}, errors={relation_errors}, "
+                    f"relations_found={relations_found}, active_groups={len(active_group_scores)}, "
+                    f"total_results={len(resources_list)} "
+                    f"(was {initial_count}), strategy={link_strategy}"
                 )
 
             if tool_context:
@@ -358,6 +529,12 @@ class VikingSearchTool(OVFileTool):
                         result_strs.append(f"      {abstract[:200]}")
                 output = "\n".join(result_strs)
 
+            search_total_ms = (time.time() - search_total_start) * 1000
+            logger.info(
+                f"[Search][PROFILE] total_ms={search_total_ms:.0f}, "
+                f"returned={len(resources_list)}, use_relations={use_relations}, "
+                f"relations_found={relations_found}"
+            )
             return output
         except Exception as e:
             return f"Error searching Viking: {str(e)}"

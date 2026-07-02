@@ -16,13 +16,22 @@ execution:
   ingest_mode: "directory"
   retrieval_instruction: ""
   use_vikingbot: true
+
+question_rewrites:
+  enabled: true
+  cache_root: "rewrites"
+  max_workers: 10
+  max_attempts: 3
 # ==================================
 
 # ===========VikingBot Configuration============
 vikingbot:
-  max_iterations: 50
+  max_iterations: 15
   log_tool_calls: true
   enable_linking: true
+  use_relations: true
+  relations_topk: 3
+  relations_similarity_threshold: 0.7
   link_strategy: llm_review
 paths:
   dataset_path: "datasets/{dataset_name}/clapnq_dev_answerable.jsonl"

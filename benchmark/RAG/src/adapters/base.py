@@ -11,17 +11,20 @@ from core.logger import get_logger
 
 EVIDENCE_BASED_ASSESSMENT_INSTRUCTION = """IMPORTANT: Answer strictly based on the provided context above. Do NOT use external knowledge or information not present in the context.
 
-Before answering, audit the provided context against the question. Provide a concise evidence analysis that can be checked:
+Before deciding, audit the provided context against the question. Provide a concise evidence analysis that can be checked:
 - Point 1: Quote the exact sentence(s) from the context that directly answer the question, focusing on content that matches the question's key terms.
 - Point 2: Identify any additional evidence, constraints, dates, entities, numbers, or multi-hop links needed for the answer.
 - Point 3: State whether any key information is missing or conflicting.
 
-If the context is INSUFFICIENT (missing key facts, conflicting information, or would require guessing), set "sufficient" to false, list the missing information, and set "answer" to "Not mentioned". Do NOT guess or fabricate.
+Make a routing decision:
+- Set "action" to "answer" only when the provided context directly supports the final answer.
+- Set "action" to "fallback" when the context is insufficient, ambiguous, missing key facts, conflicting, only weakly related, or would require guessing. In that case, set "sufficient" to false, list the missing information, and set "answer" to "Not mentioned". Do NOT guess or fabricate.
 
-If the context is SUFFICIENT, set "sufficient" to true and provide a complete answer in the "answer" field. Include all relevant details (dates, ranges, names) rather than oversimplifying.
+If the context is SUFFICIENT, set "action" to "answer", set "sufficient" to true, and provide a complete answer in the "answer" field. Include all relevant details (dates, ranges, names) rather than oversimplifying.
 
 Respond ONLY as a JSON object in the following format:
 {
+  "action": "answer" | "fallback",
   "sufficient": true/false,
   "evidence_analysis": [
     "Point 1: [Quote] ...",

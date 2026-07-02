@@ -15,11 +15,16 @@ execution:
   ingest_mode: "directory"
   retrieval_instruction: ""
   use_vikingbot: false
-  use_relations: true
-  relations_topk: 0
   use_query_expansion: false
-  generate_refusal_reason: true
+  relations_similarity_threshold: 0.7
+  use_relations: true
   link_strategy: llm_review
+  relations_topk: 3
+  generate_refusal_reason: true
+
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"
 # ==================================
 
 paths:

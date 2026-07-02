@@ -15,6 +15,10 @@ execution:
   ingest_mode: "directory"
   retrieval_instruction: ""
   generate_refusal_reason: true
+
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"
 # ==================================
 
 paths:

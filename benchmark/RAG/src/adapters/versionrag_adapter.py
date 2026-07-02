@@ -15,15 +15,14 @@ import os
 import shutil
 from typing import List, Dict, Any
 
-from .base import BaseAdapter, StandardDoc, StandardSample, StandardQA
+from .base import BaseAdapter, StandardDoc, StandardSample, StandardQA, EVIDENCE_BASED_ASSESSMENT_INSTRUCTION
 
 QA_PROMPT = """Based on the provided context, answer the following question accurately and concisely.
 Use the exact wording from the context whenever possible.
 
-Question: {}
-Answer:"""
+Question: {}"""
 
-MISSING_RULE = "If the provided context does not contain sufficient information to answer the question, respond with 'Not mentioned'."
+ASSESSMENT_INSTRUCTION = EVIDENCE_BASED_ASSESSMENT_INSTRUCTION
 
 
 class VersionRAGAdapter(BaseAdapter):
@@ -151,7 +150,7 @@ class VersionRAGAdapter(BaseAdapter):
 
     def build_prompt(self, qa: StandardQA, context_blocks: List[str]) -> tuple[str, Dict[str, Any]]:
         context_text = "\n\n".join(context_blocks)
-        full_prompt = f"{context_text}\n\n{MISSING_RULE}\n\n{QA_PROMPT.format(qa.question)}"
+        full_prompt = f"{context_text}\n\n{ASSESSMENT_INSTRUCTION}\n\n{QA_PROMPT.format(qa.question)}"
         meta = {
             "question_type": qa.category,
         }

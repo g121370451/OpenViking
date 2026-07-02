@@ -15,6 +15,10 @@ execution:
   ingest_mode: "directory"
   retrieval_instruction: ""
   use_vikingbot: true
+
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"
 # ==================================
 
 # ===========VikingBot Configuration============
@@ -22,7 +26,6 @@ vikingbot:
   max_iterations: 15
   log_tool_calls: true
   enable_linking: false
-
 paths:
   dataset_path: "datasets/{dataset_name}/data/test/evaluation_set.csv"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"

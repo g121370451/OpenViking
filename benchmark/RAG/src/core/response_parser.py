@@ -6,6 +6,7 @@ from typing import Any
 
 @dataclass
 class LLMResponse:
+    action: str
     sufficient: bool
     answer: str
     reasoning: str
@@ -25,6 +26,23 @@ def _coerce_string_list(value: Any) -> list[str]:
     return [str(value).strip()] if str(value).strip() else []
 
 
+def _normalize_action(value: Any, sufficient: bool, answer: str) -> str:
+    if isinstance(value, str) and value.strip().lower() == "fallback":
+        return "fallback"
+
+    if not sufficient:
+        return "fallback"
+    if answer.strip().lower() == "not mentioned":
+        return "fallback"
+
+    if isinstance(value, str):
+        action = value.strip().lower()
+        if action == "answer":
+            return action
+
+    return "answer"
+
+
 def parse_llm_response(raw: str) -> LLMResponse:
     text = raw.strip()
 
@@ -39,12 +57,14 @@ def parse_llm_response(raw: str) -> LLMResponse:
             if isinstance(sufficient, str):
                 sufficient = sufficient.lower() in ("true", "1", "yes")
             answer = str(obj.get("answer", "")).strip()
+            action = _normalize_action(obj.get("action"), sufficient, answer)
             reasoning = str(obj.get("reasoning", "")).strip()
             evidence_analysis = _coerce_string_list(obj.get("evidence_analysis"))
             missing_info = _coerce_string_list(obj.get("missing_info"))
             if not reasoning and evidence_analysis:
                 reasoning = evidence_analysis[-1]
             return LLMResponse(
+                action=action,
                 sufficient=sufficient,
                 answer=answer,
                 reasoning=reasoning,
@@ -77,6 +97,7 @@ def parse_llm_response(raw: str) -> LLMResponse:
     answ = raw.strip()
     if answ:
         return LLMResponse(
+            action="answer",
             sufficient=True,
             answer=answ,
             reasoning="",
@@ -85,6 +106,7 @@ def parse_llm_response(raw: str) -> LLMResponse:
             raw=raw,
         )
     return LLMResponse(
+        action="fallback",
         sufficient=False,
         answer="",
         reasoning="parse failed",

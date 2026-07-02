@@ -1,0 +1,58 @@
+project_name: "RAG_Benchmark"
+
+dataset_name: "LegalBench"
+
+adapter:
+  module: "src.adapters.legalbench_adapter"
+  class_name: "LegalBenchAdapter"
+
+execution:
+  max_workers: 10
+  ingest_workers: 8
+  retrieval_topk: 5
+  max_queries: null
+  ingest_mode: "directory"
+  retrieval_instruction: ""
+  mode: "ov_fallback_bot_relations"
+  relations_similarity_threshold: 0.7
+  relations_topk: 3
+  fallback:
+    evidence_risk_gate:
+      enabled: true
+      fallback_on_missing_info: true
+      fallback_on_evidence_gap: true
+      fallback_on_competing_candidates: true
+      strict_cross_source: false
+      fallback_on_relation_dominant: true
+      off_target_uri_ratio_threshold: 0.6
+      relation_token_ratio_threshold: 0.65
+    pass_phase1_draft_to_bot: true
+    phase1_draft_answer_chars: 1500
+    phase1_draft_evidence_chars: 2000
+
+vikingbot:
+  max_iterations: 15
+  log_tool_calls: true
+  use_relations: true
+  relations_topk: 3
+  relations_similarity_threshold: 0.7
+  enable_linking: false
+paths:
+  dataset_path: "datasets/{dataset_name}/benchmarks/maud.json"
+  doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
+  output_dir: "Output/{dataset_name}/experiment_ov_fallback_bot_relations_top_{retrieval_topk}"
+  log_file: "Output/{dataset_name}/experiment_ov_fallback_bot_relations_top_{retrieval_topk}/benchmark.log"
+
+llm:
+  model: "doubao-seed-1-8-251228"
+  temperature: 0
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+embedding:
+  model: "doubao-embedding-vision-250615"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"

@@ -14,14 +14,17 @@ execution:
   ingest_mode: "directory"
   retrieval_instruction: ""
   mode: "ov_fallback_bot_relations"
+  relations_similarity_threshold: 0.7
+  relations_topk: 3
   fallback: {}
 
 vikingbot:
   max_iterations: 15
   log_tool_calls: true
   use_relations: true
+  relations_topk: 3
+  relations_similarity_threshold: 0.7
   enable_linking: false
-
 paths:
   dataset_path: "datasets/{dataset_name}/data/test/evaluation_set.csv"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
@@ -34,3 +37,6 @@ llm:
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   api_key: "${VOLCENGINE_API_KEY}"
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"

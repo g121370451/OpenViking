@@ -19,7 +19,7 @@ execution:
 
 # ===========VikingBot Configuration============
 vikingbot:
-  max_iterations: 50
+  max_iterations: 15
   log_tool_calls: true
   enable_linking: false
 paths:
@@ -35,3 +35,6 @@ llm:
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   api_key: "${VOLCENGINE_API_KEY}"
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"
