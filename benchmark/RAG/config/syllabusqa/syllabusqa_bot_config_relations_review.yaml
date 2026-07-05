@@ -28,7 +28,7 @@ vikingbot:
   enable_linking: false
   use_relations: true
   relations_topk: 3
-  relations_similarity_threshold: 0.7
+  relations_similarity_threshold: 0.6
   link_strategy: llm_review
 paths:
   dataset_path: "datasets/{dataset_name}"

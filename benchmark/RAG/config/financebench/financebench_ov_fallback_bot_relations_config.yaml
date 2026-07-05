@@ -14,16 +14,28 @@ execution:
   ingest_mode: "directory"
   retrieval_instruction: ""
   mode: "ov_fallback_bot_relations"
-  relations_similarity_threshold: 0.7
-  relations_topk: 3
-  fallback: {}
+  relations_similarity_threshold: 0.6
+  relations_topk: 1
+  fallback:
+    evidence_risk_gate:
+      enabled: true
+      fallback_on_missing_info: true
+      fallback_on_evidence_gap: true
+      fallback_on_competing_candidates: true
+      strict_cross_source: false
+      fallback_on_relation_dominant: true
+      off_target_uri_ratio_threshold: 0.6
+      relation_token_ratio_threshold: 0.65
+    pass_phase1_draft_to_bot: true
+    phase1_draft_answer_chars: 1500
+    phase1_draft_evidence_chars: 2000
 
 vikingbot:
   max_iterations: 15
   log_tool_calls: true
   use_relations: true
   relations_topk: 3
-  relations_similarity_threshold: 0.7
+  relations_similarity_threshold: 0.6
   enable_linking: false
 paths:
   dataset_path: "datasets/{dataset_name}/financebench_open_source.jsonl"
