@@ -53,6 +53,18 @@ def _extract_uris_from_args(args_raw) -> list[str]:
     return [_normalize_uri(u) for u in uris]
 
 
+def _tool_args_to_dict(args_raw) -> dict:
+    if isinstance(args_raw, dict):
+        return args_raw
+    if isinstance(args_raw, str):
+        try:
+            parsed = json.loads(args_raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, final_content: str) -> str:
     """Build a structured relation reason for future relation-guided search."""
     tool_path: list[dict[str, str]] = []
@@ -92,16 +104,16 @@ def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, fina
             continue
 
         if tool_name == "openviking_search":
-            args_obj = json.loads(args) if isinstance(args, str) else args
-            query = args_obj.get("query", "") if isinstance(args_obj, dict) else ""
+            args_obj = _tool_args_to_dict(args)
+            query = args_obj.get("query", "")
             tool_path.append({"tool": "openviking_search", "query": query})
 
         elif tool_name in ("openviking_read", "openviking_multi_read"):
             tool_path.append({"tool": tool_name, "uri": tgt_uri})
 
         elif tool_name == "openviking_grep":
-            args_obj = json.loads(args) if isinstance(args, str) else args
-            pattern = args_obj.get("pattern", "") if isinstance(args_obj, dict) else ""
+            args_obj = _tool_args_to_dict(args)
+            pattern = args_obj.get("pattern", "")
             grep_hits = []
             if isinstance(result, list):
                 for item in result:
@@ -123,6 +135,104 @@ def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, fina
         "sufficient": True,
     }
     return json.dumps(reason, ensure_ascii=False)
+
+
+def _message_content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(str(item.get("text", "")))
+        return "\n".join(part for part in text_parts if part)
+    return ""
+
+
+def _is_internal_user_message(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        stripped == "Reflect on the results and decide next steps."
+        or (stripped.startswith("## Current Time:") and "User's query:" in stripped)
+    )
+
+
+def _collect_label_value(lines: list[str], index: int, inline_value: str) -> str:
+    inline_value = inline_value.strip()
+    nested_original = re.match(r"(?i)^original question:\s*(.*)$", inline_value)
+    if nested_original:
+        inline_value = nested_original.group(1).strip()
+
+    if inline_value:
+        return inline_value
+
+    collected: list[str] = []
+    for line in lines[index + 1:]:
+        stripped = line.strip()
+        if not stripped:
+            if collected:
+                break
+            continue
+        if collected and re.match(r"^[A-Za-z][A-Za-z0-9 _/-]{0,80}:\s*$", stripped):
+            break
+        collected.append(stripped)
+    return "\n".join(collected).strip()
+
+
+def _extract_original_question_block(text: str) -> str:
+    lines = text.splitlines()
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
+        match = re.search(r"(?i)\boriginal question:\s*(.*)$", line)
+        if not match:
+            continue
+        value = _collect_label_value(lines, idx, match.group(1))
+        if value:
+            return value
+    return ""
+
+
+def _extract_prompt_question(text: str) -> str:
+    lines = text.splitlines()
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
+        match = re.match(r"\s*(?:Here'?s the question|Question)\s*:\s*(.*)$", line, re.IGNORECASE)
+        if not match:
+            continue
+        value = _collect_label_value(lines, idx, match.group(1))
+        if value:
+            return value
+    return ""
+
+
+def _extract_original_query_from_messages(messages: list[dict]) -> str:
+    """Extract the current user question without reading labels from tool output."""
+    for msg_item in reversed(messages):
+        if not isinstance(msg_item, dict) or msg_item.get("role") != "user":
+            continue
+        content = _message_content_to_text(msg_item.get("content", ""))
+        if not content or _is_internal_user_message(content):
+            continue
+
+        original_question = _extract_original_question_block(content)
+        if original_question:
+            return original_question
+
+        looks_like_wrapped_question = (
+            content.lstrip().lower().startswith("question:")
+            or "Answer this question as briefly as possible" in content
+            or "Always use OpenViking tools first" in content
+            or re.search(r"(?im)^\s*Here'?s the question\s*:", content) is not None
+        )
+        if looks_like_wrapped_question:
+            prompt_question = _extract_prompt_question(content)
+            if prompt_question:
+                return prompt_question
+
+        stripped = content.strip()
+        if stripped:
+            return stripped
+    return ""
 
 
 def _collect_relation_derived_uris(tools_used: list) -> set[str]:
@@ -555,26 +665,7 @@ class AgentLoop:
 
         # --- LLM Review 建边 ---
         _enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
-        # Extract original query from messages
-        original_query = ""
-        for msg_item in reversed(messages):
-            content = msg_item.get("content", "") if isinstance(msg_item, dict) else ""
-            if not isinstance(content, str):
-                continue
-            for pattern in [r"Here'?s the question:\s*(.+)", r"Question:\s*(.+)"]:
-                m = re.search(pattern, content, re.DOTALL)
-                if m:
-                    original_query = m.group(1).strip()
-                    break
-            if original_query:
-                break
-        if not original_query:
-            for msg_item in reversed(messages):
-                if isinstance(msg_item, dict) and msg_item.get("role") == "user":
-                    content = msg_item.get("content", "")
-                    if isinstance(content, str) and len(content) > 5:
-                        original_query = content
-                        break
+        original_query = _extract_original_query_from_messages(messages)
 
         logger.info(
             f"[LLMReview] gate check: strategy=llm_review, enable={_enable_linking}, "
