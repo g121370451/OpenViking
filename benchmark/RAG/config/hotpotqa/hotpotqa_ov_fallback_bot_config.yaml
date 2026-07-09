@@ -7,14 +7,28 @@ adapter:
   class_name: "HotpotQAAdapter"
 
 execution:
-  max_workers: 10
+  max_workers: 1
   ingest_workers: 8
   retrieval_topk: 5
   max_queries: null
   ingest_mode: "directory"
   retrieval_instruction: ""
   mode: "ov_fallback_bot"
-  fallback: {}
+  phase1_providers:
+    primary: "raw_context_phase1_result"
+    enabled:
+      - "raw_context_phase1_result"
+      - "raw_context_naive_rule"
+    configs:
+      raw_context_phase1_result:
+        fallback_on_action_fallback: true
+        fallback_on_insufficient: true
+        fallback_on_missing_info: true
+        fallback_on_stage2_insufficient: true
+      raw_context_naive_rule:
+        fallback_on_action_fallback: true
+        fallback_on_insufficient: true
+        fallback_on_refusal_like_answer: true
 
 vikingbot:
   max_iterations: 15

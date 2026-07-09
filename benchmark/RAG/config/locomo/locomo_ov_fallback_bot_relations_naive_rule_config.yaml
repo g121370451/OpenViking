@@ -1,10 +1,10 @@
 project_name: "RAG_Benchmark"
 
-dataset_name: "Qasper"
+dataset_name: "Locomo"
 
 adapter:
-  module: "src.adapters.qasper_adapter"
-  class_name: "QasperAdapter"
+  module: "src.adapters.locomo_adapter"
+  class_name: "LocomoAdapter"
 
 execution:
   max_workers: 10
@@ -17,15 +17,14 @@ execution:
   relations_similarity_threshold: 0.6
   relations_topk: 3
   phase1_providers:
-    primary: "raw_context_phase1_result"
+    primary: "raw_context_naive_rule"
     enabled:
-      - "raw_context_phase1_result"
+      - "raw_context_naive_rule"
     configs:
-      raw_context_phase1_result:
+      raw_context_naive_rule:
         fallback_on_action_fallback: true
         fallback_on_insufficient: true
-        fallback_on_missing_info: true
-        fallback_on_stage2_insufficient: true
+        fallback_on_refusal_like_answer: true
 
 vikingbot:
   max_iterations: 15
@@ -35,11 +34,11 @@ vikingbot:
   relations_similarity_threshold: 0.6
   enable_linking: false
 paths:
-  dataset_path: "datasets/{dataset_name}"
+  dataset_path: "datasets/{dataset_name}/locomo10.json"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
   vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_ov_fallback_bot_relations_top_{retrieval_topk}"
-  log_file: "Output/{dataset_name}/experiment_ov_fallback_bot_relations_top_{retrieval_topk}/benchmark.log"
+  output_dir: "Output/{dataset_name}/experiment_ov_fallback_bot_relations_naive_rule_top_{retrieval_topk}"
+  log_file: "Output/{dataset_name}/experiment_ov_fallback_bot_relations_naive_rule_top_{retrieval_topk}/benchmark.log"
 
 llm:
   model: "doubao-seed-1-8-251228"

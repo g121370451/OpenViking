@@ -14,33 +14,33 @@ execution:
   max_queries: null
   ingest_mode: "directory"
   retrieval_instruction: ""
-  use_query_expansion: false
-  relations_similarity_threshold: 0.7
-  use_relations: true
-  link_strategy: llm_review
-  relations_topk: 3
   generate_refusal_reason: true
+  mode: "standard"
+  use_vikingbot: false
+  use_relations: true
+  relations_topk: 3
+  relations_similarity_threshold: 0.6
+  link_strategy: llm_review
 
 question_rewrites:
   enabled: false
   cache_root: "rewrites"
 # ==================================
 
-embedding:
-  api_key: "${VOLCENGINE_API_KEY}"
-  base_url: "https://ark.cn-beijing.volces.com/api/v3"
-  model: "doubao-embedding-vision-250615"
-
 paths:
   dataset_path: "datasets/{dataset_name}/data/test/evaluation_set.csv"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
   vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_test_relations_top_{retrieval_topk}"
-  log_file: "Output/{dataset_name}/experiment_test_relations_top_{retrieval_topk}/benchmark.log"
+  output_dir: "Output/{dataset_name}/experiment_test_top_{retrieval_topk}_with_relations"
+  log_file: "Output/{dataset_name}/experiment_test_top_{retrieval_topk}_with_relations/benchmark.log"
 
 
 llm:
   model: "doubao-seed-1-8-251228"
   temperature: 0
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+embedding:
+  model: "doubao-embedding-vision-250615"
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   api_key: "${VOLCENGINE_API_KEY}"

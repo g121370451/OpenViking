@@ -320,6 +320,7 @@ class VikingStoreWithRelations(VikingStoreWrapper):
         ret["context_blocks"] = relations_blocks + ret["context_blocks"]
 
         ret["relations_uris"] = relations_uris
+        ret["retrieved_uris"] = list(ret["retrieved_uris"]) + relations_uris
         ret["relations_found"] = len(related_uris)
         ret["relations_added"] = len(relations_uris)
 
@@ -330,11 +331,12 @@ class VikingStoreWithRelations(VikingStoreWrapper):
 
 
 class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
-    """HTTP-based vector store with local relations expansion.
+    """HTTP-based vector store with bot-style local relations expansion.
 
-    Uses VikingStoreHTTPWrapper for vector search + read, then applies
-    the same relations logic as VikingStoreWithRelations by reading
-    .relations_{strategy}.jsonl from the local store_path.
+    Seed retrieval still comes from VikingStoreHTTPWrapper.retrieve(); relation
+    expansion mirrors openviking_search in vikingbot with frontier traversal,
+    active relation-group pruning, existing-hit priority marking, and a final
+    relation-group filter.
     """
 
     def __init__(self, server_url: str, api_key: str = "", store_path: str = "",
@@ -451,6 +453,8 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
                     rec_query = rec.get("query_question", "")
                     rec_embedding = rec.get("query_embedding")
 
+                question_id = rec.get("question_id", "")
+
                 if not query:
                     group_key = rec.get("question_id", "") or rec_query or target
                     candidates.append({
@@ -459,6 +463,8 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
                         "weight": rec_weight,
                         "similarity": 0.0,
                         "group_key": group_key,
+                        "question_id": question_id,
+                        "reason": rec.get("reason", rec_query),
                     })
                     continue
 
@@ -472,80 +478,155 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
                             "weight": rec_weight,
                             "similarity": sim,
                             "group_key": group_key,
+                            "question_id": question_id,
+                            "reason": rec.get("reason", rec_query),
                         })
 
+        if query:
+            candidates.sort(key=lambda x: (-x["similarity"], x["target"]))
+        else:
+            candidates.sort(key=lambda x: (-float(x.get("weight", 1.0) or 1.0), x["target"]))
         return candidates
 
-    def _expand_relation_beam(self, seed_uris: list[str], query: str) -> list[tuple[str, str]]:
+    @staticmethod
+    def _is_relation_item(item: dict) -> bool:
+        return str(item.get("match_reason", "")).startswith("relation_from:")
+
+    @staticmethod
+    def _float_value(value, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _mark_relation_item(self, item: dict, from_uri: str, rel: dict) -> None:
+        item["match_reason"] = f"relation_from: {from_uri}"
+        item["relation_from"] = from_uri
+        item["relation_question_id"] = rel.get("question_id", "")
+        item["relation_group_key"] = rel.get("group_key") or rel.get("question_id") or rel.get("target", "")
+        item["relation_similarity"] = rel.get("similarity", 0.0)
+        item["relation_weight"] = rel.get("weight", 1.0)
+        item["is_priority"] = True
+        reason = rel.get("reason", "")
+        if reason:
+            item["relation_reason"] = reason
+
+    def _demote_relation_item(self, item: dict) -> None:
+        for key in (
+            "relation_from",
+            "relation_question_id",
+            "relation_group_key",
+            "relation_similarity",
+            "relation_weight",
+            "is_priority",
+            "relation_reason",
+            "priority_rank",
+        ):
+            item.pop(key, None)
+        item["match_reason"] = ""
+
+    def _expand_relation_beam(self, resources_list: list[dict], query: str) -> list[dict]:
         query_embedding = self._embed_text(query) if query else None
         if query and not query_embedding:
-            return []
+            return resources_list
 
         active_group_scores: dict[str, float] = {}
-        pruned_groups: set[str] = set()
-        seed_uri_set = set(seed_uris)
-        seen_uris = set(seed_uris)
-        relation_records: dict[str, dict] = {}
-        frontier = list(seed_uris)
+        pruned_relation_groups: set[str] = set()
+        seen_uris = {r.get("uri", "") for r in resources_list if r.get("uri", "")}
+        initial_search_uris = set(seen_uris)
+        frontier = [r.get("uri", "") for r in resources_list if r.get("uri", "")]
 
         while frontier:
-            candidates: list[dict] = []
+            depth_candidates: list[tuple[str, dict]] = []
             for uri in frontier:
                 try:
-                    candidates.extend(self._collect_relation_candidates(uri, query, query_embedding))
+                    for rel in self._collect_relation_candidates(uri, query, query_embedding):
+                        group_key = rel.get("group_key") or rel.get("question_id") or rel.get("target", "")
+                        rel["group_key"] = group_key
+                        if self.relations_topk > 0 and group_key in pruned_relation_groups:
+                            continue
+                        depth_candidates.append((uri, rel))
                 except Exception:
                     continue
 
             if self.relations_topk > 0:
-                candidates = [
-                    item for item in candidates
-                    if item["group_key"] not in pruned_groups
-                ]
                 selected_groups, newly_pruned = _update_active_relation_groups(
                     active_group_scores,
-                    candidates,
+                    [rel for _, rel in depth_candidates],
                     self.relations_topk,
                 )
-                pruned_groups.update(newly_pruned)
+                pruned_relation_groups.update(newly_pruned)
             else:
                 selected_groups = None
 
             next_frontier = []
-            for item in sorted(candidates, key=lambda x: (-x["similarity"], x["target"])):
-                if selected_groups is not None and item["group_key"] not in selected_groups:
+            for from_uri, rel in depth_candidates:
+                group_key = rel.get("group_key") or rel.get("question_id") or rel.get("target", "")
+                if selected_groups is not None and group_key not in selected_groups:
                     continue
 
-                target = item["target"]
-                if target in seed_uri_set:
+                rel_uri = rel.get("target", "")
+                if not rel_uri:
                     continue
 
-                existing = relation_records.get(target)
-                if existing:
-                    existing_is_active = (
-                        selected_groups is None
-                        or existing["group_key"] in selected_groups
-                    )
-                    if existing_is_active and item["similarity"] <= existing["similarity"]:
-                        continue
-                relation_records[target] = item
+                if rel_uri in seen_uris:
+                    for existing in resources_list:
+                        if existing.get("uri") != rel_uri:
+                            continue
+                        existing_match = str(existing.get("match_reason", ""))
+                        should_update = not existing_match
+                        if (
+                            not should_update
+                            and selected_groups is not None
+                            and existing_match.startswith("relation_from:")
+                        ):
+                            existing_group = (
+                                existing.get("relation_group_key")
+                                or existing.get("relation_question_id")
+                                or ""
+                            )
+                            existing_similarity = self._float_value(existing.get("relation_similarity", 0.0))
+                            should_update = (
+                                existing_group not in selected_groups
+                                or self._float_value(rel.get("similarity", 0.0)) > existing_similarity
+                            )
+                        if should_update:
+                            self._mark_relation_item(existing, from_uri, rel)
+                        break
+                    continue
 
-                if target not in seen_uris:
-                    seen_uris.add(target)
-                    next_frontier.append(target)
+                seen_uris.add(rel_uri)
+                new_item = {
+                    "uri": rel_uri,
+                    "context_type": "ContextType.RESOURCE",
+                    "is_leaf": False,
+                    "abstract": "",
+                    "overview": None,
+                    "category": "",
+                    "score": 0,
+                    "relations": [],
+                }
+                self._mark_relation_item(new_item, from_uri, rel)
+                resources_list.append(new_item)
+                next_frontier.append(rel_uri)
 
             frontier = next_frontier
 
         if self.relations_topk > 0:
             active_groups = set(active_group_scores)
-            final_records = [
-                item for item in relation_records.values()
-                if item["group_key"] in active_groups
-            ]
-        else:
-            final_records = list(relation_records.values())
+            filtered_resources = []
+            for item in resources_list:
+                if self._is_relation_item(item):
+                    group_key = item.get("relation_group_key") or item.get("relation_question_id") or ""
+                    if group_key not in active_groups:
+                        if item.get("uri", "") in initial_search_uris:
+                            self._demote_relation_item(item)
+                            filtered_resources.append(item)
+                        continue
+                filtered_resources.append(item)
+            resources_list = filtered_resources
 
-        final_records.sort(key=lambda x: (-x["similarity"], x["target"]))
-        return [(item["target"], item["source_uri"]) for item in final_records]
+        return resources_list
 
     def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources"):
         ret = super().retrieve(query, topk, target_uri)
@@ -553,25 +634,65 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
         if not self._vikingfs_path:
             return ret
 
-        vector_uris = list(ret["retrieved_uris"])
-        related_uris = self._expand_relation_beam(vector_uris, query)
+        resources_list = [
+            {
+                "uri": uri,
+                "match_reason": "",
+                "score": 0,
+                "relations": [],
+            }
+            for uri in ret["retrieved_uris"]
+            if uri
+        ]
+        initial_uris = set(ret["retrieved_uris"])
+        resources_list = self._expand_relation_beam(resources_list, query)
 
+        relation_items = []
+        search_items = []
+        for item in resources_list:
+            if self._is_relation_item(item):
+                relation_items.append(item)
+            else:
+                search_items.append(item)
+
+        for priority_rank, item in enumerate(relation_items, 1):
+            item["priority_rank"] = priority_rank
+
+        recall_texts = ret["recall_texts"]
+        context_blocks = []
+        retrieved_uris = []
         relations_uris = []
-        relations_blocks = []
-        for rel_uri, source_uri in related_uris:
-            try:
-                content = self.read_resource(rel_uri)
-                if not content:
-                    continue
-                ret["recall_texts"][rel_uri] = content
-                relations_blocks.append(content[:8000])
-                relations_uris.append(rel_uri)
-            except Exception:
-                continue
-        ret["context_blocks"] = relations_blocks + ret["context_blocks"]
+        relations_added_uris = []
+        relation_sources = {}
+        relation_group_keys = {}
 
+        for item in relation_items + search_items:
+            uri = item.get("uri", "")
+            if not uri:
+                continue
+            content = recall_texts.get(uri)
+            if content is None:
+                try:
+                    content = self.read_resource(uri)
+                except Exception:
+                    content = ""
+                recall_texts[uri] = content
+            retrieved_uris.append(uri)
+            context_blocks.append((content or "")[:8000])
+            if self._is_relation_item(item):
+                relations_uris.append(uri)
+                relation_sources[uri] = item.get("relation_from", "")
+                relation_group_keys[uri] = item.get("relation_group_key", "")
+                if uri not in initial_uris:
+                    relations_added_uris.append(uri)
+
+        ret["context_blocks"] = context_blocks
+        ret["retrieved_uris"] = retrieved_uris
         ret["relations_uris"] = relations_uris
-        ret["relations_found"] = len(related_uris)
-        ret["relations_added"] = len(relations_uris)
+        ret["relations_added_uris"] = relations_added_uris
+        ret["relation_source_uris"] = relation_sources
+        ret["relation_group_keys"] = relation_group_keys
+        ret["relations_found"] = len(relations_uris)
+        ret["relations_added"] = len(relations_added_uris)
 
         return ret

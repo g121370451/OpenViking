@@ -25,7 +25,7 @@ from vikingbot.config import load_config
 from vikingbot.config.schema import BotMode, Config, SessionKey
 from vikingbot.hooks import HookContext
 from vikingbot.hooks.manager import hook_manager
-from vikingbot.providers.base import LLMProvider
+from vikingbot.providers.base import LLMProvider, LLMResponse
 from vikingbot.sandbox import SandboxManager
 from vikingbot.session.manager import SessionManager
 from vikingbot.utils.helpers import cal_str_tokens
@@ -63,6 +63,57 @@ def _tool_args_to_dict(args_raw) -> dict:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _llm_review_stage_profile(
+    total_ms: float,
+    input_parse_ms: float,
+    review_ms: float,
+    link_ms: float,
+) -> dict:
+    other_ms = max(0.0, total_ms - input_parse_ms - review_ms - link_ms)
+
+    def pct(value: float) -> float:
+        return round((value / total_ms * 100.0), 1) if total_ms > 0 else 0.0
+
+    return {
+        "total_ms": int(total_ms),
+        "input_parse_ms": int(input_parse_ms),
+        "input_parse_pct": pct(input_parse_ms),
+        "review_ms": int(review_ms),
+        "review_pct": pct(review_ms),
+        "link_ms": int(link_ms),
+        "link_pct": pct(link_ms),
+        "other_ms": int(other_ms),
+        "other_pct": pct(other_ms),
+    }
+
+
+def _log_llm_review_stage_profile(profile: dict, extra: str = "") -> None:
+    suffix = f", {extra}" if extra else ""
+    logger.error(
+        "[LLMReview][STAGE_PROFILE] "
+        f"total_ms={profile['total_ms']}, "
+        f"input_parse_ms={profile['input_parse_ms']} ({profile['input_parse_pct']:.1f}%), "
+        f"review_ms={profile['review_ms']} ({profile['review_pct']:.1f}%), "
+        f"link_ms={profile['link_ms']} ({profile['link_pct']:.1f}%), "
+        f"other_ms={profile['other_ms']} ({profile['other_pct']:.1f}%)"
+        f"{suffix}"
+    )
+
+
+def _llm_review_disable_thinking_kwargs(model: str | None) -> tuple[dict | None, dict | None, bool]:
+    model_l = (model or "").lower()
+    if (
+        "volcengine/" in model_l
+        or "volces/" in model_l
+        or model_l.startswith("ark/")
+        or "doubao" in model_l
+    ):
+        return {"type": "disabled"}, None, True
+    if "dashscope/" in model_l or "qwen" in model_l:
+        return None, {"enable_thinking": False}, True
+    return None, None, False
 
 
 def _build_edge_reason(original_query: str, tgt_uri: str, tools_used: list, final_content: str) -> str:
@@ -807,24 +858,62 @@ class AgentLoop:
 
                 try:
                     # Call LLM for review
-                    _llm_review_start = time.time()
-                    review_messages = [
-                        {"role": "system", "content": "You are a document relation analyst. Output only valid JSON."},
-                        {"role": "user", "content": review_prompt},
-                    ]
-                    review_response = await self.provider.chat(
-                        messages=review_messages,
-                        tools=[],
-                        model=self.model,
-                        session_id=session_key.safe_name(),
+                    _review_stage_start = time.time()
+                    _input_parse_duration = (_review_stage_start - _post_link_start) * 1000
+                    _review_thinking, _review_extra_body, _review_thinking_disabled = (
+                        _llm_review_disable_thinking_kwargs(self.model)
                     )
-                    _llm_review_duration = (time.time() - _llm_review_start) * 1000
-                    logger.info(f"[LLMReview][TIMING] LLM review call took {_llm_review_duration:.0f}ms")
+                    _review_bypass_reason = ""
+                    _llm_review_start = time.time()
+                    if len(candidate_uris) == 1:
+                        _review_bypass_reason = "single_candidate"
+                        review_response = LLMResponse(
+                            content=json.dumps(sorted(candidate_uris)),
+                            usage={},
+                        )
+                        _llm_review_duration = 0.0
+                        logger.info(
+                            "[LLMReview] single-candidate bypass; "
+                            f"uri={sorted(candidate_uris)[0]}"
+                        )
+                    else:
+                        review_messages = [
+                            {"role": "system", "content": "You are a document relation analyst. Output only valid JSON."},
+                            {"role": "user", "content": review_prompt},
+                        ]
+                        review_response = await self.provider.chat(
+                            messages=review_messages,
+                            tools=[],
+                            model=self.model,
+                            session_id=session_key.safe_name(),
+                            thinking=_review_thinking,
+                            extra_body=_review_extra_body,
+                        )
+                        _llm_review_duration = (time.time() - _llm_review_start) * 1000
+                        logger.info(f"[LLMReview][TIMING] LLM review call took {_llm_review_duration:.0f}ms")
 
+                    review_usage = review_response.usage or {}
+                    _review_prompt_tokens = int(review_usage.get("prompt_tokens", 0) or 0)
+                    _review_completion_tokens = int(review_usage.get("completion_tokens", 0) or 0)
+                    _review_total_tokens = int(review_usage.get("total_tokens", 0) or 0)
                     if review_response.usage:
-                        token_usage["prompt_tokens"] += review_response.usage.get("prompt_tokens", 0)
-                        token_usage["completion_tokens"] += review_response.usage.get("completion_tokens", 0)
-                        token_usage["total_tokens"] += review_response.usage.get("total_tokens", 0)
+                        token_usage["prompt_tokens"] += _review_prompt_tokens
+                        token_usage["completion_tokens"] += _review_completion_tokens
+                        token_usage["total_tokens"] += _review_total_tokens
+                    _review_profile_fields = {
+                        "review_model": self.model,
+                        "review_mode": mode,
+                        "review_candidate_uris": len(candidate_uris),
+                        "review_read_uris": len(read_uris),
+                        "review_search_uris": len(search_uris),
+                        "review_prompt_chars": len(review_prompt),
+                        "review_response_chars": len(review_response.content or ""),
+                        "review_prompt_tokens": _review_prompt_tokens,
+                        "review_completion_tokens": _review_completion_tokens,
+                        "review_total_tokens": _review_total_tokens,
+                        "review_bypass": _review_bypass_reason or None,
+                        "review_thinking_disabled": _review_thinking_disabled,
+                    }
 
                     # Parse LLM output
                     _parse_start = time.time()
@@ -849,6 +938,8 @@ class AgentLoop:
                                         if u in candidate_uris:
                                             useful_uris.append(u)
                             parse_method = "json"
+                            if _review_bypass_reason:
+                                parse_method = _review_bypass_reason
                         except json.JSONDecodeError:
                             logger.warning(
                                 f"[LLMReview] JSON parse FAILED. Raw output (first 300 chars): {raw_output[:300]}"
@@ -923,11 +1014,14 @@ class AgentLoop:
                         f"skipped_relation_to_uris={len(skipped_relation_to_uris)}, "
                         f"parse_method={parse_method}"
                     )
+                    _link_stage_start = time.time()
+                    _review_stage_duration = (_link_stage_start - _review_stage_start) * 1000
 
                     # Create edges
                     if useful_uris:
                         from vikingbot.openviking_mount.ov_server import VikingClient
                         workspace_id = self.sandbox_manager.to_workspace_id(session_key) if self.sandbox_manager else None
+                        _link_stage_start = time.time()
                         _client_create_start = time.time()
                         rv_client = await VikingClient.create(workspace_id)
                         _client_create_duration = (time.time() - _client_create_start) * 1000
@@ -938,6 +1032,7 @@ class AgentLoop:
 
                             # Search top5 to expand from_uris
                             _top5_search_start = time.time()
+                            _top5_search_duration = 0.0
                             try:
                                 search_result = await rv_client.search(original_query)
                                 top5_resources = search_result.get("resources", [])[:5]
@@ -992,6 +1087,38 @@ class AgentLoop:
                             _link_max_ms = max(_link_ms_values) if _link_ms_values else 0.0
                             _link_min_ms = min(_link_ms_values) if _link_ms_values else 0.0
                             _post_link_duration = (time.time() - _post_link_start) * 1000
+                            _link_stage_duration = (time.time() - _link_stage_start) * 1000
+                            _stage_profile = _llm_review_stage_profile(
+                                total_ms=_post_link_duration,
+                                input_parse_ms=_input_parse_duration,
+                                review_ms=_review_stage_duration,
+                                link_ms=_link_stage_duration,
+                            )
+                            _log_llm_review_stage_profile(
+                                _stage_profile,
+                                extra=(
+                                    f"collect_ms={_collect_duration:.0f}, "
+                                    f"prompt_build_ms={_prompt_build_duration:.0f}, "
+                                    f"review_model={self.model}, "
+                                    f"review_mode={mode}, "
+                                    f"review_candidate_uris={len(candidate_uris)}, "
+                                    f"review_read_uris={len(read_uris)}, "
+                                    f"review_search_uris={len(search_uris)}, "
+                                    f"review_prompt_chars={len(review_prompt)}, "
+                                    f"review_response_chars={len(review_response.content or '')}, "
+                                    f"review_prompt_tokens={_review_prompt_tokens}, "
+                                    f"review_completion_tokens={_review_completion_tokens}, "
+                                    f"review_total_tokens={_review_total_tokens}, "
+                                    f"review_bypass={_review_bypass_reason or 'none'}, "
+                                    f"review_thinking_disabled={_review_thinking_disabled}, "
+                                    f"llm_review_call_ms={_llm_review_duration:.0f}, "
+                                    f"parse_review_output_ms={_parse_duration:.0f}, "
+                                    f"client_create_ms={_client_create_duration:.0f}, "
+                                    f"top5_search_ms={_top5_search_duration:.0f}, "
+                                    f"edge_reason_ms={_edge_reason_total_ms:.0f}, "
+                                    f"link_write_ms={_link_total_duration:.0f}"
+                                ),
+                            )
                             logger.info(
                                 f"[LLMReview][PROFILE] link_pairs={linked}, from_uris={len(from_uris)}, "
                                 f"to_uris={len(useful_uris)}, edge_reason_ms={_edge_reason_total_ms:.0f}, "
@@ -1027,8 +1154,18 @@ class AgentLoop:
                                     "prompt_build_ms": int(_prompt_build_duration),
                                     "llm_review_ms": int(_llm_review_duration),
                                     "parse_ms": int(_parse_duration),
+                                    **_review_profile_fields,
+                                    "input_parse_ms": _stage_profile["input_parse_ms"],
+                                    "input_parse_pct": _stage_profile["input_parse_pct"],
+                                    "review_stage_ms": _stage_profile["review_ms"],
+                                    "review_stage_pct": _stage_profile["review_pct"],
+                                    "link_stage_ms": _stage_profile["link_ms"],
+                                    "link_stage_pct": _stage_profile["link_pct"],
+                                    "llm_review_block_total_ms": _stage_profile["total_ms"],
+                                    "llm_review_block_other_ms": _stage_profile["other_ms"],
+                                    "llm_review_block_other_pct": _stage_profile["other_pct"],
                                     "client_create_ms": int(_client_create_duration),
-                                    "top5_search_ms": int(_top5_search_duration) if "_top5_search_duration" in locals() else None,
+                                    "top5_search_ms": int(_top5_search_duration),
                                     "edge_reason_ms": int(_edge_reason_total_ms),
                                     "link_total_ms": int(_link_total_duration),
                                     "post_link_total_ms": int(_post_link_duration),
@@ -1045,6 +1182,35 @@ class AgentLoop:
                             await rv_client.close()
                     elif skipped_relation_to_uris:
                         _post_link_duration = (time.time() - _post_link_start) * 1000
+                        _link_stage_duration = (time.time() - _link_stage_start) * 1000
+                        _stage_profile = _llm_review_stage_profile(
+                            total_ms=_post_link_duration,
+                            input_parse_ms=_input_parse_duration,
+                            review_ms=_review_stage_duration,
+                            link_ms=_link_stage_duration,
+                        )
+                        _log_llm_review_stage_profile(
+                            _stage_profile,
+                            extra=(
+                                f"collect_ms={_collect_duration:.0f}, "
+                                f"prompt_build_ms={_prompt_build_duration:.0f}, "
+                                f"review_model={self.model}, "
+                                f"review_mode={mode}, "
+                                f"review_candidate_uris={len(candidate_uris)}, "
+                                f"review_read_uris={len(read_uris)}, "
+                                f"review_search_uris={len(search_uris)}, "
+                                f"review_prompt_chars={len(review_prompt)}, "
+                                f"review_response_chars={len(review_response.content or '')}, "
+                                f"review_prompt_tokens={_review_prompt_tokens}, "
+                                f"review_completion_tokens={_review_completion_tokens}, "
+                                f"review_total_tokens={_review_total_tokens}, "
+                                f"review_bypass={_review_bypass_reason or 'none'}, "
+                                f"review_thinking_disabled={_review_thinking_disabled}, "
+                                f"llm_review_call_ms={_llm_review_duration:.0f}, "
+                                f"parse_review_output_ms={_parse_duration:.0f}, "
+                                "link_write_ms=0, skipped=relation_derived_to_uris_only"
+                            ),
+                        )
                         logger.info(
                             f"[LLMReview] post_link SKIPPED - all selected to_uris were "
                             f"relation-derived. skipped_to_uris={len(skipped_relation_to_uris)}, "
@@ -1077,11 +1243,51 @@ class AgentLoop:
                                 "prompt_build_ms": int(_prompt_build_duration),
                                 "llm_review_ms": int(_llm_review_duration),
                                 "parse_ms": int(_parse_duration),
+                                **_review_profile_fields,
+                                "input_parse_ms": _stage_profile["input_parse_ms"],
+                                "input_parse_pct": _stage_profile["input_parse_pct"],
+                                "review_stage_ms": _stage_profile["review_ms"],
+                                "review_stage_pct": _stage_profile["review_pct"],
+                                "link_stage_ms": _stage_profile["link_ms"],
+                                "link_stage_pct": _stage_profile["link_pct"],
+                                "llm_review_block_total_ms": _stage_profile["total_ms"],
+                                "llm_review_block_other_ms": _stage_profile["other_ms"],
+                                "llm_review_block_other_pct": _stage_profile["other_pct"],
                                 "post_link_total_ms": int(_post_link_duration),
                                 "skipped_relation_to_uris": len(skipped_relation_to_uris),
                             },
                         })
                     else:
+                        _post_link_duration = (time.time() - _post_link_start) * 1000
+                        _link_stage_duration = (time.time() - _link_stage_start) * 1000
+                        _stage_profile = _llm_review_stage_profile(
+                            total_ms=_post_link_duration,
+                            input_parse_ms=_input_parse_duration,
+                            review_ms=_review_stage_duration,
+                            link_ms=_link_stage_duration,
+                        )
+                        _log_llm_review_stage_profile(
+                            _stage_profile,
+                            extra=(
+                                f"collect_ms={_collect_duration:.0f}, "
+                                f"prompt_build_ms={_prompt_build_duration:.0f}, "
+                                f"review_model={self.model}, "
+                                f"review_mode={mode}, "
+                                f"review_candidate_uris={len(candidate_uris)}, "
+                                f"review_read_uris={len(read_uris)}, "
+                                f"review_search_uris={len(search_uris)}, "
+                                f"review_prompt_chars={len(review_prompt)}, "
+                                f"review_response_chars={len(review_response.content or '')}, "
+                                f"review_prompt_tokens={_review_prompt_tokens}, "
+                                f"review_completion_tokens={_review_completion_tokens}, "
+                                f"review_total_tokens={_review_total_tokens}, "
+                                f"review_bypass={_review_bypass_reason or 'none'}, "
+                                f"review_thinking_disabled={_review_thinking_disabled}, "
+                                f"llm_review_call_ms={_llm_review_duration:.0f}, "
+                                f"parse_review_output_ms={_parse_duration:.0f}, "
+                                "link_write_ms=0, skipped=no_useful_docs"
+                            ),
+                        )
                         logger.warning(
                             f"[LLMReview] post_link SKIPPED - no useful docs parsed. "
                             f"search_uris={len(search_uris)}, read_uris={len(read_uris)}, "
@@ -1093,16 +1299,69 @@ class AgentLoop:
                             "args": {"from_uris": sorted(search_uris), "to_uris": []},
                             "reasoning": "(precise review step - PARSE FAILED)",
                             "result": f"FAILED: parse_method={parse_method}",
-                            "duration": 0,
+                            "duration": int(_post_link_duration),
                             "execute_success": False,
                             "input_token": 0,
                             "output_token": 0,
                             "iteration": iteration,
                             "relations_found": 0,
                             "parse_method": parse_method,
+                            "profile": {
+                                "collect_ms": int(_collect_duration),
+                                "prompt_build_ms": int(_prompt_build_duration),
+                                "llm_review_ms": int(_llm_review_duration),
+                                "parse_ms": int(_parse_duration),
+                                **_review_profile_fields,
+                                "input_parse_ms": _stage_profile["input_parse_ms"],
+                                "input_parse_pct": _stage_profile["input_parse_pct"],
+                                "review_stage_ms": _stage_profile["review_ms"],
+                                "review_stage_pct": _stage_profile["review_pct"],
+                                "link_stage_ms": _stage_profile["link_ms"],
+                                "link_stage_pct": _stage_profile["link_pct"],
+                                "llm_review_block_total_ms": _stage_profile["total_ms"],
+                                "llm_review_block_other_ms": _stage_profile["other_ms"],
+                                "llm_review_block_other_pct": _stage_profile["other_pct"],
+                                "post_link_total_ms": int(_post_link_duration),
+                            },
                         })
                 except Exception:
+                    _post_link_duration = (time.time() - _post_link_start) * 1000
+                    _input_parse_for_error = locals().get(
+                        "_input_parse_duration",
+                        min(_post_link_duration, _collect_duration + _prompt_build_duration),
+                    )
+                    _review_for_error = max(0.0, _post_link_duration - _input_parse_for_error)
+                    _stage_profile = _llm_review_stage_profile(
+                        total_ms=_post_link_duration,
+                        input_parse_ms=_input_parse_for_error,
+                        review_ms=_review_for_error,
+                        link_ms=0.0,
+                    )
+                    _log_llm_review_stage_profile(
+                        _stage_profile,
+                        extra=(
+                            f"collect_ms={_collect_duration:.0f}, "
+                            f"prompt_build_ms={_prompt_build_duration:.0f}, "
+                            "link_write_ms=0, failed=review_step_exception"
+                        ),
+                    )
                     logger.exception("[LLMReview] Review step failed, continuing")
+            else:
+                _post_link_duration = (time.time() - _post_link_start) * 1000
+                _stage_profile = _llm_review_stage_profile(
+                    total_ms=_post_link_duration,
+                    input_parse_ms=_post_link_duration,
+                    review_ms=0.0,
+                    link_ms=0.0,
+                )
+                _log_llm_review_stage_profile(
+                    _stage_profile,
+                    extra=(
+                        f"collect_ms={_collect_duration:.0f}, "
+                        f"read_uris={len(read_uris)}, search_uris={len(search_uris)}, "
+                        "skipped=no_review_candidates"
+                    ),
+                )
 
         return final_content, tools_used, token_usage, iteration, messages
 

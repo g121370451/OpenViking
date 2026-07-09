@@ -171,6 +171,8 @@ class LiteLLMProvider(LLMProvider):
         max_tokens: int = 4096,
         temperature: float = 0.7,
         session_id: str | None = None,
+        thinking: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -182,6 +184,8 @@ class LiteLLMProvider(LLMProvider):
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
             session_id: Optional session ID for tracing.
+            thinking: Optional provider-specific thinking control.
+            extra_body: Optional raw request body fields for compatible APIs.
 
         Returns:
             LLMResponse with content and/or tool calls.
@@ -197,6 +201,10 @@ class LiteLLMProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if thinking is not None:
+            kwargs["thinking"] = thinking
+        if extra_body:
+            kwargs["extra_body"] = dict(extra_body)
 
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)

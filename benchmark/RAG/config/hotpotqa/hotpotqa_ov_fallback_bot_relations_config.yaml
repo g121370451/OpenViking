@@ -15,20 +15,17 @@ execution:
   retrieval_instruction: ""
   mode: "ov_fallback_bot_relations"
   relations_similarity_threshold: 0.6
-  relations_topk: 1
-  fallback:
-    evidence_risk_gate:
-      enabled: true
-      fallback_on_missing_info: true
-      fallback_on_evidence_gap: true
-      fallback_on_competing_candidates: true
-      strict_cross_source: false
-      fallback_on_relation_dominant: true
-      off_target_uri_ratio_threshold: 0.6
-      relation_token_ratio_threshold: 0.65
-    pass_phase1_draft_to_bot: true
-    phase1_draft_answer_chars: 1500
-    phase1_draft_evidence_chars: 2000
+  relations_topk: 3
+  phase1_providers:
+    primary: "raw_context_phase1_result"
+    enabled:
+      - "raw_context_phase1_result"
+    configs:
+      raw_context_phase1_result:
+        fallback_on_action_fallback: true
+        fallback_on_insufficient: true
+        fallback_on_missing_info: true
+        fallback_on_stage2_insufficient: true
 
 vikingbot:
   max_iterations: 15
@@ -49,6 +46,11 @@ llm:
   temperature: 0
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   api_key: "${VOLCENGINE_API_KEY}"
+embedding:
+  model: "doubao-embedding-vision-250615"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
 question_rewrites:
   enabled: false
   cache_root: "rewrites"
+
