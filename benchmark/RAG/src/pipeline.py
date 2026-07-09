@@ -23,9 +23,12 @@ from core.checkpoint import CheckpointManager
 from core.question_rewriter import QuestionRewriteError, QuestionRewriteStore, get_or_create_rewrites
 from fallback import (
     FallbackBotRunner,
+    fallback_judgment_gain_summary,
     fallback_judgment_summary,
+    fallback_miss_gain_summary,
     fallback_miss_summary,
     phase1_fallback_judgment,
+    recoverable_miss_gain_summary,
     recoverable_miss_summary,
 )
 from phase1_providers import Phase1ProviderRunner
@@ -866,6 +869,15 @@ class BenchmarkPipeline:
                     ),
                     "Recoverable Miss (missed fallback cases where shadow bot would have corrected phase1)": (
                         recoverable_miss_summary(fallback_records)
+                    ),
+                    "Fallback Judgment By Accuracy Gain (whether fallback decision matches bot improvement)": (
+                        fallback_judgment_gain_summary(fallback_records, logger=self.logger)
+                    ),
+                    "Fallback Miss By Accuracy Gain (missed cases where bot would improve phase1)": (
+                        fallback_miss_gain_summary(fallback_records)
+                    ),
+                    "Recoverable Miss By Accuracy Gain (missed fallback cases where shadow bot improved phase1)": (
+                        recoverable_miss_gain_summary(fallback_records)
                     ),
                 })
         self.checkpoint_manager.delete_checkpoint()

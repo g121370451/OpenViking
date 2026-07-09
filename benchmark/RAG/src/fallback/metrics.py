@@ -247,3 +247,274 @@ def recoverable_miss_summary(records: list[dict]) -> dict:
             len(recoverable) / not_triggered_count if not_triggered_count else 0.0
         ),
     }
+
+
+def _record_label(record: dict) -> str:
+    return (
+        f"sample_id={record.get('sample_id', '')}, "
+        f"query_id={record.get('_global_index', '')}"
+    )
+
+
+def _float_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _phase1_accuracy_for_gain(record: dict, provider_name: str | None = None) -> tuple[float | None, str]:
+    fallback = (record or {}).get("fallback", {}) or {}
+    provider_results = fallback.get("provider_results", {}) or {}
+    selected_provider = provider_name or fallback.get("primary_provider")
+    if selected_provider:
+        provider_result = provider_results.get(selected_provider, {}) or {}
+        provider_metrics = provider_result.get("metrics", {}) or {}
+        if "Accuracy" in provider_metrics:
+            return _float_or_none(provider_metrics.get("Accuracy")), f"provider:{selected_provider}"
+
+    metrics = (record or {}).get("metrics", {}) or {}
+    if "Phase1 Accuracy" in metrics:
+        return _float_or_none(metrics.get("Phase1 Accuracy")), "Phase1 Accuracy"
+    return None, "missing phase1/provider accuracy"
+
+
+def _bot_accuracy_for_gain(record: dict) -> tuple[float | None, str]:
+    fallback = (record or {}).get("fallback", {}) or {}
+    metrics = (record or {}).get("metrics", {}) or {}
+
+    if fallback.get("executed"):
+        if "Accuracy" in metrics:
+            return _float_or_none(metrics.get("Accuracy")), "final bot Accuracy"
+        return None, "fallback executed but final Accuracy is missing"
+
+    shadow_bot = fallback.get("shadow_bot", {}) or {}
+    if not shadow_bot:
+        return None, "fallback not triggered and shadow_bot record is missing"
+    if not shadow_bot.get("executed"):
+        error = shadow_bot.get("error", "")
+        if error:
+            return None, f"shadow bot not executed: {error}"
+        return None, "shadow bot not executed"
+
+    shadow_metrics = shadow_bot.get("metrics", {}) or {}
+    if "Accuracy" not in shadow_metrics:
+        return None, "shadow bot executed but shadow metrics are missing"
+    return _float_or_none(shadow_metrics.get("Accuracy")), "shadow bot Accuracy"
+
+
+def _log_gain_unscored(logger, record: dict, reason: str) -> None:
+    if not logger:
+        return
+    logger.error(
+        f"[FallbackGainMetrics][UNSCORED] {_record_label(record)} | {reason}"
+    )
+
+
+def fallback_gain_judgments(
+    records: list[dict],
+    provider_name: str | None = None,
+    margin: float = 0.0,
+    logger=None,
+) -> list[dict]:
+    judgments = []
+    for record in records:
+        fallback = (record or {}).get("fallback", {}) or {}
+        judged_trigger = bool(
+            fallback.get(
+                "phase1_judge_should_fallback",
+                fallback.get("triggered", False),
+            )
+        )
+        phase1_acc, phase1_source = _phase1_accuracy_for_gain(record, provider_name=provider_name)
+        bot_acc, bot_source = _bot_accuracy_for_gain(record)
+        unscored_reasons = []
+        if phase1_acc is None:
+            unscored_reasons.append(phase1_source)
+        if bot_acc is None:
+            unscored_reasons.append(bot_source)
+
+        if unscored_reasons:
+            reason = "; ".join(unscored_reasons)
+            _log_gain_unscored(logger, record, reason)
+            judgments.append({
+                "record": record,
+                "judged_trigger": judged_trigger,
+                "phase1_accuracy": phase1_acc,
+                "phase1_accuracy_source": phase1_source,
+                "bot_accuracy": bot_acc,
+                "bot_accuracy_source": bot_source,
+                "accuracy_gain": None,
+                "expected_trigger": None,
+                "scored": False,
+                "unscored_reason": reason,
+                "error": False,
+                "error_type": "unscored",
+            })
+            continue
+
+        gain = bot_acc - phase1_acc
+        expected_trigger = gain > margin
+        false_positive = judged_trigger and not expected_trigger
+        false_negative = (not judged_trigger) and expected_trigger
+        if false_positive:
+            error_type = "false_positive"
+        elif false_negative:
+            error_type = "false_negative"
+        elif judged_trigger:
+            error_type = "correct_trigger"
+        else:
+            error_type = "correct_not_trigger"
+
+        judgments.append({
+            "record": record,
+            "judged_trigger": judged_trigger,
+            "phase1_accuracy": phase1_acc,
+            "phase1_accuracy_source": phase1_source,
+            "bot_accuracy": bot_acc,
+            "bot_accuracy_source": bot_source,
+            "accuracy_gain": gain,
+            "expected_trigger": expected_trigger,
+            "scored": True,
+            "unscored_reason": "",
+            "error": false_positive or false_negative,
+            "error_type": error_type,
+        })
+    return judgments
+
+
+def fallback_judgment_gain_summary(
+    records: list[dict],
+    provider_name: str | None = None,
+    margin: float = 0.0,
+    logger=None,
+) -> dict:
+    judgments = fallback_gain_judgments(
+        records,
+        provider_name=provider_name,
+        margin=margin,
+        logger=logger,
+    )
+    scored = [j for j in judgments if j["scored"]]
+    unscored = [j for j in judgments if not j["scored"]]
+    judged_trigger = [j for j in scored if j["judged_trigger"]]
+    judged_not_trigger = [j for j in scored if not j["judged_trigger"]]
+    expected_trigger = [j for j in scored if j["expected_trigger"]]
+    expected_not_trigger = [j for j in scored if not j["expected_trigger"]]
+    false_positive = [j for j in scored if j["error_type"] == "false_positive"]
+    false_negative = [j for j in scored if j["error_type"] == "false_negative"]
+    total_scored = len(scored)
+    error_count = len(false_positive) + len(false_negative)
+    unscored_by_reason: dict[str, int] = {}
+    for j in unscored:
+        reason = j.get("unscored_reason", "unknown")
+        unscored_by_reason[reason] = unscored_by_reason.get(reason, 0) + 1
+
+    return {
+        "Total Records": len(records),
+        "Total Scored Records (records with both Phase1 and Bot Accuracy)": total_scored,
+        "Unscored Count (missing Phase1 or Bot Accuracy)": len(unscored),
+        "Unscored Reasons": unscored_by_reason,
+        "Accuracy Gain Margin": margin,
+        "Triggered Count": len(judged_trigger),
+        "Not Triggered Count": len(judged_not_trigger),
+        "Expected Trigger Count (Bot Accuracy > Phase1 Accuracy + Margin)": len(expected_trigger),
+        "Expected Not Trigger Count (Bot Accuracy <= Phase1 Accuracy + Margin)": len(expected_not_trigger),
+        "False Positive Count (triggered but Bot Accuracy did not improve Phase1)": len(false_positive),
+        "False Negative Count (not triggered but Bot Accuracy would improve Phase1)": len(false_negative),
+        "Judgment Error Count": error_count,
+        "Judgment Error Rate": error_count / total_scored if total_scored else 0.0,
+        "Judgment Accuracy (1 - Judgment Error Rate)": (
+            1.0 - (error_count / total_scored) if total_scored else 0.0
+        ),
+        "Average Phase1 Accuracy": (
+            sum(j["phase1_accuracy"] for j in scored) / total_scored
+            if total_scored else 0.0
+        ),
+        "Average Bot Accuracy": (
+            sum(j["bot_accuracy"] for j in scored) / total_scored
+            if total_scored else 0.0
+        ),
+        "Average Accuracy Gain (Bot - Phase1)": (
+            sum(j["accuracy_gain"] for j in scored) / total_scored
+            if total_scored else 0.0
+        ),
+    }
+
+
+def fallback_miss_gain_summary(
+    records: list[dict],
+    provider_name: str | None = None,
+    margin: float = 0.0,
+    logger=None,
+) -> dict:
+    judgments = fallback_gain_judgments(
+        records,
+        provider_name=provider_name,
+        margin=margin,
+        logger=logger,
+    )
+    scored = [j for j in judgments if j["scored"]]
+    not_triggered = [j for j in scored if not j["judged_trigger"]]
+    misses = [
+        j for j in not_triggered
+        if j["expected_trigger"]
+    ]
+    total_records = len(records)
+    return {
+        "Total Records": total_records,
+        "Total Scored Records (records with both Phase1 and Bot Accuracy)": len(scored),
+        "Unscored Count (missing Phase1 or Bot Accuracy)": len(judgments) - len(scored),
+        "Miss Count (not triggered and Bot Accuracy > Phase1 Accuracy + Margin)": len(misses),
+        "Miss Rate Overall (Miss Count / Total Records)": (
+            len(misses) / total_records if total_records else 0.0
+        ),
+        "Miss Rate Among Scored Records (Miss Count / Scored Records)": (
+            len(misses) / len(scored) if scored else 0.0
+        ),
+        "Miss Rate Among Not Triggered (Miss Count / Not Triggered Count)": (
+            len(misses) / len(not_triggered) if not_triggered else 0.0
+        ),
+    }
+
+
+def recoverable_miss_gain_summary(
+    records: list[dict],
+    provider_name: str | None = None,
+    margin: float = 0.0,
+    logger=None,
+) -> dict:
+    judgments = fallback_gain_judgments(
+        records,
+        provider_name=provider_name,
+        margin=margin,
+        logger=logger,
+    )
+    scored = [j for j in judgments if j["scored"]]
+    recoverable = [
+        j for j in scored
+        if (
+            (not j["judged_trigger"])
+            and j["accuracy_gain"] > 1.0
+        )
+    ]
+    total_records = len(records)
+    avg_gain = (
+        sum(j["accuracy_gain"] for j in recoverable) / len(recoverable)
+        if recoverable else 0.0
+    )
+    return {
+        "Total Records": total_records,
+        "Total Scored Records (records with both Phase1 and Bot Accuracy)": len(scored),
+        "Unscored Count (missing Phase1 or Bot Accuracy)": len(judgments) - len(scored),
+        "Recoverable Miss Count (not triggered, Bot Accuracy > Phase1 Accuracy + Margin)": len(recoverable),
+        "Recoverable Miss Rate Overall (Recoverable Miss Count / Total Records)": (
+            len(recoverable) / total_records if total_records else 0.0
+        ),
+        "Recoverable Miss Rate Among Scored Records (Recoverable Miss Count / Scored Records)": (
+            len(recoverable) / len(scored) if scored else 0.0
+        ),
+        "Average Gain Among Recoverable Misses": avg_gain,
+    }
