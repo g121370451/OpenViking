@@ -7,6 +7,7 @@ adapter:
   class_name: "LegalBenchAdapter"
 
 execution:
+  server_port: 19997
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 5

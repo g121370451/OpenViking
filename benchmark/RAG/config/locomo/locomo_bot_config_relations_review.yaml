@@ -8,6 +8,7 @@ adapter:
   class_name: "LocomoAdapter"
 
 execution:
+  server_port: 20000
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 1

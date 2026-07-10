@@ -8,6 +8,7 @@ adapter:
   class_name: "ClapNQAdapter"
 
 execution:
+  server_port: 19965
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 5

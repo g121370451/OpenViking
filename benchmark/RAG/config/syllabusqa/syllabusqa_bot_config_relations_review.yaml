@@ -8,6 +8,7 @@ adapter:
   class_name: "SyllabusQAAdapter"
 
 execution:
+  server_port: 20018
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 1

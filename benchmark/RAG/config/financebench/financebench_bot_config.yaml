@@ -8,6 +8,7 @@ adapter:
   class_name: "FinanceBenchAdapter"     
 
 execution:
+  server_port: 19974
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 1
