@@ -10,7 +10,12 @@ from litellm import acompletion
 from loguru import logger
 
 from vikingbot.integrations.langfuse import LangfuseClient
-from vikingbot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from vikingbot.providers.base import (
+    LLMProvider,
+    LLMResponse,
+    ToolCallRequest,
+    extract_reasoning_tokens,
+)
 from vikingbot.providers.registry import find_by_model, find_gateway
 from vikingbot.utils.helpers import cal_str_tokens
 
@@ -360,6 +365,9 @@ class LiteLLMProvider(LLMProvider):
                 "completion_tokens": response.usage.completion_tokens,
                 "total_tokens": response.usage.total_tokens,
             }
+            reasoning_tokens = extract_reasoning_tokens(response.usage)
+            if reasoning_tokens is not None:
+                usage["reasoning_tokens"] = reasoning_tokens
 
             # Extract cached tokens from various provider formats
             # OpenAI style: prompt_tokens_details.cached_tokens

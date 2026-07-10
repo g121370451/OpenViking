@@ -24,7 +24,10 @@ execution:
         fallback_on_action_fallback: true
         fallback_on_insufficient: true
         fallback_on_missing_info: true
-        fallback_on_stage2_insufficient: true
+        stage1_context_max_chars_total: 10000
+        stage1_context_max_chars_per_block: 2200
+        stage1_context_head_chars: 500
+        stage1_context_window_chars: 900
       raw_context_naive_rule:
         fallback_on_action_fallback: true
         fallback_on_insufficient: true

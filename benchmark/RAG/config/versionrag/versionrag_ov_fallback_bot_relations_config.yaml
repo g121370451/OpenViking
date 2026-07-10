@@ -25,7 +25,6 @@ execution:
         fallback_on_action_fallback: true
         fallback_on_insufficient: true
         fallback_on_missing_info: true
-        fallback_on_stage2_insufficient: true
 
 vikingbot:
   max_iterations: 15

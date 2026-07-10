@@ -623,6 +623,28 @@ FinanceBench has 3 question types:
 3. Modify the prompt text for the question type(s) you want to improve
 4. Re-run the evaluation with the modified prompts
 
+#### Build Link Relation Storage
+
+Build Link edges, full reasons, historical questions, and question embeddings are stored
+independently from OpenViking's vector database:
+
+```text
+<vector_store>/viking/resources/.relations_store/relations.sqlite3
+```
+
+New writes use SQLite. Legacy `.relations*.jsonl` and `.reference_questions.jsonl` files remain
+readable until migration completes. Migrate an existing store with:
+
+```bash
+python benchmark/RAG/scripts/migrate_relation_store.py \
+  --store-path benchmark/RAG/ov_storage/VersionRAG/VersionRAG_viking_store_index
+```
+
+Migration preserves full reasons and Float64 embedding values, applies global deduplication and
+lossless compression, and does not remove legacy files by default. After checking
+`migration-report.json`, add `--cleanup-legacy` to remove the old JSONL files. Set
+`VIKINGBOT_RELATION_STORE=auto|sqlite|jsonl` to control compatibility reads; the default is `auto`.
+
 ### Adding New Datasets
 
 1. Create a new adapter class in `src/adapters/`, inheriting from `BaseAdapter`

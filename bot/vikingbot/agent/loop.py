@@ -579,11 +579,31 @@ class AgentLoop:
                     )
                 )
 
+            logger.error(
+                f"[LLMThink][REQUEST] stage=agent_loop iteration={iteration} "
+                f"model={self.model} thinking_requested=provider_default "
+                "explicit_thinking_param=false"
+            )
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(ov_tools_enable=ov_tools_enable),
                 model=self.model,
                 session_id=session_key.safe_name(),
+                thinking={"type": "disabled"},
+            )
+            reasoning_content = response.reasoning_content or ""
+            reasoning_tokens = (response.usage or {}).get("reasoning_tokens")
+            thinking_observed = (
+                "yes"
+                if reasoning_content or (reasoning_tokens is not None and reasoning_tokens > 0)
+                else "unknown"
+            )
+            logger.error(
+                f"[LLMThink][RESPONSE] stage=agent_loop iteration={iteration} "
+                f"model={self.model} thinking_observed={thinking_observed} "
+                f"reasoning_content_present={bool(reasoning_content)} "
+                f"reasoning_chars={len(reasoning_content)} "
+                f"reasoning_tokens={reasoning_tokens if reasoning_tokens is not None else 'unavailable'}"
             )
             if response.usage:
                 cur_token = response.usage
@@ -715,15 +735,24 @@ class AgentLoop:
                 final_content = "I've completed processing but have no response to give."
 
         # --- LLM Review 建边 ---
+        # Use a monotonic clock for the complete build-link wall time.  The
+        # benchmark consumes the dedicated metric record appended at the end;
+        # it is intentionally separate from openviking_link edge records.
+        _build_link_start_ns = time.perf_counter_ns()
+        _build_link_tool_start_index = len(tools_used)
+        _build_link_failed = False
         _enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
         original_query = _extract_original_query_from_messages(messages)
+        _build_link_attempted = bool(
+            _enable_linking == "1" and tools_used and original_query
+        )
 
         logger.info(
             f"[LLMReview] gate check: strategy=llm_review, enable={_enable_linking}, "
             f"tools_used={len(tools_used) if tools_used else 0}, "
             f"original_query={bool(original_query)}"
         )
-        if _enable_linking == "1" and tools_used and original_query:
+        if _build_link_attempted:
             _post_link_start = time.time()
             relation_derived_uris = _collect_relation_derived_uris(tools_used)
             if relation_derived_uris:
@@ -890,6 +919,22 @@ class AgentLoop:
                             extra_body=_review_extra_body,
                         )
                         _llm_review_duration = (time.time() - _llm_review_start) * 1000
+
+                        review_reasoning_content = review_response.reasoning_content or ""
+                        review_reasoning_tokens = (review_response.usage or {}).get("reasoning_tokens")
+                        thinking_observed = (
+                            "yes"
+                            if review_reasoning_content or (review_reasoning_tokens is not None and review_reasoning_tokens > 0)
+                            else "unknown"
+                        )
+                        logger.error(
+                            f"[LLMReview][RESPONSE]"
+                            f"model={self.model} thinking_observed={thinking_observed} "
+                            f"reasoning_content_present={bool(review_reasoning_content)} "
+                            f"reasoning_chars={len(review_reasoning_content)} "
+                            f"reasoning_tokens={review_reasoning_tokens if review_reasoning_tokens is not None else 'unavailable'}"
+                        )
+
                         logger.info(f"[LLMReview][TIMING] LLM review call took {_llm_review_duration:.0f}ms")
 
                     review_usage = review_response.usage or {}
@@ -1325,6 +1370,7 @@ class AgentLoop:
                             },
                         })
                 except Exception:
+                    _build_link_failed = True
                     _post_link_duration = (time.time() - _post_link_start) * 1000
                     _input_parse_for_error = locals().get(
                         "_input_parse_duration",
@@ -1362,6 +1408,61 @@ class AgentLoop:
                         "skipped=no_review_candidates"
                     ),
                 )
+
+        if _build_link_attempted:
+            # Measure after every terminal path (including client cleanup), so
+            # no-candidate and exception attempts are not lost from averages.
+            _build_link_total_ms = (
+                time.perf_counter_ns() - _build_link_start_ns
+            ) / 1_000_000
+            _new_link_records = [
+                tool
+                for tool in tools_used[_build_link_tool_start_index:]
+                if isinstance(tool, dict)
+                and tool.get("tool_name") == "openviking_link"
+            ]
+            _build_link_pairs_requested = 0
+            _build_link_pairs_created = 0
+            for _link_record in _new_link_records:
+                _link_args = _link_record.get("args", {})
+                if isinstance(_link_args, dict):
+                    _from_count = len(_link_args.get("from_uris", []) or [])
+                    _to_count = len(_link_args.get("to_uris", []) or [])
+                    _build_link_pairs_requested += _from_count * _to_count
+                _build_link_pairs_created += int(
+                    _link_record.get("relations_found", 0) or 0
+                )
+
+            if _build_link_failed:
+                _build_link_status = "error"
+            elif _build_link_pairs_created > 0:
+                _build_link_status = "created"
+            elif _new_link_records:
+                _build_link_status = "completed_no_edges"
+            else:
+                _build_link_status = "no_review_candidates"
+
+            tools_used.append({
+                "tool_name": "openviking_build_link_metrics",
+                "args": {
+                    "attempted": True,
+                    "status": _build_link_status,
+                    "link_pairs_requested": _build_link_pairs_requested,
+                    "link_pairs_created": _build_link_pairs_created,
+                    "boundary": "llm_review_marker_to_block_end",
+                },
+                "reasoning": "(build_link timing metric)",
+                "result": "",
+                "duration": round(_build_link_total_ms, 3),
+                "execute_success": not _build_link_failed,
+                "relations_found": _build_link_pairs_created,
+            })
+            logger.info(
+                f"[BuildLink][METRIC] status={_build_link_status}, "
+                f"total_ms={_build_link_total_ms:.0f}, "
+                f"pairs_requested={_build_link_pairs_requested}, "
+                f"pairs_created={_build_link_pairs_created}"
+            )
 
         return final_content, tools_used, token_usage, iteration, messages
 

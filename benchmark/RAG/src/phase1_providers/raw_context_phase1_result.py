@@ -1,36 +1,32 @@
-import json
 import re
 from typing import Any
 
-from core.response_parser import LLMResponse, parse_llm_response
+from core.response_parser import LLMResponse
 
 from .base import Phase1Provider, Phase1ProviderResult, default_supplemental, timed
 
 
-EVIDENCE_SUFFICIENCY_PROMPT = """You are judging whether the retrieved context contains enough direct evidence to answer the question. Do not answer the question yet.
+EVIDENCE_SUFFICIENCY_PROMPT = """Act as a strict evidence auditor and answerer.
 
-Task:
-1. Internally check every required part of the question: answer type, entity, scope, date, version, count, comparison target, yes/no condition, and any other constraint.
-2. Select only evidence that directly supports those required parts.
-3. Decide whether the selected evidence is sufficient to answer the question without guessing.
+Before answering, break the question into its required entities, constraints, comparison items, and reasoning hops. Select direct context evidence for every requirement, then decide whether it is sufficient without guessing.
 
 Rules:
-- Context relevance is not enough. The evidence must directly support every required part.
-- Similar-but-different entities, versions, dates, counts, names, or scopes are not sufficient.
-- If the answer requires a number, date, version, name, location, yes/no conclusion, or comparison result, that exact value or conclusion must be directly supported by selected evidence.
-- If any required part is missing, weakly supported, inferred, ambiguous, or conflicting, set "sufficient" to false.
-- Do not use external knowledge.
-- Do not answer the question in this stage.
+- Relevance alone is insufficient; exact names, values, dates, scopes, and conclusions must be supported.
+- If anything is missing, inferred, ambiguous, or conflicting, set "sufficient" to false.
+- Use no external knowledge.
+- Select the minimum set of short exact quotes. Prefer at most 3 quotes, but completeness overrides this preference.
+- If "sufficient" is true, answer using only the selected evidence.
+- If "sufficient" is false, set "answer" to "Not mentioned".
 
-Question-type checklist:
-- Definition questions: selected evidence must include the definition text itself. If exclusions, aliases, variants, or scope limits are needed to make the definition complete, they must also be selected.
-- Yes/no questions: selected evidence must directly support the yes or no conclusion. Related context alone is not enough. A negative answer is valid only when the selected evidence covers the requested scope and supports absence, non-existence, non-mention, or no-change.
-- Location, source, or section questions: selected evidence must identify both the requested location/source/section and enough nearby content to verify it is the right one.
-- Comparison questions: selected evidence must cover every compared item and the comparison criterion.
-- Change, version, or temporal questions: selected evidence must cover the relevant version/time scope and either the before/after change or an explicit no-change/absence conclusion.
-- Multi-hop questions: selected evidence must cover every required hop and the link between hops.
-- List/count questions: selected evidence must support the complete set or count, not just examples.
-- Information-about or open-ended questions: selected evidence must cover the main facts requested by the question and any important conditions, limitations, exceptions, or triggers required to avoid a misleading partial answer.
+Question-type checklist (apply every relevant item):
+- Definition: include the definition itself and any required exclusion, alias, variant, or scope limit.
+- Yes/no: directly support the conclusion; a negative requires evidence covering the requested scope and supporting absence, non-existence, non-mention, or no-change.
+- Location/source/section: identify the requested place/source/section and enough nearby content to verify it.
+- Comparison: cover every compared item and the comparison criterion.
+- Change/version/time: cover the relevant time or version and the change, or explicit absence/no-change.
+- Multi-hop: cover every required hop and the links between hops.
+- List/count: support the complete set or count, not only examples.
+- Open-ended/information-about: cover the main requested facts and necessary conditions, limits, exceptions, or triggers.
 
 Return JSON only:
 {
@@ -42,25 +38,11 @@ Return JSON only:
     }
   ],
   "missing_info": ["<missing or unsupported required part>"],
+  "answer": "<final answer or Not mentioned>",
   "reasoning": "<one short sentence>"
 }
 
-Do not include requirements, why_relevant, supports, or any extra fields in the output JSON."""
-
-
-SELECTED_EVIDENCE_ANSWER_PROMPT = """Answer the question using only the selected evidence below.
-
-Rules:
-- Do not use the original retrieved context.
-- Do not use external knowledge.
-- Do not add facts that are not directly supported by the selected evidence.
-- If the selected evidence does not support the answer, set "answer" to "Not mentioned".
-
-Return JSON only:
-{
-  "answer": "<final answer or Not mentioned>",
-  "reasoning": "<one short sentence explaining the support>"
-}"""
+Return only this JSON object with no extra fields."""
 
 
 class RawContextPhase1ResultProvider(Phase1Provider):
@@ -69,10 +51,13 @@ class RawContextPhase1ResultProvider(Phase1Provider):
     def run(self, qa, search_res: dict, **kwargs) -> Phase1ProviderResult:
         start = timed()
         provider_cfg = self.provider_config()
-        sample_id = str(kwargs.get("sample_id", "") or "")
 
         stage1_prompt_start = timed()
-        stage1_prompt = self._build_evidence_sufficiency_prompt(qa, search_res)
+        stage1_prompt, stage1_prompt_meta = self._build_evidence_sufficiency_prompt(
+            qa,
+            search_res,
+            provider_cfg,
+        )
         stage1_prompt_build_latency = timed() - stage1_prompt_start
 
         stage1_start = timed()
@@ -85,14 +70,6 @@ class RawContextPhase1ResultProvider(Phase1Provider):
         stage1_regex_recovered = False
         stage1_sufficient_regex_found = False
         stage1_used_raw_context_for_answer = False
-        if stage1_obj is None:
-            (
-                stage1_obj,
-                stage1_parse_error,
-                stage1_regex_recovered,
-                stage1_sufficient_regex_found,
-                stage1_used_raw_context_for_answer,
-            ) = self._recover_stage1_from_sufficient_regex(stage1_raw, search_res, stage1_parse_error)
         stage1 = self._normalize_stage1(stage1_obj)
         stage1_parse_latency = timed() - stage1_parse_start
 
@@ -101,6 +78,12 @@ class RawContextPhase1ResultProvider(Phase1Provider):
         missing_info = stage1["missing_info"]
         stage1_sufficient = bool(stage1["sufficient"])
         parse_trigger = stage1_obj is None
+        answer = self.adapter.post_process_answer(qa, stage1["answer"], {})
+        action_text = str((stage1_obj or {}).get("action", "answer") or "answer").strip().lower()
+        action_trigger = (
+            self.config_bool(provider_cfg.get("fallback_on_action_fallback"), True)
+            and action_text == "fallback"
+        )
         missing_info_trigger = bool(missing_info) and self.config_bool(
             provider_cfg.get("fallback_on_missing_info"),
             True,
@@ -110,75 +93,44 @@ class RawContextPhase1ResultProvider(Phase1Provider):
             self.config_bool(provider_cfg.get("fallback_on_insufficient"), True)
             and not stage1_sufficient
         )
-        stage1_triggered = (
+        refusal_trigger = stage1_sufficient and self.is_refusal_like(answer)
+        triggered = (
             parse_trigger
+            or action_trigger
             or missing_info_trigger
             or no_evidence_trigger
             or insufficient_trigger
+            or refusal_trigger
         )
         stage1_decision_latency = timed() - stage1_decision_start
 
+        # Compatibility fields retained for historical reports.  This provider
+        # now performs exactly one LLM request and never runs a second stage.
         stage2_prompt = ""
         stage2_raw = ""
         stage2_latency = 0.0
         stage2_prompt_build_latency = 0.0
         stage2_parse_postprocess_latency = 0.0
-        stage2_parsed = parse_llm_response("")
-        answer = "Not mentioned"
-        action_trigger = False
         stage2_refusal_trigger = False
         stage2_insufficient_trigger = False
 
-        if not stage1_triggered:
-            stage2_prompt_build_start = timed()
-            stage2_prompt, stage2_meta = self._build_selected_evidence_answer_prompt(qa, selected_evidence)
-            stage2_prompt_build_latency = timed() - stage2_prompt_build_start
-
-            stage2_start = timed()
-            stage2_raw = self.llm.generate(stage2_prompt)
-            stage2_latency = timed() - stage2_start
-
-            stage2_parse_start = timed()
-            stage2_parsed = parse_llm_response(stage2_raw)
-            answer = self.adapter.post_process_answer(qa, stage2_parsed.answer, stage2_meta)
-            action_text = str(stage2_parsed.action or "answer").strip().lower()
-            action_trigger = (
-                self.config_bool(provider_cfg.get("fallback_on_action_fallback"), True)
-                and action_text == "fallback"
-            )
-            stage2_insufficient_trigger = (
-                self.config_bool(provider_cfg.get("fallback_on_stage2_insufficient"), True)
-                and not bool(stage2_parsed.sufficient)
-            )
-            stage2_refusal_trigger = self.is_refusal_like(answer)
-            stage2_parse_postprocess_latency = timed() - stage2_parse_start
-
         final_build_start = timed()
-        triggered = (
-            stage1_triggered
-            or action_trigger
-            or stage2_insufficient_trigger
-            or stage2_refusal_trigger
-        )
         if parse_trigger:
-            reasoning = f"Evidence sufficiency output could not be parsed: {stage1_parse_error}"
+            reasoning = f"Strict evidence output could not be parsed: {stage1_parse_error}"
+        elif action_trigger:
+            reasoning = "Strict evidence request explicitly routed to fallback."
         elif insufficient_trigger:
             reasoning = stage1["reasoning"] or "Selected evidence is insufficient."
         elif missing_info_trigger:
-            reasoning = "Evidence sufficiency stage reported missing information."
+            reasoning = "Strict evidence audit reported missing information."
         elif no_evidence_trigger:
-            reasoning = "Evidence sufficiency stage selected no direct evidence."
-        elif action_trigger:
-            reasoning = "Selected-evidence answer stage routed to fallback."
-        elif stage2_insufficient_trigger:
-            reasoning = "Selected-evidence answer stage marked the answer insufficient."
-        elif stage2_refusal_trigger:
-            reasoning = "Selected-evidence answer stage produced a refusal-like answer."
+            reasoning = "Strict evidence audit selected no direct evidence."
+        elif refusal_trigger:
+            reasoning = "Strict evidence request produced a refusal-like answer."
         else:
-            reasoning = stage2_parsed.reasoning or stage1["reasoning"] or "Selected evidence supports the answer."
+            reasoning = stage1["reasoning"] or "Selected evidence supports the answer."
 
         final_answer = "Not mentioned" if triggered else answer
-        combined_raw = self._combined_raw(stage1_raw, stage2_raw)
         parsed = LLMResponse(
             action="fallback" if triggered else "answer",
             sufficient=not triggered,
@@ -186,18 +138,18 @@ class RawContextPhase1ResultProvider(Phase1Provider):
             reasoning=reasoning,
             evidence_analysis=self._evidence_analysis(selected_evidence, missing_info),
             missing_info=missing_info if triggered else [],
-            raw=combined_raw,
+            raw=stage1_raw,
         )
 
-        full_prompt = self._combined_prompt(stage1_prompt, stage2_prompt)
-        raw = combined_raw
+        full_prompt = stage1_prompt
+        raw = stage1_raw
         final_build_latency = timed() - final_build_start
 
         token_count_start = timed()
         stage1_input_tokens = self.count_tokens(stage1_prompt)
         stage1_output_tokens = self.count_tokens(stage1_raw)
-        stage2_input_tokens = self.count_tokens(stage2_prompt)
-        stage2_output_tokens = self.count_tokens(stage2_raw)
+        stage2_input_tokens = 0
+        stage2_output_tokens = 0
         token_count_latency = timed() - token_count_start
         total_latency = timed() - start
         measured_latency = (
@@ -205,9 +157,6 @@ class RawContextPhase1ResultProvider(Phase1Provider):
             + stage1_latency
             + stage1_parse_latency
             + stage1_decision_latency
-            + stage2_prompt_build_latency
-            + stage2_latency
-            + stage2_parse_postprocess_latency
             + final_build_latency
             + token_count_latency
         )
@@ -217,36 +166,6 @@ class RawContextPhase1ResultProvider(Phase1Provider):
         stage2_prompt_chars = len(stage2_prompt or "")
         stage2_raw_chars = len(stage2_raw or "")
         selected_evidence_chars = sum(len(x or "") for x in selected_evidence)
-        # self._log_stage_profile(
-        #     sample_id=sample_id,
-        #     total_latency=total_latency,
-        #     stage1_prompt_build_latency=stage1_prompt_build_latency,
-        #     stage1_latency=stage1_latency,
-        #     stage1_parse_latency=stage1_parse_latency,
-        #     stage1_decision_latency=stage1_decision_latency,
-        #     stage2_prompt_build_latency=stage2_prompt_build_latency,
-        #     stage2_latency=stage2_latency,
-        #     stage2_parse_postprocess_latency=stage2_parse_postprocess_latency,
-        #     final_build_latency=final_build_latency,
-        #     token_count_latency=token_count_latency,
-        #     profile_other_latency=profile_other_latency,
-        #     stage1_input_tokens=stage1_input_tokens,
-        #     stage1_output_tokens=stage1_output_tokens,
-        #     stage2_input_tokens=stage2_input_tokens,
-        #     stage2_output_tokens=stage2_output_tokens,
-        #     stage1_prompt_chars=stage1_prompt_chars,
-        #     stage1_raw_chars=stage1_raw_chars,
-        #     stage2_prompt_chars=stage2_prompt_chars,
-        #     stage2_raw_chars=stage2_raw_chars,
-        #     selected_evidence_chars=selected_evidence_chars,
-        #     selected_evidence_count=len(selected_evidence),
-        #     stage2_ran=bool(stage2_prompt),
-        #     triggered=triggered,
-        #     stage1_json_parse_failed=stage1_json_parse_failed,
-        #     stage1_regex_recovered=stage1_regex_recovered,
-        #     stage1_sufficient_regex_found=stage1_sufficient_regex_found,
-        #     stage1_used_raw_context_for_answer=stage1_used_raw_context_for_answer,
-        # )
 
         return Phase1ProviderResult(
             name=self.name,
@@ -258,30 +177,28 @@ class RawContextPhase1ResultProvider(Phase1Provider):
             prompt=full_prompt,
             raw=raw,
             meta={
-                "phase1_provider_mode": "two_stage_evidence_sufficiency",
+                "phase1_provider_mode": "single_stage_strict_evidence_answer",
                 "stage1_sufficient": stage1_sufficient,
-                "stage2_ran": bool(stage2_prompt),
+                "stage2_ran": False,
             },
-            supplemental=default_supplemental("Two-stage evidence sufficiency provider"),
+            supplemental=default_supplemental("Single-stage strict evidence provider"),
             input_tokens=stage1_input_tokens + stage2_input_tokens,
             output_tokens=stage1_output_tokens + stage2_output_tokens,
             latency_sec=total_latency,
             details={
-                "rule": "two_stage_evidence_sufficiency_then_answer",
+                "rule": "single_stage_strict_evidence_answer",
+                "llm_call_count": 1,
                 "fallback_on_insufficient": self.config_bool(provider_cfg.get("fallback_on_insufficient"), True),
                 "fallback_on_missing_info": self.config_bool(provider_cfg.get("fallback_on_missing_info"), True),
                 "fallback_on_action_fallback": self.config_bool(provider_cfg.get("fallback_on_action_fallback"), True),
-                "fallback_on_stage2_insufficient": self.config_bool(
-                    provider_cfg.get("fallback_on_stage2_insufficient"),
-                    True,
-                ),
+                "fallback_on_stage2_insufficient": False,
                 "stage1_parse_error": stage1_parse_error,
                 "stage1_json_parse_failed": stage1_json_parse_failed,
                 "stage1_regex_recovered": stage1_regex_recovered,
                 "stage1_sufficient_regex_found": stage1_sufficient_regex_found,
                 "stage1_used_raw_context_for_answer": stage1_used_raw_context_for_answer,
                 "stage1_sufficient": stage1_sufficient,
-                "stage1_triggered": stage1_triggered,
+                "stage1_triggered": triggered,
                 "stage1_prompt_build_latency_sec": stage1_prompt_build_latency,
                 "stage1_latency_sec": stage1_latency,
                 "stage1_parse_latency_sec": stage1_parse_latency,
@@ -289,8 +206,9 @@ class RawContextPhase1ResultProvider(Phase1Provider):
                 "stage1_input_tokens": stage1_input_tokens,
                 "stage1_output_tokens": stage1_output_tokens,
                 "stage1_prompt_chars": stage1_prompt_chars,
+                **stage1_prompt_meta,
                 "stage1_raw_chars": stage1_raw_chars,
-                "stage2_ran": bool(stage2_prompt),
+                "stage2_ran": False,
                 "stage2_prompt_build_latency_sec": stage2_prompt_build_latency,
                 "stage2_latency_sec": stage2_latency,
                 "stage2_parse_postprocess_latency_sec": stage2_parse_postprocess_latency,
@@ -305,134 +223,73 @@ class RawContextPhase1ResultProvider(Phase1Provider):
                 "selected_evidence_chars": selected_evidence_chars,
                 "selected_evidence": selected_evidence,
                 "missing_info": missing_info,
+                "answer_chars": len(answer or ""),
                 "parse_trigger": parse_trigger,
                 "insufficient_trigger": insufficient_trigger,
                 "missing_info_trigger": missing_info_trigger,
                 "no_evidence_trigger": no_evidence_trigger,
                 "action_trigger": action_trigger,
+                "refusal_trigger": refusal_trigger,
                 "stage2_insufficient_trigger": stage2_insufficient_trigger,
                 "stage2_refusal_trigger": stage2_refusal_trigger,
             },
         )
 
-    def _log_stage_profile(
+    def _build_evidence_sufficiency_prompt(
         self,
-        *,
-        sample_id: str,
-        total_latency: float,
-        stage1_prompt_build_latency: float,
-        stage1_latency: float,
-        stage1_parse_latency: float,
-        stage1_decision_latency: float,
-        stage2_prompt_build_latency: float,
-        stage2_latency: float,
-        stage2_parse_postprocess_latency: float,
-        final_build_latency: float,
-        token_count_latency: float,
-        profile_other_latency: float,
-        stage1_input_tokens: int,
-        stage1_output_tokens: int,
-        stage2_input_tokens: int,
-        stage2_output_tokens: int,
-        stage1_prompt_chars: int,
-        stage1_raw_chars: int,
-        stage2_prompt_chars: int,
-        stage2_raw_chars: int,
-        selected_evidence_chars: int,
-        selected_evidence_count: int,
-        stage2_ran: bool,
-        triggered: bool,
-        stage1_json_parse_failed: bool,
-        stage1_regex_recovered: bool,
-        stage1_sufficient_regex_found: bool,
-        stage1_used_raw_context_for_answer: bool,
-    ) -> None:
-        total_input_tokens = int(stage1_input_tokens or 0) + int(stage2_input_tokens or 0)
-        total_output_tokens = int(stage1_output_tokens or 0) + int(stage2_output_tokens or 0)
-
-        def ms(value: float) -> int:
-            return int(round(float(value or 0.0) * 1000))
-
-        message = (
-            "[RawContextPhase1Result][STAGE_PROFILE] "
-            f"sample_id={sample_id}, "
-            f"total_ms={ms(total_latency)}, "
-            f"stage1_prompt_build_ms={ms(stage1_prompt_build_latency)}, "
-            f"stage1_llm_ms={ms(stage1_latency)}, "
-            f"stage1_parse_ms={ms(stage1_parse_latency)}, "
-            f"stage1_decision_ms={ms(stage1_decision_latency)}, "
-            f"stage2_prompt_build_ms={ms(stage2_prompt_build_latency)}, "
-            f"stage2_llm_ms={ms(stage2_latency)}, "
-            f"stage2_parse_postprocess_ms={ms(stage2_parse_postprocess_latency)}, "
-            f"final_build_ms={ms(final_build_latency)}, "
-            f"token_count_ms={ms(token_count_latency)}, "
-            f"other_ms={ms(profile_other_latency)}, "
-            f"stage1_input_tokens={int(stage1_input_tokens or 0)}, "
-            f"stage1_output_tokens={int(stage1_output_tokens or 0)}, "
-            f"stage2_input_tokens={int(stage2_input_tokens or 0)}, "
-            f"stage2_output_tokens={int(stage2_output_tokens or 0)}, "
-            f"total_input_tokens={total_input_tokens}, "
-            f"total_output_tokens={total_output_tokens}, "
-            f"stage1_prompt_chars={stage1_prompt_chars}, "
-            f"stage1_raw_chars={stage1_raw_chars}, "
-            f"stage2_prompt_chars={stage2_prompt_chars}, "
-            f"stage2_raw_chars={stage2_raw_chars}, "
-            f"selected_evidence_count={selected_evidence_count}, "
-            f"selected_evidence_chars={selected_evidence_chars}, "
-            f"stage2_ran={stage2_ran}, "
-            f"triggered={triggered}, "
-            f"stage1_json_parse_failed={stage1_json_parse_failed}, "
-            f"stage1_regex_recovered={stage1_regex_recovered}, "
-            f"stage1_sufficient_regex_found={stage1_sufficient_regex_found}, "
-            f"stage1_used_raw_context_for_answer={stage1_used_raw_context_for_answer}"
+        qa,
+        search_res: dict,
+        provider_cfg: dict | None = None,
+    ) -> tuple[str, dict]:
+        context_text, context_meta = self._format_search_context(
+            search_res,
+            question=str(qa.question or ""),
+            provider_cfg=provider_cfg,
         )
-        if self.logger:
-            self.logger.error(message)
-        else:
-            print(message)
-
-    def _build_evidence_sufficiency_prompt(self, qa, search_res: dict) -> str:
-        context_text = self._format_search_context(search_res)
         # Adapter-specific evidence guidance is intentionally disabled here so
         # the provider can be evaluated as a dataset-agnostic reviewer.
         selection_block = ""
         sufficiency_block = ""
         return (
-            f"Retrieved context:\n{context_text}\n\n"
-            f"{selection_block}"
-            f"{sufficiency_block}"
-            f"{EVIDENCE_SUFFICIENCY_PROMPT}\n\n"
-            f"Question: {qa.question}"
+            (
+                f"Retrieved context:\n{context_text}\n\n"
+                f"{selection_block}"
+                f"{sufficiency_block}"
+                f"{EVIDENCE_SUFFICIENCY_PROMPT}\n\n"
+                f"Question: {qa.question}"
+            ),
+            context_meta,
         )
 
-    def _build_selected_evidence_answer_prompt(self, qa, selected_evidence: list[str]) -> tuple[str, dict]:
-        evidence_blocks = [
-            f"[Selected evidence {idx}]\n{evidence}"
-            for idx, evidence in enumerate(selected_evidence, start=1)
-        ]
-        build_prompt = getattr(self.adapter, "build_prompt", None)
-        if callable(build_prompt):
-            return build_prompt(qa, evidence_blocks)
-
-        evidence_text = "\n\n".join(evidence_blocks)
-        return (
-            f"Selected evidence:\n{evidence_text}\n\n"
-            f"{SELECTED_EVIDENCE_ANSWER_PROMPT}\n\n"
-            f"Question: {qa.question}",
-            {},
+    def _format_search_context(
+        self,
+        search_res: dict,
+        *,
+        question: str = "",
+        provider_cfg: dict | None = None,
+    ) -> tuple[str, dict]:
+        provider_cfg = provider_cfg or {}
+        max_total_chars = self._config_int(
+            provider_cfg.get("stage1_context_max_chars_total"),
+            0,
+        )
+        max_block_chars = self._config_int(
+            provider_cfg.get("stage1_context_max_chars_per_block"),
+            0,
+        )
+        head_chars = self._config_int(
+            provider_cfg.get("stage1_context_head_chars"),
+            500,
+        )
+        window_chars = self._config_int(
+            provider_cfg.get("stage1_context_window_chars"),
+            900,
         )
 
-    def _adapter_instruction(self, hook_name: str, qa) -> str:
-        hook = getattr(self.adapter, hook_name, None)
-        if not callable(hook):
-            return ""
-        return str(hook(qa) or "").strip()
-
-    def _format_search_context(self, search_res: dict) -> str:
         recall_texts = search_res.get("recall_texts", {}) or {}
         retrieved_uris = list(search_res.get("retrieved_uris", []) or [])
         if retrieved_uris and recall_texts:
-            blocks = []
+            sources: list[tuple[str, str]] = []
             seen = set()
             for uri in retrieved_uris:
                 if uri in seen:
@@ -440,75 +297,170 @@ class RawContextPhase1ResultProvider(Phase1Provider):
                 seen.add(uri)
                 content = str(recall_texts.get(uri, "") or "").strip()
                 if content:
-                    blocks.append(f"[Context block {len(blocks) + 1}]\nURI: {uri}\n{content[:8000]}")
-            if blocks:
-                return "\n\n".join(blocks)
+                    sources.append((str(uri), content[:8000]))
+            if sources:
+                return self._format_context_sources(
+                    sources,
+                    question=question,
+                    max_total_chars=max_total_chars,
+                    max_block_chars=max_block_chars,
+                    head_chars=head_chars,
+                    window_chars=window_chars,
+                )
 
         context_blocks = self.context_blocks(search_res)
         if not context_blocks:
-            return "No retrieved context."
-        return "\n\n".join(
-            f"[Context block {idx}]\n{block}"
-            for idx, block in enumerate(context_blocks, start=1)
+            return "No retrieved context.", {
+                "stage1_context_block_count": 0,
+                "stage1_context_original_chars": 0,
+                "stage1_context_chars": len("No retrieved context."),
+                "stage1_context_compacted": False,
+                "stage1_context_reduction_pct": 0.0,
+                "stage1_context_max_chars_total": max_total_chars,
+                "stage1_context_max_chars_per_block": max_block_chars,
+            }
+        return self._format_context_sources(
+            [("", block) for block in context_blocks],
+            question=question,
+            max_total_chars=max_total_chars,
+            max_block_chars=max_block_chars,
+            head_chars=head_chars,
+            window_chars=window_chars,
         )
 
-    def _recover_stage1_from_sufficient_regex(
+    def _format_context_sources(
         self,
-        raw: str,
-        search_res: dict,
-        parse_error: str,
-    ) -> tuple[dict, str, bool, bool, bool]:
-        found, sufficient = self._regex_sufficient(raw)
-        selected_evidence = self._raw_context_evidence(search_res) if found and sufficient else []
-        used_raw_context = bool(selected_evidence)
-        missing_info = [] if sufficient else ["Evidence sufficiency output could not be parsed as JSON."]
-        obj = {
-            "sufficient": bool(sufficient) if found else False,
-            "selected_evidence": selected_evidence,
-            "missing_info": missing_info,
-            "reasoning": (
-                "Recovered sufficient=true from malformed stage1 JSON; using original context blocks as answer evidence."
-                if used_raw_context
-                else "Stage1 JSON could not be parsed and sufficient=true was not recoverable."
-            ),
+        sources: list[tuple[str, str]],
+        *,
+        question: str,
+        max_total_chars: int,
+        max_block_chars: int,
+        head_chars: int,
+        window_chars: int,
+    ) -> tuple[str, dict]:
+        original_chars = sum(len(content) for _, content in sources)
+        effective_block_limit = max_block_chars
+        if max_total_chars > 0:
+            fair_share = max(300, max_total_chars // max(len(sources), 1))
+            effective_block_limit = (
+                min(effective_block_limit, fair_share)
+                if effective_block_limit > 0
+                else fair_share
+            )
+
+        blocks = []
+        any_compacted = False
+        for idx, (uri, content) in enumerate(sources, start=1):
+            compacted = self._compact_context_content(
+                content,
+                question=question,
+                max_chars=effective_block_limit,
+                head_chars=head_chars,
+                window_chars=window_chars,
+            )
+            any_compacted = any_compacted or len(compacted) < len(content)
+            uri_line = f"\nURI: {uri}" if uri else ""
+            blocks.append(f"[Context block {idx}]{uri_line}\n{compacted}")
+
+        context_text = "\n\n".join(blocks)
+        reduction_pct = (
+            max(0.0, (1.0 - len(context_text) / original_chars) * 100.0)
+            if original_chars > 0 else 0.0
+        )
+        return context_text, {
+            "stage1_context_block_count": len(sources),
+            "stage1_context_original_chars": original_chars,
+            "stage1_context_chars": len(context_text),
+            "stage1_context_compacted": any_compacted,
+            "stage1_context_reduction_pct": reduction_pct,
+            "stage1_context_max_chars_total": max_total_chars,
+            "stage1_context_max_chars_per_block": effective_block_limit,
         }
-        recovery_note = (
-            f"regex sufficient fallback after {parse_error}; "
-            f"sufficient_found={found}; sufficient={bool(sufficient) if found else False}; "
-            f"used_raw_context={used_raw_context}"
-        )
-        return obj, recovery_note, True, found, used_raw_context
 
-    def _regex_sufficient(self, raw: str) -> tuple[bool, bool]:
-        match = re.search(
-            r"""["']?sufficient["']?\s*:\s*(true|false)""",
-            raw or "",
-            re.IGNORECASE,
-        )
-        if not match:
-            return False, False
-        return True, match.group(1).lower() == "true"
+    def _compact_context_content(
+        self,
+        content: str,
+        *,
+        question: str,
+        max_chars: int,
+        head_chars: int,
+        window_chars: int,
+    ) -> str:
+        text = str(content or "").strip()
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
 
-    def _raw_context_evidence(self, search_res: dict) -> list[str]:
-        recall_texts = search_res.get("recall_texts", {}) or {}
-        retrieved_uris = list(search_res.get("retrieved_uris", []) or [])
-        if retrieved_uris and recall_texts:
-            evidence = []
-            seen = set()
-            for uri in retrieved_uris:
-                if uri in seen:
-                    continue
-                seen.add(uri)
-                content = str(recall_texts.get(uri, "") or "").strip()
-                if content:
-                    evidence.append(f"URI: {uri}\n{content[:8000]}")
-            if evidence:
-                return evidence
+        head_end = min(len(text), max(0, min(head_chars, max_chars)))
+        spans: list[tuple[int, int]] = [(0, head_end)] if head_end else []
+        terms = self._question_terms(question)
+        lowered = text.lower()
+        candidates = []
+        half_window = max(100, window_chars // 2)
+        for term in terms:
+            start = 0
+            while True:
+                pos = lowered.find(term, start)
+                if pos < 0:
+                    break
+                left = max(0, pos - half_window)
+                right = min(len(text), pos + len(term) + half_window)
+                window = lowered[left:right]
+                score = sum(1 for candidate in terms if candidate in window)
+                candidates.append((score, pos, left, right))
+                start = pos + len(term)
 
-        return [
-            f"Context block {idx}\n{block}"
-            for idx, block in enumerate(self.context_blocks(search_res), start=1)
-        ]
+        used_chars = sum(right - left for left, right in spans)
+        for _, pos, left, right in sorted(candidates, key=lambda item: (-item[0], item[1])):
+            if any(kept_left <= pos < kept_right for kept_left, kept_right in spans):
+                continue
+            for kept_left, kept_right in sorted(spans):
+                if kept_right <= pos and kept_right > left:
+                    left = kept_right
+                elif kept_left > pos and kept_left < right:
+                    right = kept_left
+            remaining = max_chars - used_chars
+            if remaining <= 0:
+                break
+            if right <= left:
+                continue
+            if right - left > remaining:
+                left = max(left, min(pos - remaining // 2, right - remaining))
+                right = left + remaining
+            spans.append((left, right))
+            used_chars += right - left
+
+        if used_chars < max_chars:
+            spans.append((head_end, min(len(text), head_end + (max_chars - used_chars))))
+
+        merged = []
+        for left, right in sorted(spans):
+            if right <= left:
+                continue
+            if merged and left <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], right))
+            else:
+                merged.append((left, right))
+
+        pieces = [text[left:right].strip() for left, right in merged if text[left:right].strip()]
+        return "\n...\n".join(pieces)
+
+    def _question_terms(self, question: str) -> list[str]:
+        stopwords = {
+            "and", "are", "did", "does", "for", "from", "has", "have", "how",
+            "into", "its", "that", "the", "their", "then", "this", "was", "were",
+            "what", "when", "where", "which", "who", "why", "with", "would",
+        }
+        return list(dict.fromkeys(
+            token
+            for token in re.findall(r"[a-z0-9]+", str(question or "").lower())
+            if len(token) >= 3 and token not in stopwords
+        ))
+
+    def _config_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return max(0, int(value)) if value is not None else default
+        except (TypeError, ValueError):
+            return default
 
     def _normalize_stage1(self, obj: dict | None) -> dict:
         if not isinstance(obj, dict):
@@ -516,6 +468,7 @@ class RawContextPhase1ResultProvider(Phase1Provider):
                 "sufficient": False,
                 "selected_evidence": [],
                 "missing_info": ["Evidence sufficiency output was not valid JSON."],
+                "answer": "Not mentioned",
                 "reasoning": "",
             }
 
@@ -523,6 +476,7 @@ class RawContextPhase1ResultProvider(Phase1Provider):
             "sufficient": self._json_bool(obj.get("sufficient"), False),
             "selected_evidence": self._selected_evidence_list(obj.get("selected_evidence")),
             "missing_info": self._string_list(obj.get("missing_info")),
+            "answer": str(obj.get("answer", "Not mentioned") or "Not mentioned").strip(),
             "reasoning": str(obj.get("reasoning", "") or "").strip(),
         }
 
@@ -594,20 +548,3 @@ class RawContextPhase1ResultProvider(Phase1Provider):
             f"Direct support: {evidence_text}",
             f"Unsupported or inferred parts: {missing_text}",
         ]
-
-    def _combined_prompt(self, stage1_prompt: str, stage2_prompt: str) -> str:
-        if not stage2_prompt:
-            return f"[Stage 1: evidence sufficiency]\n{stage1_prompt}"
-        return (
-            f"[Stage 1: evidence sufficiency]\n{stage1_prompt}\n\n"
-            f"[Stage 2: selected evidence answer]\n{stage2_prompt}"
-        )
-
-    def _combined_raw(self, stage1_raw: str, stage2_raw: str) -> str:
-        return json.dumps(
-            {
-                "stage1_evidence_sufficiency_raw": stage1_raw,
-                "stage2_answer_raw": stage2_raw,
-            },
-            ensure_ascii=False,
-        )

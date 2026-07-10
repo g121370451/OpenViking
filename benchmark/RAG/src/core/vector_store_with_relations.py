@@ -1,7 +1,8 @@
-import json
 import os
 import re
 from typing import Dict, List
+
+from openviking.storage.build_link_relation_store import RelationRepository
 
 from core.vector_store import VikingStoreWrapper, VikingStoreHTTPWrapper
 
@@ -51,11 +52,11 @@ def _update_active_relation_groups(
 
 
 class VikingStoreWithRelations(VikingStoreWrapper):
-    """Vector store enhanced with .relations_{strategy}.jsonl edges.
+    """Vector store enhanced with the independent build-link relation store.
 
     Overrides retrieve():
     1. Vector search (via parent class)
-    2. For each result, query .relations_{strategy}.jsonl for related URIs
+    2. For each result, query the relation repository for related URIs
     3. Read and append related documents to context
     """
 
@@ -74,19 +75,8 @@ class VikingStoreWithRelations(VikingStoreWrapper):
         self._llm = llm
         self._embedder = embedder
         self._strategy = strategy
-        self._relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
+        self._relation_repository = RelationRepository(self._vikingfs_path)
         self._embed_cache: dict[str, list] = {}
-        self._ref_caches: dict[str, dict[str, dict]] = {}
-
-    def _uri_to_parent_path(self, uri: str) -> str:
-        if uri.startswith("viking://"):
-            rel = uri[len("viking://"):]
-        else:
-            rel = uri
-        local_path = os.path.join(self._vikingfs_path, rel)
-        if os.path.isdir(local_path):
-            return local_path
-        return os.path.dirname(local_path)
 
     def _embed_text(self, text: str):
         if not self._embedder or not text:
@@ -101,103 +91,53 @@ class VikingStoreWithRelations(VikingStoreWrapper):
             print(f"[Warning] Embedding failed: {e}")
             return None
 
-    def _load_ref_cache(self, parent_dir: str) -> dict[str, dict]:
-        if parent_dir in self._ref_caches:
-            return self._ref_caches[parent_dir]
-        cache: dict[str, dict] = {}
-        ref_path = os.path.join(parent_dir, ".reference_questions.jsonl")
-        if os.path.exists(ref_path):
-            try:
-                with open(ref_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                            qid = rec.get("id", "")
-                            if qid:
-                                cache[qid] = {"question": rec.get("question", ""), "embedding": rec.get("embedding")}
-                        except json.JSONDecodeError:
-                            continue
-            except Exception:
-                pass
-        self._ref_caches[parent_dir] = cache
-        return cache
-
-    def _resolve_ref_question(self, parent_dir: str, question_id: str) -> dict | None:
-        cache = self._load_ref_cache(parent_dir)
-        return cache.get(question_id)
-
     def _collect_relation_candidates(
         self,
         uri: str,
         query: str,
         query_embedding,
     ) -> list[dict]:
-        parent_dir = self._uri_to_parent_path(uri)
-        jsonl_path = os.path.join(parent_dir, self._relations_filename)
-        if not os.path.exists(jsonl_path):
-            return []
-
-        ref_cache: dict[str, dict | None] = {}
         candidates: list[dict] = []
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        for rec in self._relation_repository.get_edges(uri, self._strategy):
+            uri1 = rec.get("uri1", "")
+            uri2 = rec.get("uri2", "")
+            # 单向边：只有当 uri == uri1 时，uri2 才是有用的目标
+            if uri1 != uri or uri1 == uri2:
+                continue
+            target = uri2
+            if target.endswith(".abstract.md") or target.endswith(".overview.md"):
+                continue
 
-                uri1 = rec.get("uri1", "")
-                uri2 = rec.get("uri2", "")
-                # 单向边：只有当 uri == uri1 时，uri2 才是有用的目标
-                if uri1 != uri or uri1 == uri2:
-                    continue
-                target = uri2
-                if target.endswith(".abstract.md") or target.endswith(".overview.md"):
-                    continue
+            rec_weight = rec.get("weight", 1.0)
+            rec_query = rec.get("question", rec.get("query_question", ""))
+            rec_embedding = rec.get("embedding", rec.get("query_embedding"))
 
-                rec_weight = rec.get("weight", 1.0)
-                rec_query = ""
-                rec_embedding = None
-                if "question_id" in rec:
-                    qid = rec["question_id"]
-                    if qid not in ref_cache:
-                        ref_cache[qid] = self._resolve_ref_question(parent_dir, qid)
-                    ref = ref_cache[qid]
-                    if ref:
-                        rec_query = ref.get("question", "")
-                        rec_embedding = ref.get("embedding")
-                else:
-                    rec_query = rec.get("query_question", "")
-                    rec_embedding = rec.get("query_embedding")
-
-                if not query:
-                    group_key = rec.get("question_id", "") or rec_query or target
-                    candidates.append({
+            if not query:
+                group_key = rec.get("question_id", "") or rec_query or target
+                candidates.append(
+                    {
                         "target": target,
                         "source_uri": uri,
                         "weight": rec_weight,
                         "similarity": 0.0,
                         "group_key": group_key,
-                    })
-                    continue
+                    }
+                )
+                continue
 
-                if query_embedding and rec_embedding:
-                    sim = _cosine_similarity(query_embedding, rec_embedding)
-                    if sim > self.relations_similarity_threshold:
-                        group_key = rec.get("question_id", "") or rec_query or target
-                        candidates.append({
+            if query_embedding and rec_embedding:
+                sim = _cosine_similarity(query_embedding, rec_embedding)
+                if sim > self.relations_similarity_threshold:
+                    group_key = rec.get("question_id", "") or rec_query or target
+                    candidates.append(
+                        {
                             "target": target,
                             "source_uri": uri,
                             "weight": rec_weight,
                             "similarity": sim,
                             "group_key": group_key,
-                        })
+                        }
+                    )
 
         return candidates
 
@@ -329,6 +269,10 @@ class VikingStoreWithRelations(VikingStoreWrapper):
 
         return ret
 
+    def close(self):
+        self._relation_repository.close()
+        super().close()
+
 
 class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
     """HTTP-based vector store with bot-style local relations expansion.
@@ -352,19 +296,10 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
             similarity_threshold if similarity_threshold is not None
             else _DEFAULT_RELATION_SIMILARITY_THRESHOLD
         )
-        self._relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
+        self._relation_repository = (
+            RelationRepository(self._vikingfs_path) if self._vikingfs_path else None
+        )
         self._embed_cache: dict[str, list] = {}
-        self._ref_caches: dict[str, dict[str, dict]] = {}
-
-    def _uri_to_parent_path(self, uri: str) -> str:
-        if uri.startswith("viking://"):
-            rel = uri[len("viking://"):]
-        else:
-            rel = uri
-        local_path = os.path.join(self._vikingfs_path, rel)
-        if os.path.isdir(local_path):
-            return local_path
-        return os.path.dirname(local_path)
 
     def _embed_text(self, text: str):
         if not self._embedder or not text:
@@ -378,86 +313,35 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
         except Exception:
             return None
 
-    def _load_ref_cache(self, parent_dir: str) -> dict[str, dict]:
-        if parent_dir in self._ref_caches:
-            return self._ref_caches[parent_dir]
-        cache: dict[str, dict] = {}
-        ref_path = os.path.join(parent_dir, ".reference_questions.jsonl")
-        if os.path.exists(ref_path):
-            try:
-                with open(ref_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = json.loads(line)
-                            qid = rec.get("id", "")
-                            if qid:
-                                cache[qid] = {"question": rec.get("question", ""), "embedding": rec.get("embedding")}
-                        except json.JSONDecodeError:
-                            continue
-            except Exception:
-                pass
-        self._ref_caches[parent_dir] = cache
-        return cache
-
-    def _resolve_ref_question(self, parent_dir: str, question_id: str) -> dict | None:
-        cache = self._load_ref_cache(parent_dir)
-        return cache.get(question_id)
-
     def _collect_relation_candidates(
         self,
         uri: str,
         query: str,
         query_embedding,
     ) -> list[dict]:
-        parent_dir = self._uri_to_parent_path(uri)
-        jsonl_path = os.path.join(parent_dir, self._relations_filename)
-        if not os.path.exists(jsonl_path):
+        if self._relation_repository is None:
             return []
 
-        ref_cache: dict[str, dict | None] = {}
         candidates: list[dict] = []
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        for rec in self._relation_repository.get_edges(uri, self._strategy):
+            uri1 = rec.get("uri1", "")
+            uri2 = rec.get("uri2", "")
+            # 单向边：只有当 uri == uri1 时，uri2 才是有用的目标
+            if uri1 != uri or uri1 == uri2:
+                continue
+            target = uri2
+            if target.endswith(".abstract.md") or target.endswith(".overview.md"):
+                continue
 
-                uri1 = rec.get("uri1", "")
-                uri2 = rec.get("uri2", "")
-                # 单向边：只有当 uri == uri1 时，uri2 才是有用的目标
-                if uri1 != uri or uri1 == uri2:
-                    continue
-                target = uri2
-                if target.endswith(".abstract.md") or target.endswith(".overview.md"):
-                    continue
+            rec_weight = rec.get("weight", 1.0)
+            rec_query = rec.get("question", rec.get("query_question", ""))
+            rec_embedding = rec.get("embedding", rec.get("query_embedding"))
+            question_id = rec.get("question_id", "")
 
-                rec_weight = rec.get("weight", 1.0)
-                rec_query = ""
-                rec_embedding = None
-                if "question_id" in rec:
-                    qid = rec["question_id"]
-                    if qid not in ref_cache:
-                        ref_cache[qid] = self._resolve_ref_question(parent_dir, qid)
-                    ref = ref_cache[qid]
-                    if ref:
-                        rec_query = ref.get("question", "")
-                        rec_embedding = ref.get("embedding")
-                else:
-                    rec_query = rec.get("query_question", "")
-                    rec_embedding = rec.get("query_embedding")
-
-                question_id = rec.get("question_id", "")
-
-                if not query:
-                    group_key = rec.get("question_id", "") or rec_query or target
-                    candidates.append({
+            if not query:
+                group_key = question_id or rec_query or target
+                candidates.append(
+                    {
                         "target": target,
                         "source_uri": uri,
                         "weight": rec_weight,
@@ -465,14 +349,16 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
                         "group_key": group_key,
                         "question_id": question_id,
                         "reason": rec.get("reason", rec_query),
-                    })
-                    continue
+                    }
+                )
+                continue
 
-                if query_embedding and rec_embedding:
-                    sim = _cosine_similarity(query_embedding, rec_embedding)
-                    if sim > self.relations_similarity_threshold:
-                        group_key = rec.get("question_id", "") or rec_query or target
-                        candidates.append({
+            if query_embedding and rec_embedding:
+                sim = _cosine_similarity(query_embedding, rec_embedding)
+                if sim > self.relations_similarity_threshold:
+                    group_key = question_id or rec_query or target
+                    candidates.append(
+                        {
                             "target": target,
                             "source_uri": uri,
                             "weight": rec_weight,
@@ -480,7 +366,8 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
                             "group_key": group_key,
                             "question_id": question_id,
                             "reason": rec.get("reason", rec_query),
-                        })
+                        }
+                    )
 
         if query:
             candidates.sort(key=lambda x: (-x["similarity"], x["target"]))
@@ -696,3 +583,8 @@ class VikingStoreHTTPWithRelations(VikingStoreHTTPWrapper):
         ret["relations_added"] = len(relations_added_uris)
 
         return ret
+
+    def close(self):
+        if self._relation_repository is not None:
+            self._relation_repository.close()
+        super().close()

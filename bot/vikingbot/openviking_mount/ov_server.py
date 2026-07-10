@@ -8,9 +8,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from vikingbot.openviking_mount.reference_store import ReferenceStore
-
 import openviking as ov
+from openviking.storage.build_link_relation_store import RelationRepository
 from vikingbot.config.loader import load_config
 from vikingbot.openviking_mount.user_apikey_manager import UserApiKeyManager
 
@@ -95,6 +94,7 @@ def _get_embedder():
         class _Embedder:
             def __init__(self):
                 self._cache: dict[str, list] = {}
+                self.model_key = model
 
             def embed(self, text: str) -> list:
                 if text in self._cache:
@@ -151,6 +151,7 @@ class VikingClient:
         self.mode = openviking_config.mode
         workspace = config.storage_workspace or str(Path("~/.openviking/data").expanduser())
         self._vikingfs_path = os.path.join(workspace, "viking")
+        self._relation_repository = RelationRepository(self._vikingfs_path)
 
     async def _initialize(self):
         """Initialize the client (must be called after construction)"""
@@ -470,19 +471,17 @@ class VikingClient:
         strategy: str = "llm_review",
         include_match_meta: bool = False,
     ) -> list[dict[str, Any]]:
-        """查询 uri 的关联文档，通过磁盘 JSONL 直接读取 + embedding 匹配"""
+        """查询独立 relation store 中与 URI 关联的文档。"""
         total_start = time.time()
-        parent_dir = self._uri_to_parent_path(uri)
-        relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
-        jsonl_path = os.path.join(parent_dir, relations_filename)
-        if not os.path.exists(jsonl_path):
+        records = self._relation_repository.get_edges(uri, strategy)
+        if not records:
             logger.info(
-                f"[Relations][PROFILE] missing_file uri={uri} | file={jsonl_path} | "
+                f"[Relations][PROFILE] no_edges uri={uri} | "
+                f"store={self._relation_repository.database_path} | "
                 f"strategy={strategy} | total_ms={(time.time() - total_start) * 1000:.0f}"
             )
             return []
 
-        ref_store = ReferenceStore(parent_dir)
         query_embedding = None
         embed_ms = 0.0
         if query:
@@ -501,55 +500,48 @@ class VikingClient:
         seen = set()
         total_records = 0
         scan_start = time.time()
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+        for rec in records:
+            total_records += 1
+            uri1, uri2 = rec.get("uri1", ""), rec.get("uri2", "")
+            if uri1 == uri2 or uri1 != uri:
+                continue
+            target = uri2
+            if target.endswith(".abstract.md") or target.endswith(".overview.md"):
+                continue
 
-                total_records += 1
-                uri1, uri2 = rec.get("uri1", ""), rec.get("uri2", "")
-                if uri1 == uri2 or uri1 != uri:
-                    continue
-                target = uri2
-                if target.endswith(".abstract.md") or target.endswith(".overview.md"):
-                    continue
+            question_id = rec.get("question_id", "")
+            rec_query = rec.get("question", rec.get("query_question", ""))
+            rec_embedding = rec.get("embedding", rec.get("query_embedding"))
+            rec_weight = rec.get("weight", 1.0)
 
-                question_id = rec.get("question_id", "")
-                ref = ref_store.get(question_id) if question_id else None
-                rec_query = ref.get("question", "") if ref else rec.get("query_question", "")
-                rec_embedding = ref.get("embedding") if ref else rec.get("query_embedding")
-                rec_weight = rec.get("weight", 1.0)
-
-                if not query:
-                    group_key = question_id or rec_query or target
-                    if target in seen:
-                        continue
-                    seen.add(target)
-                    result = {
-                        "uri": target,
-                        "reason": rec.get("reason", rec_query),
-                        "weight": rec_weight,
-                        "question_id": question_id,
-                    }
-                    if include_match_meta:
-                        result.update({
+            if not query:
+                group_key = question_id or rec_query or target
+                if target in seen:
+                    continue
+                seen.add(target)
+                result = {
+                    "uri": target,
+                    "reason": rec.get("reason", rec_query),
+                    "weight": rec_weight,
+                    "question_id": question_id,
+                }
+                if include_match_meta:
+                    result.update(
+                        {
                             "source_uri": uri,
                             "group_key": group_key,
                             "similarity": 0.0,
-                        })
-                    results.append(result)
-                    continue
+                        }
+                    )
+                results.append(result)
+                continue
 
-                if query_embedding and rec_embedding:
-                    sim = _cosine_similarity(query_embedding, rec_embedding)
-                    if sim > similarity_threshold:
-                        group_key = question_id or rec_query or target
-                        candidates.append({
+            if query_embedding and rec_embedding:
+                sim = _cosine_similarity(query_embedding, rec_embedding)
+                if sim > similarity_threshold:
+                    group_key = question_id or rec_query or target
+                    candidates.append(
+                        {
                             "target": target,
                             "similarity": sim,
                             "weight": rec_weight,
@@ -563,7 +555,8 @@ class VikingClient:
                                 "group_key": group_key,
                                 "similarity": sim,
                             },
-                        })
+                        }
+                    )
 
         for item in sorted(
             candidates,
@@ -587,7 +580,8 @@ class VikingClient:
         if not query:
             results.sort(key=lambda x: x.get("weight", 1.0), reverse=True)
         logger.info(
-            f"[Relations][PROFILE] uri={uri} | file={jsonl_path} | "
+            f"[Relations][PROFILE] uri={uri} | "
+            f"store={self._relation_repository.database_path} | "
             f"records={total_records}, matched={len(results)} | strategy={strategy} | "
             f"match_mode=embedding_candidates, similarity_threshold={similarity_threshold}, "
             f"embed_ms={embed_ms:.0f}, scan_ms={scan_ms:.0f}, "
@@ -599,38 +593,48 @@ class VikingClient:
         self, from_uri: str, to_uris: Any, reason: str = "", query: str = "",
         strategy: str = "llm_review", weight: float = 1.0,
     ) -> None:
-        """创建 from_uri → uris 的关联边，直接写入磁盘 JSONL"""
+        """在独立 relation store 中创建 from_uri 到目标 URI 的边。"""
         link_start = time.time()
         if isinstance(to_uris, str):
             to_uris = [to_uris]
+        else:
+            to_uris = list(to_uris)
         input_count = len(to_uris)
-        created = 0
-        skipped_self = 0
+        filtered_targets = [to_uri for to_uri in to_uris if to_uri != from_uri]
+        skipped_self = input_count - len(filtered_targets)
         failed = 0
-        append_ms_values: list[float] = []
-        for to_uri in to_uris:
-            if from_uri == to_uri:
-                skipped_self += 1
-                continue
-            append_start = time.time()
-            try:
-                if self._append_relation(from_uri, to_uri, query, reason, strategy=strategy, weight=weight):
-                    created += 1
-            except Exception:
-                failed += 1
-                raise
-            finally:
-                append_ms_values.append((time.time() - append_start) * 1000)
+        embedding = None
+        model_key = os.environ.get("VIKINGBOT_EMBEDDING_MODEL", "")
+        if query:
+            embedder = _get_embedder()
+            if embedder:
+                model_key = getattr(embedder, "model_key", model_key)
+                try:
+                    embedding = embedder.embed(query)
+                except Exception as exc:
+                    logger.warning(f"[RelationsLink] Failed to embed relation question: {exc}")
+        try:
+            created = self._relation_repository.add_edges(
+                source_uri=from_uri,
+                target_uris=filtered_targets,
+                question=query,
+                embedding=embedding,
+                model_key=model_key,
+                reason=reason,
+                strategy=strategy,
+                weight=weight,
+            )
+        except Exception:
+            failed = len(filtered_targets)
+            raise
 
         total_ms = (time.time() - link_start) * 1000
-        avg_append_ms = sum(append_ms_values) / max(len(append_ms_values), 1)
-        max_append_ms = max(append_ms_values) if append_ms_values else 0.0
         log_fn = logger.info if total_ms >= 100 or input_count > 1 else logger.debug
         log_fn(
             f"[RelationsLink][PROFILE] from={from_uri} | to_count={input_count}, "
             f"created={created}, skipped_self={skipped_self}, failed={failed}, "
             f"strategy={strategy}, total_ms={total_ms:.0f}, "
-            f"avg_append_ms={avg_append_ms:.0f}, max_append_ms={max_append_ms:.0f}"
+            f"store={self._relation_repository.database_path}"
         )
 
     def _uri_to_local_path(self, uri: str) -> str:
@@ -643,64 +647,29 @@ class VikingClient:
 
     def _append_relation(self, uri1: str, uri2: str, query: str, reason: str = "",
                          strategy: str = "llm_review", weight: float = 1.0) -> bool:
-        total_start = time.time()
-        parent_dir = self._uri_to_parent_path(uri1)
-        os.makedirs(parent_dir, exist_ok=True)
-        relations_filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
-        jsonl_path = os.path.join(parent_dir, relations_filename)
-
-        question_id = ""
-        question_ms = 0.0
+        """Compatibility wrapper for callers that append one edge at a time."""
+        embedding = None
+        model_key = os.environ.get("VIKINGBOT_EMBEDDING_MODEL", "")
         if query:
-            question_start = time.time()
-            ref_store = ReferenceStore(parent_dir)
             embedder = _get_embedder()
-            question_id = ref_store.get_or_create(query, embedder=embedder)
-            question_ms = (time.time() - question_start) * 1000
-
-        key = (uri1, uri2, question_id)
-        existing = set()
-        existing_records = 0
-        existing_file_bytes = os.path.getsize(jsonl_path) if os.path.exists(jsonl_path) else 0
-        scan_start = time.time()
-        if os.path.exists(jsonl_path):
-            with open(jsonl_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        existing.add((rec.get("uri1", ""), rec.get("uri2", ""), rec.get("question_id", "")))
-                        existing_records += 1
-                    except json.JSONDecodeError:
-                        continue
-        scan_ms = (time.time() - scan_start) * 1000
-        if key in existing:
-            total_ms = (time.time() - total_start) * 1000
-            log_fn = logger.info if total_ms >= 100 else logger.debug
-            log_fn(
-                f"[RelationsAppend][PROFILE] status=exists uri1={uri1} | uri2={uri2} | "
-                f"strategy={strategy}, question_ms={question_ms:.0f}, "
-                f"scan_ms={scan_ms:.0f}, write_ms=0, total_ms={total_ms:.0f}, "
-                f"existing_records={existing_records}, file_bytes={existing_file_bytes}"
+            if embedder:
+                model_key = getattr(embedder, "model_key", model_key)
+                try:
+                    embedding = embedder.embed(query)
+                except Exception as exc:
+                    logger.warning(f"[RelationsAppend] Failed to embed relation question: {exc}")
+        return bool(
+            self._relation_repository.add_edges(
+                source_uri=uri1,
+                target_uris=[uri2],
+                question=query,
+                embedding=embedding,
+                model_key=model_key,
+                reason=reason,
+                strategy=strategy,
+                weight=weight,
             )
-            return False
-
-        record = {"uri1": uri1, "uri2": uri2, "question_id": question_id, "reason": reason, "weight": weight}
-        write_start = time.time()
-        with open(jsonl_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        write_ms = (time.time() - write_start) * 1000
-        total_ms = (time.time() - total_start) * 1000
-        log_fn = logger.info if total_ms >= 100 else logger.debug
-        log_fn(
-            f"[RelationsAppend][PROFILE] status=created uri1={uri1} | uri2={uri2} | "
-            f"strategy={strategy}, question_ms={question_ms:.0f}, "
-            f"scan_ms={scan_ms:.0f}, write_ms={write_ms:.0f}, total_ms={total_ms:.0f}, "
-            f"existing_records={existing_records}, file_bytes={existing_file_bytes}"
         )
-        return True
 
     async def glob(self, pattern: str, uri: Optional[str] = None) -> Dict[str, Any]:
         """通过 glob 模式匹配文件"""
@@ -808,6 +777,7 @@ class VikingClient:
 
     async def close(self):
         """关闭客户端"""
+        self._relation_repository.close()
         await self.client.close()
 
 

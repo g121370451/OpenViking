@@ -1,8 +1,38 @@
 """Base LLM provider interface."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def extract_reasoning_tokens(usage: Any) -> int | None:
+    """Extract provider-reported reasoning tokens from common usage layouts."""
+
+    def read_path(value: Any, path: tuple[str, ...]) -> Any:
+        current = value
+        for key in path:
+            if current is None:
+                return None
+            if isinstance(current, Mapping):
+                current = current.get(key)
+            else:
+                current = getattr(current, key, None)
+        return current
+
+    for path in (
+        ("reasoning_tokens",),
+        ("completion_tokens_details", "reasoning_tokens"),
+        ("output_tokens_details", "reasoning_tokens"),
+    ):
+        raw_value = read_path(usage, path)
+        if raw_value is None:
+            continue
+        try:
+            return int(raw_value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 @dataclass

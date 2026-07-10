@@ -623,6 +623,34 @@ FinanceBench 有 3 种问题类型：
 3. 修改您想要改进的问题类型的提示文本
 4. 使用修改后的提示重新运行评估
 
+#### Build Link Relation 存储
+
+Build Link 的边、完整 reason、历史 question 和 question embedding 独立保存在每个
+benchmark store 的以下目录，不会写入 OpenViking 的向量数据库：
+
+```text
+<vector_store>/viking/resources/.relations_store/relations.sqlite3
+```
+
+新写入默认使用 SQLite。旧的 `.relations*.jsonl` 和 `.reference_questions.jsonl`
+在迁移完成前仍会被兼容读取。迁移命令：
+
+```bash
+python benchmark/RAG/scripts/migrate_relation_store.py \
+  --store-path benchmark/RAG/ov_storage/VersionRAG/VersionRAG_viking_store_index
+```
+
+迁移会保留完整 reason 和 Float64 embedding 数值，执行全局内容去重与无损压缩，且不
+自动删除旧文件。检查生成的 `migration-report.json` 后，可显式清理旧 JSONL：
+
+```bash
+python benchmark/RAG/scripts/migrate_relation_store.py \
+  --store-path benchmark/RAG/ov_storage/VersionRAG/VersionRAG_viking_store_index \
+  --cleanup-legacy
+```
+
+可通过 `VIKINGBOT_RELATION_STORE=auto|sqlite|jsonl` 控制读取模式；默认 `auto`。
+
 ### 添加新数据集
 
 1. 在 `src/adapters/` 中创建一个新的适配器类，继承自 `BaseAdapter`

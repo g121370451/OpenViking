@@ -10,6 +10,8 @@ from pathlib import Path
 import sys
 from typing import Set
 
+from openviking.storage.build_link_relation_store import RelationRepository
+
 sys.path.append(str(Path(__file__).parent))
 
 from adapters.base import BaseAdapter, StandardQA, StandardSample
@@ -381,6 +383,11 @@ class BenchmarkPipeline:
             "skipped_relation_to_uris": [],
             "skipped_relation_to_uri_count": 0,
             "has_relation_to_uri_skipped": False,
+            "build_link_attempts": 0,
+            "build_link_time_total_ms": 0.0,
+            "build_link_time_avg_ms": 0.0,
+            "build_link_time_samples_ms": [],
+            "build_link_status_counts": {},
         }
 
         skipped_relation_to_uris: list[str] = []
@@ -420,13 +427,108 @@ class BenchmarkPipeline:
                 else:
                     created = requested
                 stats["link_pairs_created"] += created
+            elif tn == "openviking_build_link_metrics":
+                args_data = self._tool_args_dict(tc)
+                if not bool(args_data.get("attempted", True)):
+                    continue
+                duration_ms = float(
+                    tc.get("duration", args_data.get("total_ms", 0)) or 0
+                )
+                status = str(args_data.get("status", "unknown") or "unknown")
+                stats["build_link_attempts"] += 1
+                stats["build_link_time_total_ms"] += duration_ms
+                stats["build_link_time_samples_ms"].append(duration_ms)
+                status_counts = stats["build_link_status_counts"]
+                status_counts[status] = int(status_counts.get(status, 0) or 0) + 1
 
         stats["has_relations_found"] = stats["relations_found_total"] > 0
         stats["has_links_created"] = stats["link_pairs_created"] > 0
         stats["skipped_relation_to_uris"] = self._dedupe_list(skipped_relation_to_uris)
         stats["skipped_relation_to_uri_count"] = len(stats["skipped_relation_to_uris"])
         stats["has_relation_to_uri_skipped"] = stats["skipped_relation_to_uri_count"] > 0
+        if stats["build_link_attempts"] > 0:
+            stats["build_link_time_avg_ms"] = (
+                stats["build_link_time_total_ms"] / stats["build_link_attempts"]
+            )
         return stats
+
+    def _summarize_build_link_timing(self, results: list[dict]) -> dict:
+        """Aggregate per-attempt timings without averaging per-query averages."""
+        samples: list[float] = []
+        status_counts: dict[str, int] = {}
+        for result in results:
+            stats = (result.get("vikingbot", {}) or {}).get("build_link_stats", {}) or {}
+            samples.extend(
+                float(value)
+                for value in stats.get("build_link_time_samples_ms", []) or []
+            )
+            for status, count in (stats.get("build_link_status_counts", {}) or {}).items():
+                status_counts[str(status)] = (
+                    status_counts.get(str(status), 0) + int(count or 0)
+                )
+
+        total_ms = sum(samples)
+        return {
+            "attempts": len(samples),
+            "total_ms": total_ms,
+            "average_ms": total_ms / len(samples) if samples else 0.0,
+            "status_counts": status_counts,
+        }
+
+    def _summarize_phase1_evidence_efficiency(self, records: list[dict]) -> dict:
+        samples = []
+        for record in records:
+            fallback = record.get("fallback", {}) or {}
+            provider_name = str(
+                fallback.get("primary_provider", "raw_context_phase1_result")
+                or "raw_context_phase1_result"
+            )
+            provider_result = (
+                (fallback.get("provider_results", {}) or {}).get(provider_name, {}) or {}
+            )
+            details = provider_result.get("details", {}) or {}
+            if "stage1_latency_sec" not in details:
+                continue
+            samples.append({
+                "provider_latency_sec": float(provider_result.get("latency_sec", 0) or 0),
+                "stage1_latency_sec": float(details.get("stage1_latency_sec", 0) or 0),
+                "stage1_input_tokens": int(details.get("stage1_input_tokens", 0) or 0),
+                "stage1_output_tokens": int(details.get("stage1_output_tokens", 0) or 0),
+                "stage1_prompt_chars": int(details.get("stage1_prompt_chars", 0) or 0),
+                "context_original_chars": int(details.get("stage1_context_original_chars", 0) or 0),
+                "context_chars": int(details.get("stage1_context_chars", 0) or 0),
+                "context_reduction_pct": float(details.get("stage1_context_reduction_pct", 0) or 0),
+                "stage2_ran": bool(details.get("stage2_ran", False)),
+                "llm_call_count": int(
+                    details.get(
+                        "llm_call_count",
+                        1 + int(bool(details.get("stage2_ran", False))),
+                    ) or 0
+                ),
+            })
+
+        if not samples:
+            return {}
+
+        def average(key: str) -> float:
+            return sum(float(sample[key]) for sample in samples) / len(samples)
+
+        stage1_latencies = sorted(sample["stage1_latency_sec"] for sample in samples)
+        p95_index = int((len(stage1_latencies) - 1) * 0.95)
+        return {
+            "Records": len(samples),
+            "Average Phase1 Provider Time (s)": average("provider_latency_sec"),
+            "Average Stage1 Evidence LLM Time (s)": average("stage1_latency_sec"),
+            "P95 Stage1 Evidence LLM Time (s)": stage1_latencies[p95_index],
+            "Average Stage1 Input Tokens": average("stage1_input_tokens"),
+            "Average Stage1 Output Tokens": average("stage1_output_tokens"),
+            "Average Stage1 Prompt Chars": average("stage1_prompt_chars"),
+            "Average Original Context Chars": average("context_original_chars"),
+            "Average Submitted Context Chars": average("context_chars"),
+            "Average Context Reduction (%)": average("context_reduction_pct"),
+            "Average LLM Calls per Query": average("llm_call_count"),
+            "Stage2 Run Rate": sum(1 for sample in samples if sample["stage2_ran"]) / len(samples),
+        }
 
     def _save_partial_results(self, results_map: dict):
         # Persist partial generation results so we can resume safely after interruption.
@@ -434,7 +536,11 @@ class BenchmarkPipeline:
             sorted_results = [results_map[i] for i in sorted(results_map.keys())]
             dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
             save_data = {
-                "summary": {"dataset": dataset_name, "total_queries": len(sorted_results)},
+                "summary": {
+                    "dataset": dataset_name,
+                    "total_queries": len(sorted_results),
+                    "build_link_timing": self._summarize_build_link_timing(sorted_results),
+                },
                 "results": sorted_results
             }
             with open(self.generated_file, "w", encoding="utf-8") as f:
@@ -444,8 +550,21 @@ class BenchmarkPipeline:
         # Persist partial evaluation results so we can resume safely after interruption.
         with self._file_lock:
             eval_records = list(eval_results_map.values())
+            dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
             with open(self.eval_file, "w", encoding="utf-8") as f:
-                json.dump({"results": eval_records}, f, indent=2, ensure_ascii=False)
+                json.dump(
+                    {
+                        "summary": {
+                            "dataset": dataset_name,
+                            "total_queries": len(eval_records),
+                            "build_link_timing": self._summarize_build_link_timing(eval_records),
+                        },
+                        "results": eval_records,
+                    },
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
 
     def run_import(self):
         """Stage: Import documents into OV store"""
@@ -570,8 +689,13 @@ class BenchmarkPipeline:
 
         sorted_results = [results_map[i] for i in sorted(results_map.keys())]
         dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
+        build_link_timing = self._summarize_build_link_timing(sorted_results)
         save_data = {
-            "summary": {"dataset": dataset_name, "total_queries": len(sorted_results)},
+            "summary": {
+                "dataset": dataset_name,
+                "total_queries": len(sorted_results),
+                "build_link_timing": build_link_timing,
+            },
             "results": sorted_results
         }
         total = len(sorted_results)
@@ -581,6 +705,12 @@ class BenchmarkPipeline:
                         "Average Retrieval Time (s)": sum(r['retrieval']['latency_sec'] for r in sorted_results) / total,
                         "Average Input Tokens": sum(self._get_record_input_tokens(r) for r in sorted_results) / total,
                         "Average Output Tokens": sum(self._get_record_output_tokens(r) for r in sorted_results) / total,
+                    },
+                    "Build Link Efficiency": {
+                        "Build Attempts": build_link_timing["attempts"],
+                        "Total Build Link Time (ms)": build_link_timing["total_ms"],
+                        "Average Build Link Time (ms)": build_link_timing["average_ms"],
+                        "Build Status Counts": build_link_timing["status_counts"],
                     }
                 }
             )
@@ -669,9 +799,22 @@ class BenchmarkPipeline:
 
         eval_records = list(eval_results_map.values())
         total = len(eval_records)
+        eval_build_link_timing = self._summarize_build_link_timing(eval_records)
 
         with open(self.eval_file, "w", encoding="utf-8") as f:
-            json.dump({"results": eval_records}, f, indent=2, ensure_ascii=False)
+            json.dump(
+                {
+                    "summary": {
+                        "dataset": self.config.get('dataset_name', 'Unknown_Dataset'),
+                        "total_queries": total,
+                        "build_link_timing": eval_build_link_timing,
+                    },
+                    "results": eval_records,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
 
         if total > 0:
             performance_metrics = {
@@ -880,6 +1023,13 @@ class BenchmarkPipeline:
                         recoverable_miss_gain_summary(fallback_records)
                     ),
                 })
+                phase1_evidence_efficiency = self._summarize_phase1_evidence_efficiency(
+                    fallback_records
+                )
+                if phase1_evidence_efficiency:
+                    self._update_report({
+                        "Phase1 Evidence Efficiency": phase1_evidence_efficiency,
+                    })
         self.checkpoint_manager.delete_checkpoint()
 
     def run_deletion(self):
@@ -1177,10 +1327,20 @@ class BenchmarkPipeline:
         links_created = int(build_link_stats.get("link_pairs_created", 0) or 0)
 
         iterations_used = int(vikingbot_result.get("iterations_used", 0) or 0)
-        link_tools = {'openviking_link', 'openviking_relations'}
-        total_calls = len(tc_list) if tc_list else 1
+        link_tools = {
+            'openviking_link',
+            'openviking_relations',
+        }
+        counted_tool_calls = [
+            tc for tc in tc_list
+            if not (
+                isinstance(tc, dict)
+                and tc.get('tool_name', '') == 'openviking_build_link_metrics'
+            )
+        ]
+        total_calls = len(counted_tool_calls) if counted_tool_calls else 1
         non_link_call_count = sum(
-            1 for tc in tc_list
+            1 for tc in counted_tool_calls
             if isinstance(tc, dict) and tc.get('tool_name', '') not in link_tools
         )
         retrieval_iterations = (
@@ -1234,12 +1394,27 @@ class BenchmarkPipeline:
         relation_edges_hit = []
         skipped_relation_to_uris = []
         relations_found_per_search = []
+        build_link_time_samples = []
+        build_link_status_counts: dict[str, int] = {}
         for s in summaries:
             merged_tool_calls.extend(s.get("tool_calls", []) or [])
             merged_tool_names.extend(s.get("tools_used_names", []) or [])
             relation_edges_hit.extend(s.get("relation_edges_hit", []) or [])
             skipped_relation_to_uris.extend(s.get("skipped_relation_to_uris", []) or [])
             relations_found_per_search.extend(s.get("relations_found_per_search", []) or [])
+            timing_stats = s.get("build_link_stats", {}) or {}
+            build_link_time_samples.extend(
+                float(value)
+                for value in timing_stats.get("build_link_time_samples_ms", []) or []
+            )
+            for status, count in (timing_stats.get("build_link_status_counts", {}) or {}).items():
+                status_counts_key = str(status)
+                build_link_status_counts[status_counts_key] = (
+                    build_link_status_counts.get(status_counts_key, 0) + int(count or 0)
+                )
+
+        build_link_time_total_ms = sum(build_link_time_samples)
+        build_link_attempts = len(build_link_time_samples)
 
         merged_build_link_stats = {
             "relation_search_calls": sum(int(s.get("relation_search_calls", 0) or 0) for s in summaries),
@@ -1254,6 +1429,14 @@ class BenchmarkPipeline:
             "skipped_relation_to_uris": self._dedupe_list(skipped_relation_to_uris),
             "skipped_relation_to_uri_count": len(self._dedupe_list(skipped_relation_to_uris)),
             "has_relation_to_uri_skipped": any(bool(s.get("has_relation_to_uri_skipped", False)) for s in summaries),
+            "build_link_attempts": build_link_attempts,
+            "build_link_time_total_ms": build_link_time_total_ms,
+            "build_link_time_avg_ms": (
+                build_link_time_total_ms / build_link_attempts
+                if build_link_attempts else 0.0
+            ),
+            "build_link_time_samples_ms": build_link_time_samples,
+            "build_link_status_counts": build_link_status_counts,
         }
 
         return {
@@ -1924,32 +2107,14 @@ class BenchmarkPipeline:
         self.logger.info(f"Report updated -> {self.report_file}")
 
     def _count_total_relations(self, strategy: str):
-        """Count total unique edge pairs in all .relations_{strategy}.jsonl files."""
+        """Count unique relation edge pairs in the active relation repository."""
         vector_store_path = self.config.get('paths', {}).get('vector_store', '')
         if not vector_store_path or not os.path.isdir(vector_store_path):
             return 0, set()
         viking_dir = os.path.join(vector_store_path, "viking")
         if not os.path.isdir(viking_dir):
             return 0, set()
-        filename = ".relations.jsonl" if strategy == "blind" else f".relations_{strategy}.jsonl"
-        all_edges = set()
-        for root, _dirs, files in os.walk(viking_dir):
-            if filename in files:
-                fpath = os.path.join(root, filename)
-                try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                rec = json.loads(line)
-                                uri1 = rec.get("uri1", "")
-                                uri2 = rec.get("uri2", "")
-                                if uri1 and uri2 and uri1 != uri2:
-                                    all_edges.add((uri1, uri2))
-                            except json.JSONDecodeError:
-                                continue
-                except Exception:
-                    continue
+        repository = RelationRepository(viking_dir)
+        all_edges = repository.get_all_edge_pairs(strategy)
+        repository.close()
         return len(all_edges), all_edges
