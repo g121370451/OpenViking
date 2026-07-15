@@ -1,15 +1,14 @@
-
 project_name: "RAG_Benchmark"
 
 # ===========Modify Configuration================
-dataset_name: "HotpotQA" 
+dataset_name: "VersionRAG"
 
 adapter:
-  module: "src.adapters.hotpotqa_adapter"  
-  class_name: "HotpotQAAdapter"     
+  module: "src.adapters.versionrag_adapter"
+  class_name: "VersionRAGAdapter"
 
 execution:
-  server_port: 19985
+  server_port: 20030
   max_workers: 10
   ingest_workers: 8
   retrieval_topk: 5
@@ -30,12 +29,11 @@ question_rewrites:
 # ==================================
 
 paths:
-  dataset_path: "datasets/{dataset_name}/hotpot_qa_100.json"
+  dataset_path: "datasets/{dataset_name}/data/test/evaluation_set.csv"
   doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
   vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
-  output_dir: "Output/{dataset_name}/experiment_test_top_{retrieval_topk}_1_8_per_query_with_relations"
-  log_file: "Output/{dataset_name}/experiment_test_top_{retrieval_topk}_1_8_per_query_with_relations/benchmark.log"
-
+  output_dir: "Output/{dataset_name}/experiment_test_top_{retrieval_topk}_with_relations"
+  log_file: "Output/{dataset_name}/experiment_test_top_{retrieval_topk}_with_relations/benchmark.log"
 
 llm:
   model: "doubao-seed-1-8-251228"
