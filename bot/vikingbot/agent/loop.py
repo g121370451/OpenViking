@@ -566,6 +566,7 @@ class AgentLoop:
             "completion_tokens": 0,
             "total_tokens": 0,
         }
+        original_query = _extract_original_query_from_messages(messages)
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -650,6 +651,7 @@ class AgentLoop:
                         session_key=session_key,
                         sandbox_manager=self.sandbox_manager,
                         sender_id=sender_id,
+                        original_question=original_query,
                     )
                     tool_execute_duration = (time.time() - tool_execute_start_time) * 1000
                     return idx, tool_call, result, tool_execute_duration, tool_context
@@ -742,7 +744,6 @@ class AgentLoop:
         _build_link_tool_start_index = len(tools_used)
         _build_link_failed = False
         _enable_linking = os.environ.get("VIKINGBOT_ENABLE_LINKING", "0")
-        original_query = _extract_original_query_from_messages(messages)
         _build_link_attempted = bool(
             _enable_linking == "1" and tools_used and original_query
         )

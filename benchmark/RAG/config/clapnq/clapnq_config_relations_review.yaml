@@ -17,7 +17,7 @@ execution:
   retrieval_instruction: ""
   use_vikingbot: false
   use_query_expansion: false
-  relations_similarity_threshold: 0.7
+  relations_similarity_threshold: 0.8
   use_relations: true
   link_strategy: llm_review
   relations_topk: 3

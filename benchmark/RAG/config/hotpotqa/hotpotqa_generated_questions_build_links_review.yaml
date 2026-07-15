@@ -1,0 +1,52 @@
+project_name: "RAG_Benchmark"
+
+# Compatibility entrypoint for the final canonical mixed question set.
+# Run with --step gen only. Accuracy/F1 evaluation is intentionally disabled.
+dataset_name: "HotpotQA"
+
+adapter:
+  module: "src.adapters.build_link_questions_adapter"
+  class_name: "BuildLinkQuestionsAdapter"
+
+execution:
+  server_port: 20035
+  max_workers: 10
+  ingest_workers: 1
+  retrieval_topk: 1
+  max_queries: null
+  ingest_mode: "directory"
+  retrieval_instruction: ""
+  use_vikingbot: true
+
+question_rewrites:
+  enabled: false
+
+evaluation:
+  enabled: false
+
+vikingbot:
+  max_iterations: 15
+  log_tool_calls: true
+  enable_linking: true
+  use_relations: true
+  relations_topk: 3
+  relations_similarity_threshold: 0.8
+  link_strategy: llm_review
+
+paths:
+  dataset_path: "generated_questions/HotpotQA/mixed_questions.jsonl"
+  doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_viking_store_index"
+  output_dir: "Output/{dataset_name}/experiment_mixed_questions_build_links_review"
+  log_file: "Output/{dataset_name}/experiment_mixed_questions_build_links_review/benchmark.log"
+
+llm:
+  model: "doubao-seed-1-8-251228"
+  temperature: 0
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+
+embedding:
+  model: "doubao-embedding-vision-250615"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"

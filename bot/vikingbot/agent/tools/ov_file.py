@@ -181,12 +181,18 @@ class VikingSearchTool(OVFileTool):
             filter_ms = (time.time() - filter_start) * 1000
 
             use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
+            relation_query = str(getattr(tool_context, "original_question", "") or "").strip()
             relations_found = 0
             logger.info(
                 f"[Search][PROFILE] filter_ms={filter_ms:.0f}, raw_count={raw_count}, "
-                f"l2_count={l2_count}, kept={len(resources_list)}, use_relations={use_relations}"
+                f"l2_count={l2_count}, kept={len(resources_list)}, use_relations={use_relations}, "
+                f"relation_query_source=original_question, relation_query_len={len(relation_query)}"
             )
-            if use_relations:
+            if use_relations and not relation_query:
+                logger.warning(
+                    "[Search] Relations expansion skipped: original question is unavailable"
+                )
+            if use_relations and relation_query:
                 link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "llm_review")
                 seen_uris = {r.get("uri", "") for r in resources_list}
                 initial_search_uris = set(seen_uris)
@@ -218,7 +224,7 @@ class VikingSearchTool(OVFileTool):
                     rel_tasks = [
                         client.relations(
                             uri,
-                            query=query,
+                            query=relation_query,
                             strategy=link_strategy,
                             include_match_meta=True,
                         )

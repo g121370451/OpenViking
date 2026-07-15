@@ -32,7 +32,7 @@ vikingbot:
   enable_linking: true
   use_relations: true
   relations_topk: 3
-  relations_similarity_threshold: 0.6
+  relations_similarity_threshold: 0.8
   link_strategy: llm_review
 paths:
   dataset_path: "datasets/{dataset_name}/hotpot_qa_100.json"

@@ -15,7 +15,7 @@ execution:
   ingest_mode: "directory"
   retrieval_instruction: ""
   mode: "ov_fallback_bot_relations"
-  relations_similarity_threshold: 0.6
+  relations_similarity_threshold: 0.8
   relations_topk: 3
   phase1_providers:
     primary: "raw_context_phase1_result"
@@ -32,7 +32,7 @@ vikingbot:
   log_tool_calls: true
   use_relations: true
   relations_topk: 3
-  relations_similarity_threshold: 0.6
+  relations_similarity_threshold: 0.8
   enable_linking: false
 paths:
   dataset_path: "datasets/{dataset_name}"

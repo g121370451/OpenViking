@@ -475,6 +475,70 @@ class BenchmarkPipeline:
             "status_counts": status_counts,
         }
 
+    def _summarize_build_link_diagnostics(self, records: list[dict]) -> dict:
+        """Build link-only diagnostics that do not depend on answer evaluation."""
+        vb_records = [record for record in records if "vikingbot" in record]
+        if not vb_records:
+            return {}
+
+        def value(record, key, fallback_key=None):
+            vikingbot = record.get("vikingbot", {}) or {}
+            raw = vikingbot.get(key)
+            if raw is None and fallback_key:
+                raw = vikingbot.get(fallback_key, 0)
+            return int(raw or 0)
+
+        def summarize(selected: list[dict]) -> dict:
+            relations_found = [value(record, "total_relations_found") for record in selected]
+            link_calls = [value(record, "link_tool_calls") for record in selected]
+            links_requested = [
+                value(record, "link_pairs_requested", "links_created")
+                for record in selected
+            ]
+            links_created = [
+                value(record, "link_pairs_created", "links_created")
+                for record in selected
+            ]
+            total = len(selected)
+            return {
+                "Total Queries": total,
+                "Queries With Relations Found": sum(count > 0 for count in relations_found),
+                "Total Relations Found During Search": sum(relations_found),
+                "Total Link Tool Calls": sum(link_calls),
+                "Queries With Link Tool Calls": sum(count > 0 for count in link_calls),
+                "Queries With Links Created": sum(count > 0 for count in links_created),
+                "Queries Without Links Created": sum(count == 0 for count in links_created),
+                "Link Construction Rate": (
+                    sum(count > 0 for count in links_created) / total if total else 0.0
+                ),
+                "Total Link Pairs Requested": sum(links_requested),
+                "Total Links Created": sum(links_created),
+                "Relations Found Per Query": relations_found,
+            }
+
+        result = summarize(vb_records)
+        by_origin = {}
+        origins = sorted({
+            str(
+                record.get("question_origin")
+                or (record.get("vikingbot", {}) or {}).get("question_origin")
+                or "unknown"
+            )
+            for record in vb_records
+        })
+        for origin in origins:
+            selected = [
+                record for record in vb_records
+                if str(
+                    record.get("question_origin")
+                    or (record.get("vikingbot", {}) or {}).get("question_origin")
+                    or "unknown"
+                ) == origin
+            ]
+            by_origin[origin] = summarize(selected)
+        result["By Question Origin"] = by_origin
+        return result
+
     def _summarize_phase1_evidence_efficiency(self, records: list[dict]) -> dict:
         samples = []
         for record in records:
@@ -700,7 +764,7 @@ class BenchmarkPipeline:
         }
         total = len(sorted_results)
         if total > 0:
-            self._update_report({
+            generation_report = {
                     "Query Efficiency (Average Per Query)": {
                         "Average Retrieval Time (s)": sum(r['retrieval']['latency_sec'] for r in sorted_results) / total,
                         "Average Input Tokens": sum(self._get_record_input_tokens(r) for r in sorted_results) / total,
@@ -713,13 +777,22 @@ class BenchmarkPipeline:
                         "Build Status Counts": build_link_timing["status_counts"],
                     }
                 }
-            )
+            build_link_diagnostics = self._summarize_build_link_diagnostics(sorted_results)
+            if build_link_diagnostics and self._is_build_link_mode():
+                generation_report["Build Link Diagnostics"] = build_link_diagnostics
+            self._update_report(generation_report)
         with open(self.generated_file, "w", encoding="utf-8") as f:
             json.dump(save_data, f, indent=2, ensure_ascii=False)
         self.checkpoint_manager.delete_checkpoint()
 
     def run_evaluation(self):
         """Step 4: Evaluation"""
+        evaluation_config = self.config.get("evaluation", {}) or {}
+        if isinstance(evaluation_config, dict) and not evaluation_config.get("enabled", True):
+            self.logger.info(
+                ">>> Evaluation disabled by config; keeping generation/build-link metrics only"
+            )
+            return
         self.logger.info(">>> Stage: Evaluation")
 
         if not os.path.exists(self.generated_file):
@@ -1495,7 +1568,10 @@ class BenchmarkPipeline:
 
             build_link_mode = self._is_build_link_mode()
             rewrite_enabled = self._is_question_rewrite_enabled()
-            rewrite_index = int((qa.metadata or {}).get("rewrite_index", 0) or 0)
+            qa_metadata = qa.metadata or {}
+            question_origin = str(qa_metadata.get("question_origin", "") or "")
+            question_provenance = qa_metadata.get("question_provenance")
+            rewrite_index = int(qa_metadata.get("rewrite_index", 0) or 0)
             trace_suffix = f"rewrite_{rewrite_index}" if rewrite_index else ""
             session_suffix = trace_suffix or "main"
             session_id = f"query_{uuid.uuid4().hex}_{session_suffix}"
@@ -1525,6 +1601,8 @@ class BenchmarkPipeline:
 
             return {
                 "_global_index": task['id'], "sample_id": task['sample_id'], "question": qa.question,
+                "question_origin": question_origin,
+                "question_provenance": question_provenance,
                 "gold_answers": qa.gold_answers, "category": str(qa.category), "evidence": qa.evidence,
                 "retrieval": {"latency_sec": merged.get("total_time_sec", 0), "uris": []},
                 "llm": {"final_answer": ans},
@@ -1558,10 +1636,12 @@ class BenchmarkPipeline:
                     "question_rewrites_enabled": rewrite_enabled,
                     "build_link_rewrites_enabled": rewrite_enabled,
                     "question_rewrite_cache_dir": self._question_rewrite_cache_dir(),
-                    "original_question": (qa.metadata or {}).get("original_question", qa.question),
+                    "question_origin": question_origin,
+                    "question_provenance": question_provenance,
+                    "original_question": qa_metadata.get("original_question", qa.question),
                     "rewrite_index": rewrite_index,
-                    "rewrite_source_sample_id": (qa.metadata or {}).get("rewrite_source_sample_id", ""),
-                    "rewrite_source_qa_index": (qa.metadata or {}).get("rewrite_source_qa_index", ""),
+                    "rewrite_source_sample_id": qa_metadata.get("rewrite_source_sample_id", ""),
+                    "rewrite_source_qa_index": qa_metadata.get("rewrite_source_qa_index", ""),
                 },
                 "metrics": {"Recall": 0.0},
                 "token_usage": {
