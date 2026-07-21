@@ -1,0 +1,48 @@
+project_name: "RAG_Benchmark"
+dataset_name: "LegalBench_MAUD"
+
+adapter:
+  module: "src.adapters.legalbench_adapter"
+  class_name: "LegalBenchAdapter"
+
+execution:
+  server_port: 20060
+  max_workers: 10
+  ingest_workers: 8
+  retrieval_topk: 1
+  max_queries: null
+  ingest_mode: "directory"
+  retrieval_instruction: ""
+  use_vikingbot: true
+
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"
+
+vikingbot:
+  max_iterations: 15
+  log_tool_calls: true
+  enable_linking: false
+  use_relations: true
+  relations_global_search: true
+  relations_topk: 3
+  relations_similarity_threshold: 0.8
+  link_strategy: llm_review
+
+paths:
+  dataset_path: "datasets/LegalBench/benchmarks/maud.json"
+  doc_output_dir: "ov_storage/LegalBench/LegalBench_processed_docs"
+  vector_store: "ov_storage/LegalBench/LegalBench_viking_store_index"
+  output_dir: "Output/LegalBench_MAUD/experiment_test_bot_top_{retrieval_topk}_relations_global_review"
+  log_file: "Output/LegalBench_MAUD/experiment_test_bot_top_{retrieval_topk}_relations_global_review/benchmark.log"
+
+llm:
+  model: "doubao-seed-1-8-251228"
+  temperature: 0
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+
+embedding:
+  model: "doubao-embedding-vision-250615"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"

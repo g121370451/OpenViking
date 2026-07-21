@@ -470,15 +470,21 @@ class VikingClient:
         query: str = "",
         strategy: str = "llm_review",
         include_match_meta: bool = False,
+        global_search: bool = False,
     ) -> list[dict[str, Any]]:
-        """查询独立 relation store 中与 URI 关联的文档。"""
+        """查询独立 relation store；可选在全部 SQLite 边中匹配。"""
         total_start = time.time()
-        records = self._relation_repository.get_edges(uri, strategy)
+        scope = "global" if global_search else "source"
+        if global_search:
+            records = self._relation_repository.get_all_edges(strategy)
+        else:
+            records = self._relation_repository.get_edges(uri, strategy)
         if not records:
             logger.info(
-                f"[Relations][PROFILE] no_edges uri={uri} | "
+                f"[Relations][PROFILE] no_edges uri={uri or '<global>'} | "
                 f"store={self._relation_repository.database_path} | "
-                f"strategy={strategy} | total_ms={(time.time() - total_start) * 1000:.0f}"
+                f"strategy={strategy} | scope={scope} | "
+                f"total_ms={(time.time() - total_start) * 1000:.0f}"
             )
             return []
 
@@ -498,12 +504,14 @@ class VikingClient:
         results = []
         candidates: list[dict[str, Any]] = []
         seen = set()
+        similarity_cache: dict[str, float] = {}
+        question_groups_seen: set[str] = set()
         total_records = 0
         scan_start = time.time()
         for rec in records:
             total_records += 1
             uri1, uri2 = rec.get("uri1", ""), rec.get("uri2", "")
-            if uri1 == uri2 or uri1 != uri:
+            if uri1 == uri2 or (not global_search and uri1 != uri):
                 continue
             target = uri2
             if target.endswith(".abstract.md") or target.endswith(".overview.md"):
@@ -513,9 +521,10 @@ class VikingClient:
             rec_query = rec.get("question", rec.get("query_question", ""))
             rec_embedding = rec.get("embedding", rec.get("query_embedding"))
             rec_weight = rec.get("weight", 1.0)
+            group_key = question_id or rec_query or target
+            question_groups_seen.add(group_key)
 
             if not query:
-                group_key = question_id or rec_query or target
                 if target in seen:
                     continue
                 seen.add(target)
@@ -528,7 +537,7 @@ class VikingClient:
                 if include_match_meta:
                     result.update(
                         {
-                            "source_uri": uri,
+                            "source_uri": uri1,
                             "group_key": group_key,
                             "similarity": 0.0,
                         }
@@ -537,9 +546,12 @@ class VikingClient:
                 continue
 
             if query_embedding and rec_embedding:
-                sim = _cosine_similarity(query_embedding, rec_embedding)
+                if group_key not in similarity_cache:
+                    similarity_cache[group_key] = _cosine_similarity(
+                        query_embedding, rec_embedding
+                    )
+                sim = similarity_cache[group_key]
                 if sim > similarity_threshold:
-                    group_key = question_id or rec_query or target
                     candidates.append(
                         {
                             "target": target,
@@ -551,7 +563,7 @@ class VikingClient:
                                 "reason": rec.get("reason", rec_query),
                                 "weight": rec_weight,
                                 "question_id": question_id,
-                                "source_uri": uri,
+                                "source_uri": uri1,
                                 "group_key": group_key,
                                 "similarity": sim,
                             },
@@ -577,12 +589,15 @@ class VikingClient:
             results.append(result)
 
         scan_ms = (time.time() - scan_start) * 1000
+        matched_question_groups = {item["group_key"] for item in candidates}
         if not query:
             results.sort(key=lambda x: x.get("weight", 1.0), reverse=True)
         logger.info(
-            f"[Relations][PROFILE] uri={uri} | "
+            f"[Relations][PROFILE] uri={uri or '<global>'} | "
             f"store={self._relation_repository.database_path} | "
-            f"records={total_records}, matched={len(results)} | strategy={strategy} | "
+            f"records={total_records}, unique_questions={len(question_groups_seen)}, "
+            f"matched_question_groups={len(matched_question_groups)}, "
+            f"matched={len(results)} | strategy={strategy} | scope={scope} | "
             f"match_mode=embedding_candidates, similarity_threshold={similarity_threshold}, "
             f"embed_ms={embed_ms:.0f}, scan_ms={scan_ms:.0f}, "
             f"total_ms={(time.time() - total_start) * 1000:.0f}"

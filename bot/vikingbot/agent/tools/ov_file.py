@@ -135,6 +135,16 @@ class VikingSearchTool(OVFileTool):
             search_total_start = time.time()
             client = await self._get_client(tool_context)
             search_client = getattr(client, 'admin_user_client', client)
+            use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
+            relations_global_search = (
+                os.environ.get("VIKINGBOT_RELATIONS_GLOBAL_SEARCH", "0") == "1"
+            )
+            relation_query = str(
+                getattr(tool_context, "original_question", "") or ""
+            ).strip()
+            can_run_global_relations = (
+                use_relations and relations_global_search and bool(relation_query)
+            )
             # Get default limit from config, then request 3x to ensure enough L2 results after filtering
             try:
                 from openviking_cli.utils.config import get_openviking_config
@@ -150,7 +160,7 @@ class VikingSearchTool(OVFileTool):
                 f"query_len={len(query or '')}"
             )
 
-            if not results:
+            if not results and not can_run_global_relations:
                 return f"No results found for query: {query}"
 
             if isinstance(results, dict):
@@ -160,7 +170,7 @@ class VikingSearchTool(OVFileTool):
             else:
                 resources_list = []
 
-            if not resources_list:
+            if not resources_list and not can_run_global_relations:
                 return str(results)
 
             raw_count = len(resources_list)
@@ -173,19 +183,18 @@ class VikingSearchTool(OVFileTool):
             ]
             l2_count = len(resources_list)
 
-            if not resources_list:
+            if not resources_list and not can_run_global_relations:
                 return f"No L2 content results found for query: {query}"
 
             # Keep only top `default_limit` results by score
             resources_list = sorted(resources_list, key=lambda r: r.get("score", 0), reverse=True)[:default_limit]
             filter_ms = (time.time() - filter_start) * 1000
 
-            use_relations = os.environ.get("VIKINGBOT_USE_RELATIONS", "0") == "1"
-            relation_query = str(getattr(tool_context, "original_question", "") or "").strip()
             relations_found = 0
             logger.info(
                 f"[Search][PROFILE] filter_ms={filter_ms:.0f}, raw_count={raw_count}, "
                 f"l2_count={l2_count}, kept={len(resources_list)}, use_relations={use_relations}, "
+                f"relations_scope={'global' if relations_global_search else 'source'}, "
                 f"relation_query_source=original_question, relation_query_len={len(relation_query)}"
             )
             if use_relations and not relation_query:
@@ -193,7 +202,9 @@ class VikingSearchTool(OVFileTool):
                     "[Search] Relations expansion skipped: original question is unavailable"
                 )
             if use_relations and relation_query:
+                relations_if_start = time.perf_counter()
                 link_strategy = os.environ.get("VIKINGBOT_LINK_STRATEGY", "llm_review")
+                relation_scope = "global" if relations_global_search else "source"
                 seen_uris = {r.get("uri", "") for r in resources_list}
                 initial_search_uris = set(seen_uris)
                 initial_count = len(resources_list)
@@ -209,11 +220,15 @@ class VikingSearchTool(OVFileTool):
                 relation_errors = 0
                 relation_depth = 0
 
-                frontier = [r.get("uri", "") for r in resources_list if r.get("uri", "")]
+                frontier = (
+                    [""]
+                    if relations_global_search
+                    else [r.get("uri", "") for r in resources_list if r.get("uri", "")]
+                )
                 logger.info(
                     f"[Search] Relations expansion starting: "
                     f"frontier={len(frontier)} URIs, strategy={link_strategy}, "
-                    f"relations_topk={relations_topk}"
+                    f"relations_topk={relations_topk}, scope={relation_scope}"
                 )
 
                 while frontier:
@@ -221,16 +236,33 @@ class VikingSearchTool(OVFileTool):
                     depth_start = time.time()
                     depth_frontier_count = len(frontier)
                     rel_call_start = time.time()
-                    rel_tasks = [
-                        client.relations(
-                            uri,
-                            query=relation_query,
-                            strategy=link_strategy,
-                            include_match_meta=True,
-                        )
-                        for uri in frontier
-                    ]
+                    if relations_global_search:
+                        rel_tasks = [
+                            client.relations(
+                                "",
+                                query=relation_query,
+                                strategy=link_strategy,
+                                include_match_meta=True,
+                                global_search=True,
+                            )
+                        ]
+                    else:
+                        rel_tasks = [
+                            client.relations(
+                                uri,
+                                query=relation_query,
+                                strategy=link_strategy,
+                                include_match_meta=True,
+                            )
+                            for uri in frontier
+                        ]
                     rel_results = await asyncio.gather(*rel_tasks, return_exceptions=True)
+                    if (
+                        relations_global_search
+                        and rel_results
+                        and isinstance(rel_results[0], Exception)
+                    ):
+                        raise rel_results[0]
                     rel_call_ms = (time.time() - rel_call_start) * 1000
                     relation_call_total_ms += rel_call_ms
 
@@ -248,6 +280,14 @@ class VikingSearchTool(OVFileTool):
                             continue
                         depth_records += len(rels)
                         for rel in rels:
+                            effective_from_uri = (
+                                str(rel.get("source_uri", ""))
+                                if relations_global_search
+                                else from_uri
+                            )
+                            if not effective_from_uri:
+                                depth_skipped += 1
+                                continue
                             rel_uri = rel.get("uri", "")
                             if not rel_uri:
                                 depth_skipped += 1
@@ -261,7 +301,7 @@ class VikingSearchTool(OVFileTool):
                             if relations_topk > 0 and group_key in pruned_relation_groups:
                                 depth_skipped += 1
                                 continue
-                            depth_candidates.append((from_uri, rel))
+                            depth_candidates.append((effective_from_uri, rel))
 
                     if relations_topk > 0:
                         selected_groups, newly_pruned = update_active_relation_groups(
@@ -354,7 +394,8 @@ class VikingSearchTool(OVFileTool):
                         resources_list.append(item)
                         relations_found += 1
                         depth_new_docs += 1
-                        next_frontier.append(rel_uri)
+                        if not relations_global_search:
+                            next_frontier.append(rel_uri)
 
                     depth_ms = (time.time() - depth_start) * 1000
                     logger.info(
@@ -364,9 +405,10 @@ class VikingSearchTool(OVFileTool):
                         f"existing_hits={depth_existing_hits}, skipped={depth_skipped}, "
                         f"abstract_reads={depth_abstract_reads}, abstract_ms={depth_abstract_ms:.0f}, "
                         f"next_frontier={len(next_frontier)}, depth_ms={depth_ms:.0f}, "
-                        f"active_groups={len(active_group_scores)}, total_results={len(resources_list)}"
+                        f"active_groups={len(active_group_scores)}, total_results={len(resources_list)}, "
+                        f"scope={relation_scope}"
                     )
-                    frontier = next_frontier
+                    frontier = [] if relations_global_search else next_frontier
 
                 if relations_topk > 0:
                     active_groups = set(active_group_scores)
@@ -417,7 +459,15 @@ class VikingSearchTool(OVFileTool):
                     f"abstract_ms={abstract_total_ms:.0f}, errors={relation_errors}, "
                     f"relations_found={relations_found}, active_groups={len(active_group_scores)}, "
                     f"total_results={len(resources_list)} "
-                    f"(was {initial_count}), strategy={link_strategy}"
+                    f"(was {initial_count}), strategy={link_strategy}, scope={relation_scope}"
+                )
+                relations_if_ms = (time.perf_counter() - relations_if_start) * 1000
+                logger.error(
+                    f"[Search][RELATIONS_IF_TIMING] relations_if_ms={relations_if_ms:.3f}, "
+                    f"depth={relation_depth}, relation_call_ms={relation_call_total_ms:.3f}, "
+                    f"abstract_ms={abstract_total_ms:.3f}, errors={relation_errors}, "
+                    f"relations_found={relations_found}, total_results={len(resources_list)}, "
+                    f"strategy={link_strategy}, scope={relation_scope}"
                 )
 
             if tool_context:

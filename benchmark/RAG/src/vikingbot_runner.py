@@ -59,10 +59,17 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, sear
     if llm_config:
         if 'vlm' not in config or config.get('vlm') is None:
             config['vlm'] = {}
+        if 'provider' in llm_config:
+            config['vlm']['provider'] = llm_config['provider']
         if 'model' in llm_config:
             config['vlm']['model'] = llm_config['model']
         if 'base_url' in llm_config:
             config['vlm']['api_base'] = llm_config['base_url']
+        if 'api_key' in llm_config:
+            raw_api_key = llm_config['api_key'] or ''
+            config['vlm']['api_key'] = os.path.expandvars(str(raw_api_key))
+        elif llm_config.get('api_key_env_var'):
+            config['vlm']['api_key'] = os.environ.get(llm_config['api_key_env_var'], '')
         if 'temperature' in llm_config:
             config['vlm']['temperature'] = llm_config['temperature']
 
@@ -74,6 +81,9 @@ def _generate_temp_ov_conf(original_conf_path: str, vector_store_path: str, sear
         hash_input += f"_sl{search_limit}".encode('utf-8')
     if llm_config:
         hash_input += json.dumps(llm_config, sort_keys=True).encode('utf-8')
+        resolved_api_key = config.get('vlm', {}).get('api_key', '')
+        if resolved_api_key:
+            hash_input += hashlib.sha256(str(resolved_api_key).encode('utf-8')).digest()
     if server_port is not None:
         hash_input += f"_port{server_port}".encode('utf-8')
     path_hash = hashlib.md5(hash_input).hexdigest()
@@ -314,6 +324,7 @@ def _build_vikingbot_env(
     enable_reasoning: bool = True,
     relations_topk: int = 0,
     relations_similarity_threshold: float | None = None,
+    relations_global_search: bool = False,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
@@ -325,6 +336,7 @@ def _build_vikingbot_env(
     env["VIKINGBOT_ENABLE_REASONING"] = "1" if enable_reasoning else "0"
     env["VIKINGBOT_LINK_STRATEGY"] = link_strategy
     env["VIKINGBOT_RELATIONS_TOPK"] = str(int(relations_topk or 0))
+    env["VIKINGBOT_RELATIONS_GLOBAL_SEARCH"] = "1" if relations_global_search else "0"
     if relations_similarity_threshold is not None:
         env["VIKINGBOT_RELATIONS_SIMILARITY_THRESHOLD"] = str(relations_similarity_threshold)
     if embedding_config:
@@ -371,6 +383,10 @@ class VikingBotRunner:
         self.relations_similarity_threshold = self.vikingbot_config.get(
             'relations_similarity_threshold',
             config.get('execution', {}).get('relations_similarity_threshold'),
+        )
+        self.relations_global_search = self.vikingbot_config.get(
+            'relations_global_search',
+            config.get('execution', {}).get('relations_global_search', False),
         )
         self.vector_store_path = config.get('paths', {}).get('vector_store')
         self.llm_config = config.get('llm', None)
@@ -425,6 +441,7 @@ class VikingBotRunner:
                 enable_reasoning=self.enable_reasoning,
                 relations_topk=self.relations_topk,
                 relations_similarity_threshold=self.relations_similarity_threshold,
+                relations_global_search=self.relations_global_search,
             )
 
             # Write bot JSON output to a temp file (avoids stdout escape issues)
