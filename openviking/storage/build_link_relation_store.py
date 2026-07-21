@@ -504,6 +504,7 @@ class SQLiteRelationStore:
             """
             SELECT
                 e.id,
+                source.uri AS source_uri,
                 target.uri AS target_uri,
                 e.question_key,
                 e.reason_id,
@@ -529,6 +530,45 @@ class SQLiteRelationStore:
             """,
             (source_uri, strategy),
         ).fetchall()
+        return self._decode_edge_rows(rows)
+
+    def get_all_edges(self, strategy: str) -> list[dict[str, Any]]:
+        """Return every SQLite edge for a strategy, without source filtering."""
+        if not self.exists:
+            return []
+        rows = self._connect().execute(
+            """
+            SELECT
+                e.id,
+                source.uri AS source_uri,
+                target.uri AS target_uri,
+                e.question_key,
+                e.reason_id,
+                e.weight,
+                e.extra_codec,
+                e.extra_raw_size,
+                e.extra_payload,
+                q.id AS question_row_id,
+                q.question_utf8,
+                q.dimension,
+                q.embedding_f64,
+                reason.value_type AS reason_value_type,
+                reason.codec AS reason_codec,
+                reason.raw_size AS reason_raw_size,
+                reason.payload AS reason_payload
+            FROM edges e
+            JOIN resources source ON source.id = e.source_id
+            JOIN resources target ON target.id = e.target_id
+            LEFT JOIN questions q ON q.id = e.question_id
+            JOIN reasons reason ON reason.id = e.reason_id
+            WHERE e.strategy = ?
+            ORDER BY e.id
+            """,
+            (strategy,),
+        ).fetchall()
+        return self._decode_edge_rows(rows)
+
+    def _decode_edge_rows(self, rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         reasons: dict[int, Any] = {}
         for row in rows:
@@ -564,7 +604,7 @@ class SQLiteRelationStore:
                     reasons[reason_id] = _decode_text(reason_raw)
             record.update(
                 {
-                    "uri1": source_uri,
+                    "uri1": str(row["source_uri"]),
                     "uri2": str(row["target_uri"]),
                     "question_id": str(row["question_key"]),
                     "question": question,
@@ -724,6 +764,16 @@ class RelationRepository:
                 legacy_edges.append(edge)
                 existing.add(key)
         return legacy_edges
+
+    def get_all_edges(self, strategy: str) -> list[dict[str, Any]]:
+        """Return all SQLite edges for an experimental global relation search."""
+        if self.mode == "jsonl":
+            raise RuntimeError("Global relation search requires the SQLite relation store")
+        if not self.sqlite.exists:
+            raise FileNotFoundError(
+                f"Global relation search SQLite database not found: {self.sqlite.db_path}"
+            )
+        return self.sqlite.get_all_edges(strategy)
 
     def add_edges(
         self,
