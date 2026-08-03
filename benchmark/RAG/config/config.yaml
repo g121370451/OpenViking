@@ -16,6 +16,8 @@ adapter:
 
 # ===========Execution Configuration============
 execution:
+  # Backend mode: standard, bookrag, vikingbot, nanobot, or an OV fallback mode
+  # mode: "bookrag"
   # Maximum number of concurrent worker threads for parallel QA task processing
   max_workers: 10
   # Number of concurrent worker threads for document ingestion
@@ -60,13 +62,57 @@ paths:
 # Large language model configuration for answer generation and evaluation
 llm:
   # Model name
-  model: "doubao-seed-1-8-251228"
+  model: "doubao-seed-2.0-lite"
   # Generation temperature (0 means deterministic output, higher values mean more randomness)
   temperature: 0
   # API base URL
   base_url: "https://ark.cn-beijing.volces.com/api/v3"
   # API key (keep this secure, do not commit to code repositories)
   api_key: "${VOLCENGINE_API_KEY}"
+
+# ===========BookRAG Configuration============
+# Used only when execution.mode is "bookrag". BookRAG consumes the Markdown
+# files produced by the selected Adapter and builds one cross-document GBC index.
+bookrag:
+  index_dir: "datasets/{dataset_name}/bookrag_index"
+  index:
+    chunk_size: 512
+    overlap: 50
+    tokenizer: "cl100k_base"
+  tree:
+    node_summary: true
+    node_keywords: true
+  graph:
+    extractor_type: "llm"
+    refine_type: "advanced"
+    similarity_threshold: 0.6
+  gbc:
+    variant: "standard"
+    topk: 5
+    select_depth: 2
+    topk_ent: 5
+    sim_threshold_e: 0.3
+    alpha: 0.5
+    x_percentile: 0.85
+    max_retry: 3
+  reranker:
+    model: "doubao-seed-rerank"
+    model_version: "251028"
+    backend: "vikingdb"
+    ak: "${VIKINGDB_RERANK_AK}"
+    sk: "${VIKINGDB_RERANK_SK}"
+    host: "api-vikingdb.vikingdb.cn-beijing.volces.com"
+    threshold: 0.1
+    batch_size: 100
+
+# BookRAG requires a text embedding endpoint. The fields are translated to
+# BookRAG EmbeddingConfig only in bookrag mode.
+embedding:
+  model: "doubao-embedding-vision-250615"
+  backend: "volcengine"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+  max_workers: 8
 question_rewrites:
   enabled: true
   cache_root: "rewrites"

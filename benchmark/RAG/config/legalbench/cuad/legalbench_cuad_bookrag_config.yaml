@@ -1,0 +1,77 @@
+project_name: "RAG_Benchmark"
+
+# LegalBench CUAD 的 BookRAG benchmark 配置。
+dataset_name: "LegalBench_CUAD"
+
+adapter:
+  module: "src.adapters.legalbench_adapter"
+  class_name: "LegalBenchAdapter"
+
+execution:
+  mode: "bookrag"
+  max_workers: 4
+  ingest_workers: 4
+  retrieval_topk: 5
+  max_queries: null
+  ingest_mode: "dataset"
+  retrieval_instruction: ""
+  use_vikingbot: false
+
+paths:
+  dataset_path: "datasets/LegalBench/benchmarks/cuad.json"
+  doc_output_dir: "ov_storage/LegalBench/LegalBench_processed_docs"
+  vector_store: "ov_storage/LegalBench/.LegalBench_CUAD_bookrag_index"
+  output_dir: "Output/{dataset_name}/experiment_bookrag_top_{retrieval_topk}"
+  log_file: "Output/{dataset_name}/experiment_bookrag_top_{retrieval_topk}/benchmark.log"
+
+llm:
+  model: "doubao-seed-2.0-lite"
+  temperature: 0
+  max_tokens: 4096
+  base_url: "https://ark.cn-beijing.volces.com/api/plan/v3"
+  api_key: "${DOUBAO_LLM_API_KEY}"
+
+embedding:
+  model: "doubao-embedding-vision-250615"
+  backend: "volcengine"
+  base_url: "https://ark.cn-beijing.volces.com/api/plan/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+  max_length: 8192
+  max_workers: 8
+
+bookrag:
+  index_dir: "ov_storage/LegalBench/.LegalBench_CUAD_bookrag_index"
+  index:
+    chunk_size: 512
+    overlap: 50
+    tokenizer: "cl100k_base"
+  tree:
+    node_summary: true
+    node_keywords: true
+  graph:
+    extractor_type: "llm"
+    refine_type: "advanced"
+    similarity_threshold: 0.6
+  gbc:
+    variant: "standard"
+    topk: 5
+    select_depth: 2
+    topk_ent: 5
+    sim_threshold_e: 0.3
+    alpha: 0.5
+    x_percentile: 0.85
+    max_retry: 3
+  reranker:
+    backend: "vikingdb"
+    ak: "${VIKINGDB_RERANK_AK}"
+    sk: "${VIKINGDB_RERANK_SK}"
+    host: "api-vikingdb.vikingdb.cn-beijing.volces.com"
+    model: "doubao-seed-rerank"
+    model_version: "251028"
+    threshold: 0.1
+    batch_size: 100
+    max_length: 8192
+
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"

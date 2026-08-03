@@ -23,6 +23,23 @@ from openviking.models.rerank.base import RerankBase
 logger = logging.getLogger(__name__)
 
 
+class VikingDBRerankError(RuntimeError):
+    """A VikingDB rerank failure with enough context for caller-side recovery."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        response=None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response = response
+        self.retryable = retryable
+
+
 class RerankClient(RerankBase):
     """
     VikingDB Rerank API client.
@@ -94,8 +111,11 @@ class RerankClient(RerankBase):
             documents: List of document texts to rank
 
         Returns:
-            List of rerank scores for each document (same order as input),
-            or None when rerankver fails and the caller should fall back
+            List of rerank scores for each document (same order as input).
+
+        Raises:
+            VikingDBRerankError: The HTTP request failed or the response was
+                invalid. The exception retains details for caller-side retry.
         """
         if not documents:
             return []
@@ -109,6 +129,7 @@ class RerankClient(RerankBase):
             "instruction": "Whether the Document answers the Query or matches the content retrieval intent",
         }
 
+        response = None
         try:
             started = time.monotonic()
             req = self._prepare_request(
@@ -125,11 +146,36 @@ class RerankClient(RerankBase):
                 timeout=30,
             )
 
-            result = response.json()
+            status_code = getattr(response, "status_code", 200) or 200
+            try:
+                result = response.json()
+            except Exception as error:
+                response_text = str(getattr(response, "text", ""))[:1000]
+                raise VikingDBRerankError(
+                    "VikingDB reranker returned non-JSON response"
+                    + (f": {response_text}" if response_text else ""),
+                    status_code=status_code,
+                    response=response,
+                    retryable=status_code == 429 or status_code >= 500,
+                ) from error
+
+            response_summary = json.dumps(result, ensure_ascii=False)[:1000]
+            if status_code >= 400:
+                raise VikingDBRerankError(
+                    f"VikingDB reranker HTTP {status_code}: {response_summary}",
+                    status_code=status_code,
+                    response=response,
+                    retryable=status_code == 429 or status_code >= 500,
+                )
+
             # print(f"[RerankClient] Raw response: {result}")
             if "result" not in result or "data" not in result["result"]:
-                logger.warning(f"[RerankClient] Unexpected response format: {result}")
-                return None
+                raise VikingDBRerankError(
+                    f"VikingDB reranker returned unexpected response: {response_summary}",
+                    status_code=status_code,
+                    response=response,
+                    retryable=True,
+                )
 
             # Update token usage tracking (estimate, VikingDB doesn't provide token info)
             self._extract_and_update_token_usage(
@@ -142,20 +188,38 @@ class RerankClient(RerankBase):
             # Each document is a separate group, data array returns scores for each group sequentially
             data = result["result"]["data"]
             if len(data) != len(documents):
-                logger.warning(
-                    "[RerankClient] Unexpected rerank result length: expected=%s actual=%s",
-                    len(documents),
-                    len(data),
+                raise VikingDBRerankError(
+                    "VikingDB reranker returned an unexpected result length: "
+                    f"expected={len(documents)} actual={len(data)}",
+                    status_code=status_code,
+                    response=response,
+                    retryable=True,
                 )
-                return None
             scores = [item.get("score", 0.0) for item in data]
 
             logger.debug(f"[RerankClient] Reranked {len(documents)} documents")
             return scores
 
-        except Exception as e:
-            logger.error(f"[RerankClient] Rerank failed: {e}")
-            return None
+        except VikingDBRerankError as error:
+            logger.error("[RerankClient] Rerank failed: %s", error)
+            raise
+        except Exception as error:
+            error_response = getattr(error, "response", None)
+            if error_response is None:
+                error_response = response
+            status_code = getattr(error_response, "status_code", None)
+            retryable = isinstance(
+                error,
+                (requests.Timeout, requests.ConnectionError),
+            ) or status_code == 429 or (status_code is not None and status_code >= 500)
+            wrapped = VikingDBRerankError(
+                f"VikingDB reranker request failed with {type(error).__name__}: {error}",
+                status_code=status_code,
+                response=error_response,
+                retryable=retryable,
+            )
+            logger.error("[RerankClient] Rerank failed: %s", wrapped)
+            raise wrapped from error
 
     @classmethod
     def from_config(cls, config) -> Optional["RerankClient"]:

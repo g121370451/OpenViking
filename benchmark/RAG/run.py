@@ -121,15 +121,29 @@ def main():
             config['paths'][key] = resolved
             # print(f"  - {key}: {resolved}")
 
+    bookrag_cfg = config.get('bookrag', {})
+    if isinstance(bookrag_cfg, dict) and bookrag_cfg.get('index_dir'):
+        rendered_path = str(bookrag_cfg['index_dir']).format(**format_vars)
+        bookrag_cfg['index_dir'] = resolve_path(rendered_path, PROJECT_ROOT)
+
     # Store ov_config_path in config for vikingbot_runner to use
     config['_ov_conf_path'] = ov_config_path
 
     # --- D. Initialize Components ---
     try:
+        mode = config.get('execution', {}).get('mode')
+        if mode is None:
+            if config.get('execution', {}).get('use_nanobot', False):
+                mode = "nanobot"
+            elif config.get('execution', {}).get('use_vikingbot', False):
+                mode = "vikingbot"
+            else:
+                mode = "standard"
+
         search_limit = config.get('vikingbot', {}).get('search_limit')
         llm_config = config.get('llm', None)
         server_port = config.get('execution', {}).get('server_port', None)
-        if os.path.exists(ov_config_path):
+        if mode != "bookrag" and os.path.exists(ov_config_path):
             temp_conf_path = _generate_temp_ov_conf(
                 ov_config_path,
                 config['paths'].get('vector_store', ''),
@@ -173,18 +187,16 @@ def main():
         llm_client = LLMClientWrapper(config=config['llm'], api_key=api_key)
 
         # 3. Vector Store
-        mode = config.get('execution', {}).get('mode')
-        if mode is None:
-            if config.get('execution', {}).get('use_nanobot', False):
-                mode = "nanobot"
-            elif config.get('execution', {}).get('use_vikingbot', False):
-                mode = "vikingbot"
-            else:
-                mode = "standard"
-
         if mode == "nanobot":
             vector_store = None
             logger.info("Nanobot mode: skipping VikingStoreWrapper initialization")
+        elif mode == "bookrag":
+            from src.bookrag_runner import BookRAGStoreWrapper
+
+            vector_store = BookRAGStoreWrapper(config=config, llm=llm_client)
+            logger.info(
+                f"BookRAG mode: using dataset-level GBC index at {vector_store.index_dir}"
+            )
         elif mode in ("ov_fallback_bot", "ov_fallback_bot_relations"):
             vector_store_path = config['paths']['vector_store']
             search_limit = config.get('vikingbot', {}).get('search_limit')

@@ -652,7 +652,8 @@ class BenchmarkPipeline:
         
         mode_desc = {
             'directory': 'Unified directory mode',
-            'per_file': 'Per-file mode'
+            'per_file': 'Per-file mode',
+            'dataset': 'Dataset-level aggregate mode',
         }
         self.logger.info(f"Ingestion mode: {ingest_mode} ({mode_desc.get(ingest_mode, 'Unknown mode')})")
         self.logger.info(f"Number of documents: {len(doc_info)}")
@@ -715,6 +716,7 @@ class BenchmarkPipeline:
 
         mode_dispatch = {
             "standard": self._process_generation_task,
+            "bookrag": self._process_bookrag_task,
             "vikingbot": self._process_vikingbot_task,
             "nanobot": self._process_nanobot_task,
             "ov_fallback_bot": self._process_ov_fallback_bot_task,
@@ -1541,6 +1543,90 @@ class BenchmarkPipeline:
             "relation_edges_hit": relation_edges_hit,
             "runs": summaries,
         }
+
+    def _process_bookrag_task(self, task):
+        """Use BookRAG's official AnswerAgent result without a second LLM pass."""
+        self.monitor.worker_start()
+        try:
+            qa = task["qa"]
+            retrieval_instruction = self.config["execution"].get(
+                "retrieval_instruction", ""
+            )
+            query = (
+                f"{retrieval_instruction} {qa.question}".strip()
+                if retrieval_instruction
+                else qa.question
+            )
+            trace_dir = os.path.join(
+                self.output_dir,
+                "bookrag_traces",
+                f"query_{int(task['id']) + 1:04d}",
+            )
+
+            started = time.time()
+            result = self.db.answer(
+                query=query,
+                topk=self.config["execution"]["retrieval_topk"],
+                query_output_dir=trace_dir,
+            )
+            latency = time.time() - started
+
+            recall_texts = result.get("recall_texts", {}) or {}
+            retrieved_uris = result.get("retrieved_uris", []) or []
+            recall = MetricsCalculator.check_recall(
+                list(recall_texts.values()), qa.evidence
+            )
+            token_usage = result.get("token_usage", {}) or {}
+            prompt_tokens = int(token_usage.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(token_usage.get("completion_tokens", 0) or 0)
+            total_tokens = int(
+                token_usage.get("total_tokens", prompt_tokens + completion_tokens)
+                or 0
+            )
+            answer = str(result.get("answer", "") or "")
+
+            self.monitor.worker_end(tokens=total_tokens)
+            self.logger.info(
+                f"[Query-{task['id']}] BookRAG AnswerAgent | "
+                f"Nodes={len(result.get('retrieved_node_ids', []) or [])} | "
+                f"Recall={recall:.2f} | Time={latency:.2f}s"
+            )
+
+            return {
+                "_global_index": task["id"],
+                "sample_id": task["sample_id"],
+                "question": qa.question,
+                "gold_answers": qa.gold_answers,
+                "category": str(qa.category),
+                "evidence": qa.evidence,
+                "retrieval": {
+                    "latency_sec": latency,
+                    "uris": retrieved_uris,
+                },
+                "llm": {
+                    "final_answer": answer,
+                    "backend": "bookrag_answer_agent",
+                },
+                "bookrag": {
+                    "retrieved_node_ids": result.get("retrieved_node_ids", []),
+                    "trace_dir": result.get("trace_dir", trace_dir),
+                    "total_time_sec": latency,
+                },
+                "metrics": {"Recall": recall},
+                "token_usage": {
+                    "total_input_tokens": prompt_tokens,
+                    "llm_output_tokens": completion_tokens,
+                    "retrieval_embedding_tokens": int(
+                        result.get("retrieval_tokens", 0) or 0
+                    ),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                },
+            }
+        except Exception:
+            self.monitor.worker_end(success=False)
+            raise
 
     def _get_question_rewrites(self, sample_id: str, question: str) -> list[str]:
         store = QuestionRewriteStore(

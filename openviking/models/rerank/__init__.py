@@ -14,11 +14,15 @@ from openviking.models.rerank.base import RerankBase
 from openviking.models.rerank.cohere_rerank import CohereRerankClient
 from openviking.models.rerank.litellm_rerank import LiteLLMRerankClient
 from openviking.models.rerank.openai_rerank import OpenAIRerankClient
-from openviking.models.rerank.volcengine_rerank import RerankClient
+from openviking.models.rerank.volcengine_rerank import (
+    RerankClient,
+    VikingDBRerankError,
+)
 
 __all__ = [
     "RerankBase",
     "RerankClient",
+    "VikingDBRerankError",
     "CohereRerankClient",
     "LiteLLMRerankClient",
     "OpenAIRerankClient",

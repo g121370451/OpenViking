@@ -57,6 +57,10 @@ uv pip install -e ".[benchmark]"
 source .venv/bin/activate
 ```
 
+For the Python 3.10+ BookRAG backend, install
+`uv pip install -e ".[benchmark,bookrag]"` and follow
+[the BookRAG backend guide](./docs/bookrag_backend.md).
+
 #### 2. Prepare Datasets
 
 This project provides a complete dataset preparation workflow, including downloading, sampling, and configuration.

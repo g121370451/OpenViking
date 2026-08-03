@@ -57,6 +57,10 @@ uv pip install -e ".[benchmark]"
 source .venv/bin/activate
 ```
 
+如需使用 Python 3.10+ 的 BookRAG 后端，请安装
+`uv pip install -e ".[benchmark,bookrag]"`，配置方法见
+[BookRAG 后端说明](./docs/bookrag_backend.md)。
+
 #### 2. 准备数据集
 
 本项目提供完整的数据集准备工作流，包括下载、抽样和配置。
