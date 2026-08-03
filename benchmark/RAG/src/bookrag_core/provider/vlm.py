@@ -19,7 +19,8 @@ os.environ["OLLAMA_HOST"] = "http://127.0.0.1:11434"
 from bookrag_core.configs import vlm_config
 from bookrag_core.configs.vlm_config import VLMConfig
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Executor, ThreadPoolExecutor, as_completed
+from bookrag_core.utils.ingest_timer import submit_ingest_task
 
 log = logging.getLogger(__name__)
 
@@ -519,7 +520,11 @@ class VLM:
         return {}
 
     def batch_generate(
-        self, queries: list, images_list: list = None, max_workers: int = 8
+        self,
+        queries: list,
+        images_list: list = None,
+        max_workers: int = 8,
+        executor: Optional[Executor] = None,
     ):
         if isinstance(self.vlm, QwenVLController):
             if len(queries) > 1:
@@ -527,11 +532,14 @@ class VLM:
                     "QwenVLController does not support parallel batch inference in a single process."
                 )
             return [self.generate(queries[0], images_list[0] if images_list else None)]
-        results = [None] * len(queries)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        def run(active_executor: Executor):
+            results = [None] * len(queries)
             future_to_idx = {
-                executor.submit(
-                    self.generate, queries[i], images_list[i] if images_list else None
+                submit_ingest_task(
+                    active_executor,
+                    self.generate,
+                    queries[i],
+                    images_list[i] if images_list else None,
                 ): i
                 for i in range(len(queries))
             }
@@ -541,7 +549,15 @@ class VLM:
                     results[idx] = future.result()
                 except Exception as e:
                     results[idx] = f"Error: {e}"
-        return results
+            return results
+
+        if executor is not None:
+            return run(executor)
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="bookrag-vlm",
+        ) as owned_executor:
+            return run(owned_executor)
 
 
 if __name__ == "__main__":

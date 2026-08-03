@@ -5,15 +5,15 @@
 
 from __future__ import annotations
 
-import copy
 import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from bookrag_core.configs.system_config import SystemConfig
 from bookrag_core.Index.Tree import DocumentTree, NodeType, TreeNode
+from bookrag_core.pipelines.tree_aggregation import aggregate_document_trees
 
 log = logging.getLogger(__name__)
 
@@ -288,51 +288,6 @@ def build_tree_from_markdown(
     """Public Core entry for constructing one document tree from Markdown."""
     builder = MarkdownTreeBuilder()
     return builder.build_file(markdown_path, sample_id=str(sample_id), cfg=cfg)
-
-
-def aggregate_document_trees(
-    document_trees: Iterable[DocumentTree],
-    *,
-    cfg: SystemConfig | None = None,
-    dataset_name: str = "dataset",
-) -> DocumentTree:
-    """Fuse document trees without changing their original node depths."""
-    source_trees = list(document_trees)
-    aggregate = DocumentTree(
-        meta_dict={"file_name": dataset_name, "sample_id": dataset_name},
-        cfg=cfg,
-    )
-    aggregate.root_node.depth = -1
-    aggregate.root_node.meta_info.local_index_id = None
-    aggregate.root_node.meta_info.block_type = "dataset_root"
-
-    nodes = [aggregate.root_node]
-    for source_tree in source_trees:
-        cloned_tree = copy.deepcopy(source_tree)
-        document_root = cloned_tree.root_node
-        if document_root is None:
-            continue
-        document_root.parent = aggregate.root_node
-        aggregate.root_node.children.append(document_root)
-
-        for node in cloned_tree.nodes:
-            if node.meta_info.local_index_id is None:
-                node.meta_info.local_index_id = node.index_id
-            node.index_id = len(nodes)
-            nodes.append(node)
-
-    aggregate.nodes = nodes
-    aggregate.pdf_id_to_index_id = {}
-    aggregate.max_depth = max((node.depth for node in nodes), default=-1)
-    if cfg is None and source_trees:
-        aggregate.save_dir = source_trees[0].save_dir
-
-    log.info(
-        "Aggregated %d Markdown documents into one tree with %d nodes.",
-        len(source_trees),
-        len(aggregate.nodes),
-    )
-    return aggregate
 
 
 def build_dataset_tree_from_markdown(

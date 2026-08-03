@@ -1,7 +1,8 @@
 # Copyright (C) 2025-2026 Shu Wang
 # SPDX-License-Identifier: Apache-2.0 OR AGPL-3.0-only
 
-from typing import Optional, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Optional, List, Dict
 
 from bookrag_core.provider.llm import LLM
 from bookrag_core.prompts.refiner_prompt import (
@@ -11,12 +12,80 @@ from bookrag_core.prompts.refiner_prompt import (
     StitchingJudgmentsResponse,
 )
 from bookrag_core.utils.utils import num_tokens, get_json_content, enumerate_pdf_list
+from bookrag_core.utils.ingest_timer import submit_ingest_task
 import json
 import re
 import logging
 from bs4 import BeautifulSoup
 
 log = logging.getLogger(__name__)
+
+
+def _run_llm_judgment_batches(
+    batches: list[tuple[int, str]],
+    llm: LLM,
+    *,
+    prompt_template: str,
+    prompt_key: str,
+    schema: Any,
+    label: str,
+) -> tuple[list[Any], list[str]]:
+    """Run independent refiner batches concurrently and restore input order."""
+    if not batches:
+        return [], []
+
+    def judge(batch: tuple[int, str]) -> tuple[list[Any] | None, str]:
+        expected, json_str = batch
+        prompt = prompt_template.format(**{prompt_key: json_str})
+        for _ in range(2):
+            try:
+                log.info("number of tokens in prompt: %d", num_tokens(prompt))
+                response = llm.get_json_completion(prompt=prompt, schema=schema)
+                judgments = list(response.judgments)
+                if len(judgments) != expected:
+                    log.error(
+                        "LLM response length mismatch: %d vs %d",
+                        len(judgments),
+                        expected,
+                    )
+                    continue
+                return judgments, json_str
+            except Exception as error:
+                log.error("LLM error: %s", error)
+                log.error("Prompt: %s", prompt)
+        log.error("Failed to process %d %s pairs with LLM judgment.", expected, label)
+        return None, json_str
+
+    workers = min(len(batches), max(1, int(getattr(llm, "max_workers", 1))))
+    log.info(
+        "Processing %d independent %s judgment batches with %d workers.",
+        len(batches),
+        label,
+        workers,
+    )
+    ordered_results: list[tuple[list[Any] | None, str] | None] = [None] * len(batches)
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix=f"bookrag-{label}-refiner",
+    ) as executor:
+        futures = {
+            submit_ingest_task(executor, judge, batch): position
+            for position, batch in enumerate(batches)
+        }
+        for future in as_completed(futures):
+            ordered_results[futures[future]] = future.result()
+
+    judgments: list[Any] = []
+    failed_json: list[str] = []
+    for result in ordered_results:
+        if result is None:
+            raise RuntimeError(f"Missing {label} refiner batch result")
+        batch_judgments, json_str = result
+        if batch_judgments is None:
+            failed_json.append(json_str)
+        else:
+            judgments.extend(batch_judgments)
+    return judgments, failed_json
 
 
 def is_likely_incomplete_paragraph(text: str) -> bool:
@@ -266,34 +335,16 @@ def llm_text_judge(text_candidate_pairs, llm: LLM):
         text_candidate_pairs, llm.config.max_tokens -
         num_tokens(TEXT_MERGE_PROMPT) - 400
     )
-    llm_infer_results = []
-    for number, json_str in json_str_list:
-        success = False
-        for i in range(2):
-            try:
-                prompt = TEXT_MERGE_PROMPT.format(json_text=json_str)
-                log.info(f"number of tokens in prompt: {num_tokens(prompt)}")
-                response = llm.get_json_completion(
-                    prompt=prompt, schema=StitchingJudgmentsResponse)
-                judgments = response.judgments
-                if len(judgments) != number:
-                    log.error(
-                        f"LLM response length mismatch: {len(judgments)} vs {number}"
-                    )
-                    continue
-                else:
-                    llm_infer_results.extend(judgments)
-                    success = True
-                    break  # Exit the retry loop on success
-            except Exception as e:
-                log.error(f"LLM error: {e}")
-                log.error(f"Prompt: {prompt}")
-                continue
-        if not success:
-            # remove current json_str from the list if all retries failed
-            log.error(
-                f"Failed to process {number} table pairs with LLM judgment.")
-            found_remove_text(text_candidate_pairs, json_str)
+    llm_infer_results, failed_json = _run_llm_judgment_batches(
+        json_str_list,
+        llm,
+        prompt_template=TEXT_MERGE_PROMPT,
+        prompt_key="json_text",
+        schema=StitchingJudgmentsResponse,
+        label="text",
+    )
+    for json_str in failed_json:
+        found_remove_text(text_candidate_pairs, json_str)
 
     if len(llm_infer_results) != len(text_candidate_pairs):
         log.error(
@@ -578,36 +629,16 @@ def llm_table_judger(table_pairs: list[tuple[dict, dict]], llm: LLM):
         table_pairs, llm.config.max_tokens -
         num_tokens(TABLE_MERGE_PROMPT) - 500
     )
-    llm_infer_results = []
-    for number, json_str in json_str_list:
-        log.info(f"Processing {number} table pairs with LLM judgment.")
-        # retry twice to ensure robustness
-        success = False
-        for i in range(2):
-            try:
-                prompt = TABLE_MERGE_PROMPT.format(json_pairs=json_str)
-                log.info(f"number of tokens in prompt: {num_tokens(prompt)}")
-                response = llm.get_json_completion(
-                    prompt=prompt, schema=MergeJudgmentsResponse)
-                judgements = response.judgments
-                if len(judgements) != number:
-                    log.error(
-                        f"LLM response length mismatch: {len(judgements)} vs {number}"
-                    )
-                    continue
-                else:
-                    llm_infer_results.extend(judgements)
-                    success = True
-                    break  # Exit the retry loop on success
-            except Exception as e:
-                log.error(f"LLM error: {e}")
-                log.error(f"Prompt: {prompt}")
-                continue
-        if not success:
-            # remove current json_str from the list if all retries failed
-            log.error(
-                f"Failed to process {number} table pairs with LLM judgment.")
-            found_remove_table(table_pairs, json_str)
+    llm_infer_results, failed_json = _run_llm_judgment_batches(
+        json_str_list,
+        llm,
+        prompt_template=TABLE_MERGE_PROMPT,
+        prompt_key="json_pairs",
+        schema=MergeJudgmentsResponse,
+        label="table",
+    )
+    for json_str in failed_json:
+        found_remove_table(table_pairs, json_str)
 
     if len(llm_infer_results) != len(table_pairs):
         log.error(

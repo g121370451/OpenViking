@@ -118,8 +118,37 @@ def source_records(
 
 
 def tree_config_fingerprint(cfg) -> str:
-    del cfg
-    return canonical_sha256({})
+    if getattr(cfg, "source_format", None) != "pdf":
+        # The legacy normalized-Markdown tree has no model/parser-dependent
+        # structure. Keep its existing checkpoint semantics for focused tests
+        # and for explicitly constructed legacy configs.
+        return canonical_sha256({})
+
+    mineru = cfg.mineru
+    llm = cfg.llm
+    tree = cfg.tree
+    return canonical_sha256(
+        {
+            "source_format": "pdf",
+            "mineru": {
+                "backend": mineru.backend,
+                "method": mineru.method,
+                "lang": mineru.lang,
+                "server_url": mineru.server_url,
+            },
+            # pdf_info_refiner and outline extraction use the LLM and therefore
+            # affect tree structure before the summary stage begins.
+            "tree_llm": {
+                "model": llm.model_name,
+                "api_base": llm.api_base,
+                "max_tokens": llm.max_tokens,
+                "temperature": llm.temperature,
+            },
+            "tree": {
+                "node_keywords": tree.node_keywords,
+            },
+        }
+    )
 
 
 def summary_config_fingerprint(cfg) -> str:

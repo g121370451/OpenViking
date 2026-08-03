@@ -22,7 +22,6 @@ from rich.logging import RichHandler
 
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # log_dir = "/home/wangshu/multimodal/GBC-RAG/test/index_qwen3/logs"
@@ -51,6 +50,7 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
     :return: A tuple containing the KGExtractor and KGRefiner instances.
     """
     llm = LLM(cfg.llm)
+    ingest_workers = max(1, int(getattr(cfg, "ingest_workers", 1)))
     vlm = VLM(cfg.vlm) if cfg.graph.image_description_force else None
 
     # try load_the graph if constructed before
@@ -108,6 +108,8 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         cfg_graph=cfg.graph, llm=llm, vlm=vlm, save_path=cfg.save_path
     )
     kg_extract_res = []
+    token_tracker = TokenTracker.get_instance()
+    extraction_token_baseline = token_tracker.get_usage()
 
     batch_process = True
 
@@ -140,12 +142,16 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
                 nodes=batch_title_nodes,
                 title_paths=batch_title_paths,
                 sibling_nodes_list=batch_sibling_nodes,
+                max_workers=ingest_workers,
             )
             kg_extract_res.extend(res_dict)
 
         if batch_nodes:
             log.info("Processing non-title nodes in batches...------")
-            res_dict = kg_extractor.batch_extract_kg(nodes=batch_nodes)
+            res_dict = kg_extractor.batch_extract_kg(
+                nodes=batch_nodes,
+                max_workers=ingest_workers,
+            )
             kg_extract_res.extend(res_dict)
 
         # resort the results based on node index
@@ -179,8 +185,10 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
             f"missing={missing[:10]}, unexpected={unexpected[:10]}"
         )
 
-    token_tracker = TokenTracker.get_instance()
-    kg_extraction_cost = token_tracker.record_stage("kg_extraction")
+    kg_extraction_cost = token_tracker.record_stage_since(
+        "kg_extraction",
+        extraction_token_baseline,
+    )
     log.info(f"Knowledge graph extraction cost: {kg_extraction_cost}")
 
     extraction_fingerprint = canonical_sha256(kg_extract_res)
@@ -217,6 +225,7 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         start_position = 0
         refinement_phase = "entity_resolution"
 
+    refinement_token_baseline = token_tracker.get_usage()
     kg_refiner = KGRefiner(
         llm=llm,
         graph_config=cfg.graph,
@@ -224,6 +233,7 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         save_path=cfg.save_path,
         g=cfg.graph.g,
         resume_state=refinement_snapshot,
+        max_workers=ingest_workers,
     )
     checkpoint_every = max(
         1,
@@ -274,59 +284,25 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
                                 "entity_resolution",
                             )
                 elif cfg.graph.refine_type == "advanced":
-                    merge_workers = max(
-                        1,
-                        int(getattr(cfg.llm, "max_workers", 4)),
-                    )
-                    log.info(
-                        "Advanced KG merge uses %d concurrent TreeNode LLM workers; "
-                        "Graph/VDB operations remain locked.",
-                        merge_workers,
-                    )
-                    last_checkpoint_position = start_position
-                    with ThreadPoolExecutor(max_workers=merge_workers) as executor:
-                        for window_start in range(
-                            start_position,
-                            len(kg_extract_res),
-                            merge_workers,
+                    for offset, res in enumerate(
+                        pending_results,
+                        start=start_position,
+                    ):
+                        kg_refiner.advanced_kg_refiner(
+                            entities=res.get("entities", []),
+                            relationships=res.get("relations", []),
+                            source_id=res.get("node_idx", -1),
+                        )
+                        next_position = offset + 1
+                        progress.update(1)
+                        if (
+                            next_position % checkpoint_every == 0
+                            or next_position == len(kg_extract_res)
                         ):
-                            window_end = min(
-                                window_start + merge_workers,
-                                len(kg_extract_res),
+                            save_refinement_checkpoint(
+                                next_position,
+                                "entity_resolution",
                             )
-                            window = kg_extract_res[window_start:window_end]
-                            futures = {
-                                executor.submit(
-                                    kg_refiner.advanced_kg_refiner,
-                                    entities=res.get("entities", []),
-                                    relationships=res.get("relations", []),
-                                    source_id=res.get("node_idx", -1),
-                                ): res
-                                for res in window
-                            }
-                            errors = []
-                            for future in as_completed(futures):
-                                try:
-                                    future.result()
-                                except BaseException as error:
-                                    errors.append(error)
-                                finally:
-                                    progress.update(1)
-                            if errors:
-                                raise RuntimeError(
-                                    "Concurrent KG merge failed; the previous completed "
-                                    "window checkpoint was preserved."
-                                ) from errors[0]
-                            if (
-                                window_end - last_checkpoint_position
-                                >= checkpoint_every
-                                or window_end == len(kg_extract_res)
-                            ):
-                                save_refinement_checkpoint(
-                                    window_end,
-                                    "entity_resolution",
-                                )
-                                last_checkpoint_position = window_end
                 else:
                     raise ValueError(
                         f"Unsupported KG refine_type: {cfg.graph.refine_type}"
@@ -361,7 +337,10 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
         raise
 
     log.info("Knowledge graph refinement completed.")
-    kg_refinement_cost = token_tracker.record_stage("kg_refinement")
+    kg_refinement_cost = token_tracker.record_stage_since(
+        "kg_refinement",
+        refinement_token_baseline,
+    )
     log.info(f"Knowledge graph refinement cost: {kg_refinement_cost}")
 
     kg_refiner.close()

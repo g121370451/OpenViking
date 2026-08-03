@@ -22,6 +22,7 @@ from core.metrics import MetricsCalculator
 from core.judge_util import llm_grader
 from core.response_parser import parse_llm_response
 from core.checkpoint import CheckpointManager
+from core.pdf_materializer import PdfMaterializer
 from core.question_rewriter import QuestionRewriteError, QuestionRewriteStore, get_or_create_rewrites
 from fallback import (
     FallbackBotRunner,
@@ -68,6 +69,12 @@ class BenchmarkPipeline:
         self.save_frequency = 10
         
         self.metrics_summary = {
+            "document_preparation": {
+                "enabled": False,
+                "time": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
             "insertion": {"time": 0, "input_tokens": 0, "output_tokens": 0, "embedding_tokens": 0},
             "deletion": {"time": 0, "input_tokens": 0, "output_tokens": 0, "embedding_tokens": 0}
         }
@@ -641,8 +648,35 @@ class BenchmarkPipeline:
         if not doc_dir:
             doc_dir = os.path.join(self.output_dir, "docs")
 
+        preparation_started = time.monotonic()
         try:
-            doc_info = self.adapter.data_prepare(doc_dir)
+            pdf_preprocessing = (
+                (self.config.get("bookrag") or {}).get("pdf_preprocessing") or {}
+            )
+            pdf_preprocessing_enabled = (
+                self.config.get("execution", {}).get("mode") == "bookrag"
+                and self._config_bool(pdf_preprocessing.get("enabled"), False)
+            )
+            if pdf_preprocessing_enabled:
+                source_documents = self.adapter.prepare_pdf_sources(doc_dir)
+                pdf_output_dir = pdf_preprocessing.get("output_dir") or os.path.join(
+                    doc_dir,
+                    "pdfs",
+                )
+                doc_info, preparation_stats = PdfMaterializer(
+                    pdf_output_dir
+                ).materialize(source_documents)
+                preparation_stats["time"] = time.monotonic() - preparation_started
+                self.metrics_summary["document_preparation"] = preparation_stats
+                self.logger.info(
+                    "BookRAG PDF preparation finished outside insertion timing: "
+                    f"documents={len(doc_info)}, time={preparation_stats['time']:.2f}s, "
+                    f"copied={preparation_stats['copied_pdf']}, "
+                    f"rendered={preparation_stats['rendered_text']}, "
+                    f"cached={preparation_stats['skipped_existing']}"
+                )
+            else:
+                doc_info = self.adapter.data_prepare(doc_dir)
         except Exception as e:
             self.logger.exception(f"Data preparation failed: {e}")
             exit(1)
@@ -670,14 +704,29 @@ class BenchmarkPipeline:
         if self.db:
             self.db.close()
 
-        self._update_report({
+        report_updates = {
             "Insertion Efficiency (Total Dataset)": {
                 "Total Insertion Time (s)": self.metrics_summary["insertion"]["time"],
                 "Total Input Tokens": self.metrics_summary["insertion"]["input_tokens"],
                 "Total Output Tokens": self.metrics_summary["insertion"]["output_tokens"],
                 "Total Embedding Tokens": self.metrics_summary["insertion"].get("embedding_tokens", 0)
             }
-        })
+        }
+        preparation_stats = self.metrics_summary["document_preparation"]
+        if preparation_stats.get("enabled"):
+            report_updates["Document Preparation (Excluded from Insertion)"] = {
+                "PDF Preparation Time (s)": preparation_stats["time"],
+                "PDF Count": preparation_stats.get("pdf_count", 0),
+                "Copied PDFs": preparation_stats.get("copied_pdf", 0),
+                "Rendered Text Documents": preparation_stats.get("rendered_text", 0),
+                "Reused/Cached PDFs": (
+                    preparation_stats.get("reused_pdf", 0)
+                    + preparation_stats.get("skipped_existing", 0)
+                ),
+                "Input Tokens": 0,
+                "Output Tokens": 0,
+            }
+        self._update_report(report_updates)
 
     def run_generation(self):
         """Stage: Generate answers for QA queries"""

@@ -61,15 +61,10 @@ class FinanceBenchAdapter(BaseAdapter):
 
         os.makedirs(doc_dir, exist_ok=True)
 
-        doc_names = set()
-        with open(self.raw_file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    doc_names.add(json.loads(line)["doc_name"])
+        doc_names = self._referenced_doc_names()
 
         docs: List[StandardDoc] = []
-        for doc_name in sorted(doc_names):
+        for doc_name in doc_names:
             pdf_path = os.path.join(self.pdf_dir, f"{doc_name}.pdf")
             if not os.path.exists(pdf_path):
                 self.logger.warning(f"PDF not found: {pdf_path}, skipping")
@@ -83,6 +78,32 @@ class FinanceBenchAdapter(BaseAdapter):
         self.logger.info(
             f"[FinanceBench] Prepared {len(docs)} Markdown documents for ingestion "
             "(referenced only)"
+        )
+        return docs
+
+    def _referenced_doc_names(self) -> list[str]:
+        doc_names = set()
+        with open(self.raw_file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    doc_names.add(json.loads(line)["doc_name"])
+        return sorted(doc_names)
+
+    def prepare_pdf_sources(self, doc_dir: str) -> List[StandardDoc]:
+        """Return original SEC PDFs without the lossy Markdown detour."""
+        del doc_dir
+        if not os.path.exists(self.pdf_dir):
+            raise FileNotFoundError(f"PDF directory not found: {self.pdf_dir}")
+        docs: List[StandardDoc] = []
+        for doc_name in self._referenced_doc_names():
+            pdf_path = os.path.join(self.pdf_dir, f"{doc_name}.pdf")
+            if not os.path.exists(pdf_path):
+                self.logger.warning(f"PDF not found: {pdf_path}, skipping")
+                continue
+            docs.append(StandardDoc(sample_id=doc_name, doc_path=pdf_path))
+        self.logger.info(
+            f"[FinanceBench] Prepared {len(docs)} native PDFs for materialization"
         )
         return docs
 

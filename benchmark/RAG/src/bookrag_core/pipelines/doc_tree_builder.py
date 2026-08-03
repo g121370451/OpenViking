@@ -10,7 +10,6 @@ from bookrag_core.pipelines.tree_node_summary import generate_tree_node_summary
 from bookrag_core.configs.system_config import SystemConfig
 from bookrag_core.provider.llm import LLM
 from bookrag_core.provider.vlm import VLM
-from bookrag_core.provider.TokenTracker import TokenTracker
 import os
 import logging
 from pathlib import Path
@@ -63,28 +62,9 @@ def construct_tree_index(
     return tree_index
 
 
-def build_tree_from_pdf(cfg: SystemConfig, reforce: bool = False) -> DocumentTree:
-
-    tree_index_path = DocumentTree.get_save_path(cfg.save_path)
-    if os.path.exists(tree_index_path) and not reforce:
-        # Load existing tree index
-        log.info(f"Loading existing tree index from {tree_index_path}...")
-        tree_index = DocumentTree.load_from_file(tree_index_path)
-        log.info("Tree index loaded successfully.")
-        return tree_index
-    else:
-        # Create a new tree index
-        log.info("Creating a new tree index...")
-
-    meta_dict = {
-        "file_name": os.path.basename(cfg.pdf_path),
-        "file_path": cfg.pdf_path,
-    }
-
+def prepare_pdf_content(cfg: SystemConfig, reforce: bool = False) -> list[dict]:
+    """Run or reuse MinerU and return its merged content for one PDF."""
     os.makedirs(cfg.save_path, exist_ok=True)
-
-    tree_index = DocumentTree(meta_dict=meta_dict, cfg=cfg)
-
     backend = cfg.mineru.backend
     server_url = cfg.mineru.server_url
     method = cfg.mineru.method
@@ -125,30 +105,78 @@ def build_tree_from_pdf(cfg: SystemConfig, reforce: bool = False) -> DocumentTre
         # tmp pdf_list save for fast test
         log.info(f"Content extracted and saved to {tmp_save_path}")
 
+    return pdf_list
+
+
+def build_tree_structure_from_pdf(
+    cfg: SystemConfig,
+    reforce: bool = False,
+    *,
+    persist: bool = True,
+) -> DocumentTree:
+    """Build or load the PDF structure without generating node summaries."""
+    tree_index_path = DocumentTree.get_save_path(cfg.save_path)
+    if os.path.exists(tree_index_path) and not reforce:
+        log.info(f"Loading existing structural tree index from {tree_index_path}...")
+        tree_index = DocumentTree.load_from_file(tree_index_path)
+        log.info("Structural tree index loaded successfully.")
+        return tree_index
+
+    log.info("Creating a new structural tree index...")
+
+    meta_dict = {
+        "file_name": os.path.basename(cfg.pdf_path),
+        "file_path": cfg.pdf_path,
+    }
+
+    os.makedirs(cfg.save_path, exist_ok=True)
+
+    tree_index = DocumentTree(meta_dict=meta_dict, cfg=cfg)
+    pdf_list = prepare_pdf_content(cfg, reforce=reforce)
+
     llm = LLM(cfg.llm)
-    vlm = VLM(cfg.vlm) if cfg.tree.use_vlm else None
 
     pdf_list = pdf_info_refiner(pdf_list, llm)
     title_outline = extract_pdf_outline_in_chunks(pdf_list, llm)
     tree_index = construct_tree_index(
         tree_index=tree_index, pdf_list=pdf_list, title_outline=title_outline
     )
-    token_tracker = TokenTracker.get_instance()
-    tree_index_cost = token_tracker.record_stage("tree_index_construction")
-    log.info(f"Tree index construction cost: {tree_index_cost}")
+    # The dataset orchestrator owns token stage boundaries.  Calling
+    # record_stage() from concurrent document workers would share and advance
+    # one global baseline, making per-stage accounting order-dependent.
+    if persist:
+        tree_index.save_to_file()
+    return tree_index
+
+
+def build_tree_from_pdf(cfg: SystemConfig, reforce: bool = False) -> DocumentTree:
+    """Original single-PDF flow, including optional summary generation."""
+    tree_index_path = DocumentTree.get_save_path(cfg.save_path)
+    if os.path.exists(tree_index_path) and not reforce:
+        log.info(f"Loading existing tree index from {tree_index_path}...")
+        tree_index = DocumentTree.load_from_file(tree_index_path)
+        log.info("Tree index loaded successfully.")
+        return tree_index
+
+    # Preserve the original single-PDF cache contract: tree.pkl represents the
+    # completed configured flow, so do not expose a structural-only file while
+    # summaries are still running.  Dataset ingestion calls the structural
+    # entry directly and intentionally persists its per-document cache.
+    tree_index = build_tree_structure_from_pdf(
+        cfg,
+        reforce=reforce,
+        persist=False,
+    )
 
     if cfg.tree.node_summary:
-        # Generate summaries for each node
+        llm = LLM(cfg.llm)
+        vlm = VLM(cfg.vlm) if cfg.tree.use_vlm else None
         tree_index = generate_tree_node_summary(
             tree_index=tree_index,
             llm=llm,
             use_VLM=cfg.tree.use_vlm,
             vlm=vlm,
         )
-        token_tracker = TokenTracker.get_instance()
-        summary_cost = token_tracker.record_stage("tree_node_summary")
-        log.info(f"Tree node summary generation cost: {summary_cost}")
 
-    # save
     tree_index.save_to_file()
     return tree_index

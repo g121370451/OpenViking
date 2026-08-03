@@ -28,12 +28,17 @@ from bookrag_core.configs.system_config import SystemConfig
 from bookrag_core.configs.tree_config import TreeConfig
 from bookrag_core.configs.vdb_config import VDBConfig
 from bookrag_core.configs.vlm_config import VLMConfig
-from bookrag_core.checkpoint import atomic_write_json
-from bookrag_core.construct_index import construct_GBC_index_from_markdown
+from bookrag_core.checkpoint import (
+    STATE_FILENAME,
+    STATE_FORMAT_VERSION,
+    atomic_write_json,
+)
+from bookrag_core.construct_index import construct_GBC_index_from_pdfs
 from bookrag_core.Index.GBCIndex import GBC
 from bookrag_core.Index.Tree import NodeType
 from bookrag_core.provider.TokenTracker import TokenTracker
 from bookrag_core.rag import create_rag_agent
+from bookrag_core.utils.ingest_timer import DocumentWorkTimer
 from bookrag_core.utils.utils import num_tokens
 
 log = logging.getLogger("Benchmark")
@@ -131,6 +136,7 @@ def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
     tree = bookrag.get("tree") or {}
     graph = bookrag.get("graph") or {}
     gbc = bookrag.get("gbc") or {}
+    mineru = bookrag.get("mineru") or {}
     reranker = bookrag.get("reranker") or {}
     execution = config.get("execution") or {}
     llm = config.get("llm") or {}
@@ -177,7 +183,9 @@ def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
         frequency_penalty=float(llm.get("frequency_penalty", 0)),
         presence_penalty=float(llm.get("presence_penalty", 0)),
         backend="openai",
-        max_workers=int(llm.get("max_workers", execution.get("max_workers", 4))),
+        # Query-level concurrency belongs to execution.max_workers.  Do not
+        # multiply it by an implicit per-query LLM pool.
+        max_workers=max(1, int(llm.get("max_workers", 1))),
     )
     if not llm_config.model_name or not llm_config.api_base:
         raise ValueError("BookRAG requires llm.model and llm.base_url")
@@ -185,7 +193,7 @@ def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
     tree_config = TreeConfig(
         node_keywords=bool(tree.get("node_keywords", True)),
         node_summary=bool(tree.get("node_summary", True)),
-        use_vlm=False,
+        use_vlm=bool(tree.get("use_vlm", False)),
     )
     graph_config = GraphConfig(
         extractor_type=str(graph.get("extractor_type", "llm")),
@@ -212,8 +220,9 @@ def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
 
     return SystemConfig(
         llm=llm_config,
-        # Markdown input has no images, but AnswerAgent still expects a VLM
-        # object. Reuse the same OpenAI-compatible online endpoint if needed.
+        # AnswerAgent and optional image summaries still expect a VLM object.
+        # Reuse the same OpenAI-compatible online endpoint unless configured
+        # separately in a later backend-specific extension.
         vlm=VLMConfig(
             backend="gpt",
             model_name=llm_config.model_name,
@@ -222,9 +231,15 @@ def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
             api_key=llm_config.api_key,
             api_base=llm_config.api_base,
         ),
-        # Required by SystemConfig validation only; Markdown ingestion never
-        # imports or invokes the MinerU pipeline.
-        mineru=MinerU(backend="pipeline", method="auto", lang="en"),
+        mineru=MinerU(
+            backend=str(mineru.get("backend", "pipeline")),
+            method=str(mineru.get("method", "auto")),
+            # MinerU 2.1.11's current PDF-Extract-Kit snapshot ships the
+            # ch_lite PyTorch OCR weights but not the en weights requested by
+            # that release. ch_lite's dictionary also covers ASCII text.
+            lang=str(mineru.get("lang", "ch_lite")),
+            server_url=str(mineru.get("server_url", "http://127.0.0.1:30000")),
+        ),
         tree=tree_config,
         graph=graph_config,
         vdb=VDBConfig(
@@ -234,6 +249,9 @@ def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
             embedding_config=copy.deepcopy(embedding_config),
         ),
         index_type="gbc",
+        doc_workers=max(1, int(execution.get("doc_workers", 4))),
+        ingest_workers=max(1, int(execution.get("ingest_workers", 4))),
+        source_format="pdf",
         rag=RAGConfig(strategy_config=rag_strategy),
         pdf_path=None,
         save_path=str(index_dir),
@@ -248,7 +266,7 @@ class BookRAGStoreWrapper:
         config: dict[str, Any],
         llm: Any | None = None,
         *,
-        construct_index_fn: Callable[..., Any] = construct_GBC_index_from_markdown,
+        construct_index_fn: Callable[..., Any] = construct_GBC_index_from_pdfs,
         load_index_fn: Callable[[SystemConfig], Any] = GBC.load_gbc_index,
         agent_factory: Callable[..., Any] = create_rag_agent,
     ):
@@ -262,7 +280,10 @@ class BookRAGStoreWrapper:
             f"{self.index_dir.name}.build.lock"
         )
         index_config = ((config.get("bookrag") or {}).get("index") or {})
-        atomic_build = index_config.get("atomic_build", True)
+        # PDF/MinerU artifacts are durable index state, not disposable build
+        # output. Build directly in the final directory by default so an
+        # interrupted import and a later changed-source import reuse them.
+        atomic_build = index_config.get("atomic_build", False)
         if not isinstance(atomic_build, bool):
             raise ValueError("bookrag.index.atomic_build must be true or false")
         self.atomic_build = atomic_build
@@ -324,6 +345,40 @@ class BookRAGStoreWrapper:
         )
 
     @staticmethod
+    def _is_resumable_build_dir(path: Path) -> bool:
+        state_path = path / STATE_FILENAME
+        if state_path.is_file():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                state = None
+            if (
+                isinstance(state, dict)
+                and state.get("format_version") == STATE_FORMAT_VERSION
+                and isinstance(state.get("sources"), list)
+            ):
+                return True
+
+        # MinerU can fail or be interrupted before the aggregate tree exists.
+        # A per-document manifest written by pdf_tree_builder is sufficient to
+        # recognize this as our own resumable directory rather than arbitrary
+        # user data.
+        for manifest_path in path.glob("pdf_trees/*/pdf_tree_manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(manifest, dict)
+                and manifest.get("format_version") == 1
+                and manifest.get("status") in {"building", "complete"}
+                and manifest.get("source_path")
+                and manifest.get("source_sha256")
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _content_hash(path: Path) -> str:
         digest = hashlib.sha256()
         with path.open("rb") as file:
@@ -358,10 +413,10 @@ class BookRAGStoreWrapper:
                 )
             seen_sample_ids.add(sample_id)
             path = Path(sample.doc_path)
-            if path.suffix.lower() not in {".md", ".markdown"}:
-                raise ValueError(f"BookRAG only accepts normalized Markdown: {path}")
+            if path.suffix.lower() != ".pdf":
+                raise ValueError(f"BookRAG MinerU ingestion only accepts PDF: {path}")
             if not path.is_file():
-                raise FileNotFoundError(f"BookRAG Markdown file not found: {path}")
+                raise FileNotFoundError(f"BookRAG PDF file not found: {path}")
         return ordered
 
     @staticmethod
@@ -443,11 +498,21 @@ class BookRAGStoreWrapper:
     def ingest(
         self,
         samples: Sequence[StandardDoc],
-        max_workers: int = 10,
+        max_workers: int | None = None,
         monitor: Any | None = None,
         ingest_mode: str = "dataset",
     ) -> dict[str, Any]:
-        del max_workers, monitor
+        del monitor
+        execution = self.benchmark_config.get("execution") or {}
+        ingest_workers = max(
+            1,
+            int(
+                max_workers
+                if max_workers is not None
+                else execution.get("ingest_workers", 4)
+            ),
+        )
+        doc_workers = max(1, int(execution.get("doc_workers", 4)))
         started = time.time()
         with self._lock:
             with _BuildFileLock(self.build_lock_path):
@@ -469,35 +534,57 @@ class BookRAGStoreWrapper:
                 else:
                     if self.index_dir.exists():
                         has_tree = (self.index_dir / "tree.pkl").is_file()
-                        if any(self.index_dir.iterdir()) and not has_tree:
+                        is_resumable = self._is_resumable_build_dir(self.index_dir)
+                        if (
+                            any(self.index_dir.iterdir())
+                            and not has_tree
+                            and not is_resumable
+                        ):
                             raise RuntimeError(
                                 "Refusing to reuse a non-empty direct BookRAG directory "
-                                f"without tree.pkl: {self.index_dir}"
+                                "without tree.pkl or a valid build checkpoint: "
+                                f"{self.index_dir}"
                             )
                     self.index_dir.mkdir(parents=True, exist_ok=True)
                     build_dir = self.index_dir
                     log.info("[BookRAG] Building directly in final directory: %s", build_dir)
                 build_config = self.core_config.model_copy(deep=True)
                 build_config.save_path = str(build_dir)
+                build_config.doc_workers = doc_workers
+                build_config.ingest_workers = ingest_workers
+                # Aggregate-tree summary, KG, and embedding providers share the
+                # ingestion worker budget. Per-document post-MinerU pipelines
+                # explicitly avoid a nested provider pool.
+                build_config.llm.max_workers = ingest_workers
+                build_config.graph.embedding_config.max_workers = ingest_workers
+                build_config.vdb.embedding_config.max_workers = ingest_workers
                 documents = [
                     (str(sample.sample_id), Path(sample.doc_path).resolve()) for sample in ordered
                 ]
                 gbc_index = None
                 try:
                     log.info(
-                        "[BookRAG] Building one dataset-level GBC index from %d Markdown documents.",
+                        "[BookRAG] Building one dataset-level GBC index from %d PDF documents.",
                         len(documents),
                     )
-                    log.info("[BookRAG] Phase 1/4: Markdown tree aggregation")
+                    log.info(
+                        "[BookRAG] Import concurrency: doc_workers=%d, "
+                        "ingest_workers=%d (execution.max_workers is query-only).",
+                        doc_workers,
+                        ingest_workers,
+                    )
+                    log.info("[BookRAG] Phase 1/4: MinerU PDF trees and dataset aggregation")
                     tracker = TokenTracker.get_instance()
                     tracker.reset()
-                    gbc_index = self._construct_index(
-                        build_config,
-                        documents,
-                        dataset_name=str(
-                            self.benchmark_config.get("dataset_name", "dataset")
-                        ),
-                    )
+                    ingest_timer = DocumentWorkTimer()
+                    with ingest_timer:
+                        gbc_index = self._construct_index(
+                            build_config,
+                            documents,
+                            dataset_name=str(
+                                self.benchmark_config.get("dataset_name", "dataset")
+                            ),
+                        )
                     usage = tracker.get_usage()
                     tree_index = getattr(gbc_index, "TreeIndex", None)
                     graph_index = getattr(gbc_index, "GraphIndex", None)
@@ -509,7 +596,18 @@ class BookRAGStoreWrapper:
                     self._close_constructed_index(gbc_index)
                     gbc_index = None
 
-                    elapsed = time.time() - started
+                    wall_time = time.time() - started
+                    elapsed = ingest_timer.total_work_time(wall_time)
+                    work_statistics = ingest_timer.statistics()
+                    log.info(
+                        "[BookRAG] Import timing: wall=%.2fs, task_sum=%.2fs, "
+                        "parallel_union=%.2fs, reported_work_time=%.2fs, tasks=%d.",
+                        wall_time,
+                        work_statistics["task_time"],
+                        work_statistics["task_wall_time"],
+                        elapsed,
+                        work_statistics["task_count"],
+                    )
                     manifest = {
                         "format_version": 1,
                         "backend": _MANIFEST_BACKEND,
@@ -544,7 +642,8 @@ class BookRAGStoreWrapper:
                             "[BookRAG] Phase 4/4: direct build completed in final directory"
                         )
                     log.info(
-                        "[BookRAG] Dataset GBC index ready: nodes=%d, entities=%d, time=%.2fs",
+                        "[BookRAG] Dataset GBC index ready: nodes=%d, entities=%d, "
+                        "time=%.2fs",
                         node_count,
                         entity_count,
                         elapsed,
@@ -620,49 +719,56 @@ class BookRAGStoreWrapper:
         if int(topk) < 1:
             raise ValueError("BookRAG topk must be positive")
 
+        configured_topk = int(self.core_config.rag.strategy_config.topk)
+        if int(topk) != configured_topk:
+            raise ValueError(
+                "BookRAG topk is initialized once from configuration; "
+                f"requested {int(topk)}, configured {configured_topk}"
+            )
+
         with self._lock:
             self._ensure_runtime()
-            query_dir = Path(query_output_dir)
-            query_dir.mkdir(parents=True, exist_ok=True)
+            rag_agent = self._rag_agent
+            gbc_index = self._gbc_index
 
-            # The official retriever stores topk as runtime state.
-            self._rag_agent.cfg.topk = int(topk)
-            self._rag_agent.retriever.topk = int(topk)
-            tracker = TokenTracker.get_instance()
-            tracker.set_persistence_path(None)
-            tracker.reset()
-            answer, retrieved_node_ids = self._rag_agent.generation(str(query), query_dir)
-            usage = tracker.get_usage()
+        # Retrieval is read-only after initialization, so concurrent benchmark
+        # workers must not hold the runtime lifecycle lock during generation.
+        query_dir = Path(query_output_dir)
+        query_dir.mkdir(parents=True, exist_ok=True)
+        tracker = TokenTracker.get_instance()
+        with tracker.query_scope() as query_usage:
+            answer, retrieved_node_ids = rag_agent.generation(str(query), query_dir)
+        usage = query_usage.get_usage()
 
-            nodes = self._gbc_index.TreeIndex.get_nodes_by_ids(list(retrieved_node_ids or []))
-            recall_texts: dict[str, str] = {}
-            context_blocks: list[str] = []
-            node_ids: list[int] = []
-            for node in nodes:
-                if node.type == NodeType.ROOT:
-                    continue
-                uri = self._node_uri(node)
-                block = self._context_block(node)
-                if uri in recall_texts:
-                    continue
-                recall_texts[uri] = block
-                context_blocks.append(block)
-                node_ids.append(int(node.index_id))
+        nodes = gbc_index.TreeIndex.get_nodes_by_ids(list(retrieved_node_ids or []))
+        recall_texts: dict[str, str] = {}
+        context_blocks: list[str] = []
+        node_ids: list[int] = []
+        for node in nodes:
+            if node.type == NodeType.ROOT:
+                continue
+            uri = self._node_uri(node)
+            block = self._context_block(node)
+            if uri in recall_texts:
+                continue
+            recall_texts[uri] = block
+            context_blocks.append(block)
+            node_ids.append(int(node.index_id))
 
-            return {
-                "answer": str(answer or ""),
-                "retrieved_node_ids": node_ids,
-                "recall_texts": recall_texts,
-                "context_blocks": context_blocks,
-                "retrieved_uris": list(recall_texts),
-                "retrieval_tokens": 0,
-                "token_usage": {
-                    "prompt_tokens": int(usage.get("prompt_tokens", 0)),
-                    "completion_tokens": int(usage.get("completion_tokens", 0)),
-                    "total_tokens": int(usage.get("total_tokens", 0)),
-                },
-                "trace_dir": str(query_dir),
-            }
+        return {
+            "answer": str(answer or ""),
+            "retrieved_node_ids": node_ids,
+            "recall_texts": recall_texts,
+            "context_blocks": context_blocks,
+            "retrieved_uris": list(recall_texts),
+            "retrieval_tokens": 0,
+            "token_usage": {
+                "prompt_tokens": int(usage.get("prompt_tokens", 0)),
+                "completion_tokens": int(usage.get("completion_tokens", 0)),
+                "total_tokens": int(usage.get("total_tokens", 0)),
+            },
+            "trace_dir": str(query_dir),
+        }
 
     def clear(self) -> None:
         with self._lock:

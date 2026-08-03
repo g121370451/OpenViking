@@ -34,10 +34,18 @@ class SystemConfig(BaseModel):
 
     rag_force_reprocess: Optional[bool] = False
 
+    # Import concurrency is deliberately separate from query/evaluation
+    # concurrency. ``doc_workers`` controls independent post-MinerU document
+    # pipelines. ``ingest_workers`` controls aggregate-tree summary and KG
+    # stages. MinerU itself is always serial.
+    doc_workers: int = Field(default=1, ge=1)
+    ingest_workers: int = Field(default=1, ge=1)
+
     # RAG Configurations
     rag: RAGConfig = Field(default_factory=RAGConfig)
 
     # Paths
+    source_format: Optional[str] = "pdf"
     pdf_path: Optional[str] = "/home/wangshu/multimodal/GBC-RAG/test/double_paper.pdf"
     save_path: Optional[str] = "/home/wangshu/multimodal/GBC-RAG/test/tree_index"
 

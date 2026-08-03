@@ -10,7 +10,8 @@ adapter:
 execution:
   mode: "bookrag"
   max_workers: 4
-  ingest_workers: 4
+  doc_workers: 4
+  ingest_workers: 2
   retrieval_topk: 5
   max_queries: null
   ingest_mode: "dataset"
@@ -40,6 +41,14 @@ embedding:
   max_workers: 8
 
 bookrag:
+  pdf_preprocessing:
+    enabled: true
+  mineru:
+    backend: "pipeline"
+    method: "auto"
+    lang: "ch_lite"
+    server_url: "http://127.0.0.1:30000"
+
   index_dir: "ov_storage/LegalBench/.LegalBench_MAUD_bookrag_index"
   tree:
     node_summary: true

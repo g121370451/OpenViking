@@ -1,10 +1,36 @@
 # Copyright (C) 2025-2026 Shu Wang
 # SPDX-License-Identifier: Apache-2.0 OR AGPL-3.0-only
 
-import threading
 import json
+import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Generator
+
+
+class QueryTokenUsage:
+    """Token counters owned by one retrieval query."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+
+    def add_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        with self._lock:
+            self.prompt_tokens += prompt_tokens
+            self.completion_tokens += completion_tokens
+            self.total_tokens += prompt_tokens + completion_tokens
+
+    def get_usage(self) -> dict:
+        with self._lock:
+            return {
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+            }
 
 
 class TokenTracker:
@@ -14,6 +40,14 @@ class TokenTracker:
 
     _instance = None
     _lock = threading.RLock() # Use RLock instead of Lock
+    _query_usage: ContextVar[QueryTokenUsage | None] = ContextVar(
+        "bookrag_query_token_usage",
+        default=None,
+    )
+    _prepared_ingest: ContextVar[bool] = ContextVar(
+        "bookrag_prepared_ingest_token_state",
+        default=False,
+    )
 
     def __new__(cls):
         # The __new__ method is called before __init__ when an object is created.
@@ -42,11 +76,39 @@ class TokenTracker:
         """
         Adds token usage to the global counters in a thread-safe manner.
         """
+        prompt_tokens = int(prompt_tokens)
+        completion_tokens = int(completion_tokens)
+        query_usage = self._query_usage.get()
+        if query_usage is not None:
+            query_usage.add_usage(prompt_tokens, completion_tokens)
+
         with self._lock:
             self.prompt_tokens += prompt_tokens
             self.completion_tokens += completion_tokens
             self.total_tokens += prompt_tokens + completion_tokens
             self._persist_locked()
+
+    @contextmanager
+    def query_scope(self) -> Generator[QueryTokenUsage, None, None]:
+        """Track usage for the current retrieval query without resetting globals."""
+        usage = QueryTokenUsage()
+        context_token = self._query_usage.set(usage)
+        try:
+            yield usage
+        finally:
+            self._query_usage.reset(context_token)
+
+    @contextmanager
+    def prepared_ingest_scope(self) -> Generator[None, None, None]:
+        """Keep an outer orchestrator's token baseline in nested builders."""
+        context_token = self._prepared_ingest.set(True)
+        try:
+            yield
+        finally:
+            self._prepared_ingest.reset(context_token)
+
+    def ingest_state_is_prepared(self) -> bool:
+        return bool(self._prepared_ingest.get())
 
     def set_persistence_path(self, path=None):
         """Enable or disable durable cumulative usage accounting."""
@@ -149,6 +211,38 @@ class TokenTracker:
             self.last_stage_prompt_tokens = self.prompt_tokens
             self.last_stage_completion_tokens = self.completion_tokens
             
+            return stage_usage
+
+    def record_stage_since(
+        self,
+        stage_name: str,
+        baseline: Dict[str, int],
+    ) -> Dict[str, int]:
+        """Record a stage from an explicit main-thread token snapshot.
+
+        Unlike ``record_stage``, this method does not depend on which worker
+        happened to finish a previous stage first.  It should be called only
+        after every future belonging to the stage has joined.
+        """
+        with self._lock:
+            stage_prompt_tokens = self.prompt_tokens - int(
+                baseline.get("prompt_tokens", 0)
+            )
+            stage_completion_tokens = self.completion_tokens - int(
+                baseline.get("completion_tokens", 0)
+            )
+            if stage_prompt_tokens < 0 or stage_completion_tokens < 0:
+                raise RuntimeError(
+                    "Token stage baseline is newer than the current counters"
+                )
+            stage_usage = {
+                "prompt_tokens": stage_prompt_tokens,
+                "completion_tokens": stage_completion_tokens,
+                "total_tokens": stage_prompt_tokens + stage_completion_tokens,
+            }
+            self.stage_history[stage_name] = stage_usage
+            self.last_stage_prompt_tokens = self.prompt_tokens
+            self.last_stage_completion_tokens = self.completion_tokens
             return stage_usage
 
     def print_all_stages(self):

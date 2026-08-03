@@ -95,6 +95,25 @@ class VersionRAGAdapter(BaseAdapter):
         )
         return docs
 
+    def prepare_pdf_sources(self, doc_dir: str) -> List[StandardDoc]:
+        """Expose native PDFs and raw Markdown to the shared PDF materializer."""
+        del doc_dir
+        if not os.path.exists(self.raw_doc_dir):
+            raise FileNotFoundError(f"Raw document directory not found: {self.raw_doc_dir}")
+
+        documents: List[StandardDoc] = []
+        for filename in sorted(os.listdir(self.raw_doc_dir)):
+            raw_path = os.path.join(self.raw_doc_dir, filename)
+            if not os.path.isfile(raw_path):
+                continue
+            name, extension = os.path.splitext(filename)
+            if extension.lower() in {".md", ".markdown", ".pdf"}:
+                documents.append(StandardDoc(sample_id=name, doc_path=raw_path))
+        self.logger.info(
+            f"[VersionRAG] Prepared {len(documents)} native PDF/Markdown sources"
+        )
+        return documents
+
     def _pdf_to_markdown(self, pdf_path: str, md_path: str):
         """
         使用 pymupdf (fitz) 从数字原生 PDF 提取文本并保存为 Markdown。

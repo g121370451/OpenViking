@@ -187,6 +187,8 @@ bookrag = [
     "beautifulsoup4>=4.13,<5.0",
     "chromadb>=1.0.13,<2.0",
     "json-repair>=0.46.2",
+    "markdown-it-py>=3.0,<5.0",
+    "mineru[pipeline]==2.1.11",
     "networkx>=3.4,<3.5; python_version == '3.10'",
     "networkx>=3.5,<4.0; python_version >= '3.11'",
     "nltk>=3.9,<4.0",
@@ -194,11 +196,15 @@ bookrag = [
     "openai>=1.70.0",
     "pandas>=2.3,<3.0",
     "pydantic>=2.11,<3.0",
+    "pymupdf>=1.24.0",
     "pyyaml>=6.0",
     "requests>=2.32.4,<3.0",
     "rich>=14,<15",
     "scikit-learn>=1.7,<2.0",
     "tiktoken>=0.7.0",
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "transformers==4.51.3",
     "tqdm>=4.67,<5.0",
 ]
 local-embed = [
@@ -216,6 +222,15 @@ ov = "openviking_cli.rust_cli:main"  # Rust CLI 入口（极简包装器）
 openviking = "openviking_cli.rust_cli:main"  # Rust CLI 入口（放弃 python CLI）
 openviking-server = "openviking_cli.server_bootstrap:main"
 vikingbot = "vikingbot.cli.commands:app"
+
+[tool.uv]
+# MinerU 2.1.11 pins older pdfminer-six and OpenAI SDK releases. Its local
+# pipeline path does not call either API directly; keep OpenViking's security
+# floor and the OpenAI 2.x version required by current LangChain integrations.
+override-dependencies = [
+    "openai>=2.26.0,<3.0.0",
+    "pdfminer-six>=20251230",
+]
 
 [tool.setuptools_scm]
 write_to = "openviking/_version.py"

@@ -50,6 +50,7 @@ import json
 import os
 from nltk.metrics.distance import edit_distance
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from bookrag_core.utils.ingest_timer import submit_ingest_task
 from tqdm import tqdm
 import re
 
@@ -1172,7 +1173,10 @@ class KGExtractor:
         results = []
         errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self.extract_kg, node): node for node in nodes}
+            futures = {
+                submit_ingest_task(executor, self.extract_kg, node): node
+                for node in nodes
+            }
             with tqdm(
                 total=len(futures),
                 desc="Extracting KG from text nodes",
@@ -1214,7 +1218,13 @@ class KGExtractor:
         errors = []
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(self.extract_title, node, title_path, sibling_nodes): (
+                submit_ingest_task(
+                    executor,
+                    self.extract_title,
+                    node,
+                    title_path,
+                    sibling_nodes,
+                ): (
                     node,
                     title_path,
                     sibling_nodes,

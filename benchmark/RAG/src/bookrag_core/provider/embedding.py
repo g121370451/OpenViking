@@ -20,6 +20,7 @@ import logging
 import gc
 
 from bookrag_core.provider.retry import call_with_retry
+from bookrag_core.utils.ingest_timer import submit_ingest_task
 
 log = logging.getLogger(__name__)
 
@@ -743,9 +744,15 @@ class TextEmbeddingProvider(BaseEmbedder):
                 ]
             else:
                 with ThreadPoolExecutor(max_workers=workers) as executor:
-                    all_embeddings = list(
-                        executor.map(self._embed_one_volcengine_text, texts)
-                    )
+                    futures = [
+                        submit_ingest_task(
+                            executor,
+                            self._embed_one_volcengine_text,
+                            text,
+                        )
+                        for text in texts
+                    ]
+                    all_embeddings = [future.result() for future in futures]
             embeddings_tensor = np.asarray(all_embeddings, dtype=np.float32)
 
         # 对来自任何后端的输出都进行归一化

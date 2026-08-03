@@ -98,6 +98,15 @@ class BaseAdapter(ABC):
         """
         pass
 
+    def prepare_pdf_sources(self, doc_dir: str) -> List[StandardDoc]:
+        """Return source documents for later PDF materialization.
+
+        Most datasets already normalize structured records to Markdown or text,
+        so their existing preparation is the correct source. Adapters backed by
+        native PDFs can override this hook to avoid PDF -> Markdown -> PDF loss.
+        """
+        return self.data_prepare(doc_dir)
+
     @abstractmethod
     def load_and_transform(self) -> List[StandardSample]:
         """

@@ -1,6 +1,8 @@
 # Copyright (C) 2025-2026 Shu Wang
 # SPDX-License-Identifier: Apache-2.0 OR AGPL-3.0-only
 
+from concurrent.futures import ThreadPoolExecutor
+import inspect
 from typing import Callable, Optional, List, Dict, Set
 
 from bookrag_core.Index.Tree import TreeNode, NodeType, DocumentTree
@@ -212,9 +214,32 @@ def generate_tree_node_summary(
     ]
     work_levels = [(level, nodes) for level, nodes in work_levels if nodes]
     total_nodes = sum(len(nodes) for _, nodes in work_levels)
+    summary_workers = max(1, int(getattr(llm, "max_workers", 1)))
+    llm_batch_parameters = inspect.signature(
+        llm.batch_get_completion
+    ).parameters
+    llm_accepts_executor = "executor" in llm_batch_parameters
+    vlm_accepts_executor = bool(
+        use_VLM
+        and vlm is not None
+        and "executor" in inspect.signature(vlm.batch_generate).parameters
+    )
+
+    log.info(
+        "Summary plan: total_tree_nodes=%d, structural_roots=%d, "
+        "summary_targets=%d, levels=%d, workers=%d.",
+        len(tree_index.nodes),
+        sum(node.type == NodeType.ROOT for node in tree_index.nodes),
+        total_nodes,
+        len(work_levels),
+        summary_workers,
+    )
 
     # Process nodes from the bottom level to the top
-    with tqdm(
+    with ThreadPoolExecutor(
+        max_workers=summary_workers,
+        thread_name_prefix="bookrag-summary",
+    ) as summary_executor, tqdm(
         total=total_nodes,
         desc="BookRAG summaries",
         unit="node",
@@ -222,7 +247,9 @@ def generate_tree_node_summary(
     ) as progress:
         for level_number, (level, level_nodes) in enumerate(work_levels, start=1):
             progress.set_postfix_str(
-                f"level {level_number}/{len(work_levels)}, depth={level}", refresh=True
+                f"level {level_number}/{len(work_levels)}, depth={level}, "
+                f"workers={summary_workers}",
+                refresh=True,
             )
             log.info(f"Processing level {level} with {len(level_nodes)} summary nodes.")
             # Initialize lists for LLM and VLM prompts
@@ -276,11 +303,14 @@ def generate_tree_node_summary(
                     batch_end = batch_start + checkpoint_batch_size
                     batch_prompts = llm_prompt_list[batch_start:batch_end]
                     batch_node_ids = llm_node_idx_list[batch_start:batch_end]
-                    llm_summaries = llm.batch_get_completion(
-                        prompts=batch_prompts,
-                        json_response=False,
-                        progress_callback=lambda: progress.update(1),
-                    )
+                    batch_kwargs = {
+                        "prompts": batch_prompts,
+                        "json_response": False,
+                        "progress_callback": lambda: progress.update(1),
+                    }
+                    if llm_accepts_executor:
+                        batch_kwargs["executor"] = summary_executor
+                    llm_summaries = llm.batch_get_completion(**batch_kwargs)
                     for idx, summary in zip(batch_node_ids, llm_summaries):
                         node = tree_index.get_node_by_index_id(idx)
                         if node:
@@ -308,9 +338,14 @@ def generate_tree_node_summary(
                     batch_prompts = vlm_prompt_list[batch_start:batch_end]
                     batch_images = vlm_images_list[batch_start:batch_end]
                     batch_node_ids = vlm_node_idx_list[batch_start:batch_end]
-                    vlm_summaries = vlm.batch_generate(
-                        query=batch_prompts, images=batch_images
-                    )
+                    vlm_kwargs = {
+                        "queries": batch_prompts,
+                        "images_list": batch_images,
+                        "max_workers": summary_workers,
+                    }
+                    if vlm_accepts_executor:
+                        vlm_kwargs["executor"] = summary_executor
+                    vlm_summaries = vlm.batch_generate(**vlm_kwargs)
                     progress.update(len(batch_node_ids))
                     for idx, summary in zip(batch_node_ids, vlm_summaries):
                         node = tree_index.get_node_by_index_id(idx)

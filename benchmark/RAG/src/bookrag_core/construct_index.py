@@ -12,6 +12,7 @@ from bookrag_core.configs.vdb_config import VDBConfig
 log = logging.getLogger(__name__)
 
 from bookrag_core.Index.GBCIndex import GBC
+from bookrag_core.Index.Tree import NodeType
 from bookrag_core.configs.system_config import SystemConfig
 from bookrag_core.provider.TokenTracker import TokenTracker
 from bookrag_core.utils.file_utils import save_indexing_stats
@@ -41,11 +42,12 @@ def construct_GBC_index_from_tree(
     os.makedirs(cfg.save_path, exist_ok=True)
     tree_index.save_dir = cfg.save_path
     token_tracker = TokenTracker.get_instance()
-    token_tracker.reset()
     from bookrag_core.checkpoint import BuildCheckpoint
 
     checkpoint = BuildCheckpoint(cfg.save_path)
-    checkpoint.restore_token_usage(configure_persistence=False)
+    if not token_tracker.ingest_state_is_prepared():
+        token_tracker.reset()
+        checkpoint.restore_token_usage(configure_persistence=False)
     current_run_stats = {"build_tree_time": 0.0}
 
     should_generate_summaries = cfg.tree.node_summary and (
@@ -57,6 +59,7 @@ def construct_GBC_index_from_tree(
         from bookrag_core.provider.vlm import VLM
 
         summary_start = time.time()
+        summary_token_baseline = token_tracker.get_usage()
         llm = LLM(cfg.llm)
         vlm = VLM(cfg.vlm) if cfg.tree.use_vlm else None
         tree_index = generate_tree_node_summary(
@@ -72,7 +75,10 @@ def construct_GBC_index_from_tree(
         current_run_stats["build_summary_time"] = round(
             time.time() - summary_start, 2
         )
-        summary_cost = token_tracker.record_stage("tree_node_summary")
+        summary_cost = token_tracker.record_stage_since(
+            "tree_node_summary",
+            summary_token_baseline,
+        )
         log.info("Tree node summary generation cost: %s", summary_cost)
 
     tree_index.save_to_file()
@@ -130,6 +136,7 @@ def construct_GBC_index_from_markdown(
         log.info("[Resume] Source files or tree configuration changed; resetting checkpoints.")
         checkpoint.reset_for_context(documents, cfg)
         checkpoint.restore_token_usage()
+    tree_token_baseline = token_tracker.get_usage()
     tree_validation = (
         checkpoint.validate_tree(documents, cfg)
         if context_matches
@@ -159,6 +166,11 @@ def construct_GBC_index_from_markdown(
             len(documents),
             tree_duration,
         )
+    tree_cost = token_tracker.record_stage_since(
+        "tree_index_construction",
+        tree_token_baseline,
+    )
+    log.info("Tree index construction cost: %s", tree_cost)
 
     if cfg.tree.node_summary:
         summary_validation = checkpoint.validate_summaries(tree_index, cfg)
@@ -191,14 +203,135 @@ def construct_GBC_index_from_markdown(
         checkpoint.mark_summary_progress(updated_tree, cfg)
 
     try:
-        return construct_GBC_index_from_tree(
-            cfg,
-            tree_index,
-            tree_only=tree_only,
-            graph_only=graph_only,
-            summary_node_ids=summary_targets,
-            summary_checkpoint_callback=save_summary_checkpoint,
+        with token_tracker.prepared_ingest_scope():
+            return construct_GBC_index_from_tree(
+                cfg,
+                tree_index,
+                tree_only=tree_only,
+                graph_only=graph_only,
+                summary_node_ids=summary_targets,
+                summary_checkpoint_callback=save_summary_checkpoint,
+            )
+    finally:
+        TokenTracker.get_instance().set_persistence_path(None)
+
+
+def construct_GBC_index_from_pdfs(
+    cfg: SystemConfig,
+    documents,
+    *,
+    dataset_name: str = "dataset",
+    tree_only: bool = False,
+    graph_only: bool = False,
+):
+    """Build a dataset GBC index from independently parsed MinerU PDF trees."""
+    from bookrag_core.checkpoint import BuildCheckpoint, TreeValidation
+    from bookrag_core.pipelines.pdf_tree_builder import build_dataset_tree_from_pdf
+
+    documents = list(documents)
+    checkpoint = BuildCheckpoint(cfg.save_path)
+    token_tracker = TokenTracker.get_instance()
+    token_tracker.reset()
+    tree_path = os.path.join(cfg.save_path, "tree.pkl")
+    has_saved_context = bool(checkpoint.state.get("source_fingerprint"))
+    if not has_saved_context and not os.path.isfile(tree_path):
+        # Persist source identity before entering MinerU so an interruption
+        # before the aggregate tree is created remains a recognized lineage.
+        checkpoint.reset_for_context(documents, cfg)
+    context_matches = checkpoint.context_matches(documents, cfg)
+    if context_matches:
+        checkpoint.restore_token_usage()
+    else:
+        log.info("[Resume] PDF sources or tree configuration changed; resetting checkpoints.")
+        checkpoint.reset_for_context(documents, cfg)
+        checkpoint.restore_token_usage()
+    tree_token_baseline = token_tracker.get_usage()
+    tree_validation = (
+        checkpoint.validate_tree(documents, cfg)
+        if context_matches
+        else TreeValidation(False, reason="source or tree configuration changed")
+    )
+    if tree_validation.valid:
+        tree_index = tree_validation.tree
+        log.info(
+            "[Resume] PDF dataset tree valid: %d nodes%s.",
+            len(tree_index.nodes),
+            "; tree.json repaired" if tree_validation.json_repaired else "",
         )
+    else:
+        log.info("[Resume] Rebuilding PDF dataset tree: %s.", tree_validation.reason)
+        tree_start_time = time.time()
+        tree_index = build_dataset_tree_from_pdf(
+            cfg,
+            documents,
+            dataset_name=dataset_name,
+        )
+        tree_duration = time.time() - tree_start_time
+        tree_index.save_dir = cfg.save_path
+        tree_index.save_to_file()
+        checkpoint.mark_tree_complete(tree_index, documents, cfg)
+        log.info(
+            "Dataset tree constructed from %d MinerU PDF trees in %.2f seconds.",
+            len(documents),
+            tree_duration,
+        )
+    tree_cost = token_tracker.record_stage_since(
+        "tree_index_construction",
+        tree_token_baseline,
+    )
+    log.info("Tree index construction cost: %s", tree_cost)
+
+    if cfg.tree.node_summary:
+        summary_validation = checkpoint.validate_summaries(tree_index, cfg)
+        summary_targets = summary_validation.target_node_ids
+        if summary_validation.complete:
+            log.info(
+                "[Resume] Summary valid: %d/%d. Skipping summary generation.",
+                len(summary_validation.required_node_ids),
+                len(summary_validation.required_node_ids),
+            )
+        else:
+            for node_id in summary_targets:
+                node = tree_index.get_node_by_index_id(node_id)
+                if node is not None:
+                    node.summary = ""
+            checkpoint.mark_summary_progress(tree_index, cfg)
+            log.info(
+                "[Resume] Summary incomplete: regenerating %d nodes (%d directly invalid).",
+                len(summary_targets),
+                len(summary_validation.invalid_node_ids),
+            )
+        log.info(
+            "[BookRAG Summary Plan] documents=%d, tree_nodes=%d, "
+            "structural_roots=%d, summary_required=%d, completed=%d, "
+            "current_targets=%d.",
+            len(documents),
+            len(tree_index.nodes),
+            sum(node.type == NodeType.ROOT for node in tree_index.nodes),
+            len(summary_validation.required_node_ids),
+            len(
+                summary_validation.required_node_ids
+                - summary_validation.invalid_node_ids
+            ),
+            len(summary_targets),
+        )
+    else:
+        summary_targets = set()
+        checkpoint.update_stage("summary", status="disabled")
+
+    def save_summary_checkpoint(updated_tree):
+        checkpoint.mark_summary_progress(updated_tree, cfg)
+
+    try:
+        with token_tracker.prepared_ingest_scope():
+            return construct_GBC_index_from_tree(
+                cfg,
+                tree_index,
+                tree_only=tree_only,
+                graph_only=graph_only,
+                summary_node_ids=summary_targets,
+                summary_checkpoint_callback=save_summary_checkpoint,
+            )
     finally:
         TokenTracker.get_instance().set_persistence_path(None)
 

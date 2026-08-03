@@ -8,12 +8,13 @@ import json
 import logging
 import re
 from pydantic import BaseModel
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Executor, ThreadPoolExecutor, as_completed
 from bookrag_core.Common.Memory import Memory
 from bookrag_core.configs.llm_config import LLMConfig
 from bookrag_core.provider.retry import call_with_retry
 from bookrag_core.utils.utils import get_max_output_tokens
 from bookrag_core.provider.TokenTracker import TokenTracker
+from bookrag_core.utils.ingest_timer import submit_ingest_task
 
 log = logging.getLogger(__name__)
 
@@ -409,6 +410,7 @@ class LLM:
         prompts: List[Union[str, Memory]],
         json_response: bool = False,
         progress_callback: Optional[Callable[[], None]] = None,
+        executor: Optional[Executor] = None,
     ) -> list:
         """Generate completions concurrently while preserving input order.
 
@@ -417,10 +419,15 @@ class LLM:
         callback here lets callers report real progress without duplicating the
         thread-pool implementation.
         """
-        results = [None] * len(prompts)
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        def run(active_executor: Executor) -> list:
+            results = [None] * len(prompts)
             future_to_idx = {
-                executor.submit(self.get_completion, prompt, json_response): idx
+                submit_ingest_task(
+                    active_executor,
+                    self.get_completion,
+                    prompt,
+                    json_response,
+                ): idx
                 for idx, prompt in enumerate(prompts)
             }
             for future in as_completed(future_to_idx):
@@ -438,7 +445,15 @@ class LLM:
                                 "Ignoring an error raised by the batch progress callback.",
                                 exc_info=True,
                             )
-        return results
+            return results
+
+        if executor is not None:
+            return run(executor)
+        with ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix="bookrag-llm",
+        ) as owned_executor:
+            return run(owned_executor)
 
     def get_json_completion(
         self,
