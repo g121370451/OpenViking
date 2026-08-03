@@ -118,14 +118,8 @@ def source_records(
 
 
 def tree_config_fingerprint(cfg) -> str:
-    tree = cfg.tree
-    return canonical_sha256(
-        {
-            "markdown_chunk_size": tree.markdown_chunk_size,
-            "markdown_chunk_overlap": tree.markdown_chunk_overlap,
-            "markdown_tokenizer": tree.markdown_tokenizer,
-        }
-    )
+    del cfg
+    return canonical_sha256({})
 
 
 def summary_config_fingerprint(cfg) -> str:

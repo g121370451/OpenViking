@@ -50,10 +50,16 @@ class FinanceBenchAdapter(BaseAdapter):
 
     def data_prepare(self, doc_dir: str) -> List[StandardDoc]:
         """
-        Prepare document list for ingestion. Only ingest documents referenced in JSONL.
+        Convert referenced PDFs to Markdown and return the generated documents.
+
+        Only documents referenced by the FinanceBench JSONL are processed. Existing
+        non-empty Markdown files are reused so repeated imports do not parse the same
+        PDFs again.
         """
         if not os.path.exists(self.pdf_dir):
             raise FileNotFoundError(f"PDF directory not found: {self.pdf_dir}")
+
+        os.makedirs(doc_dir, exist_ok=True)
 
         doc_names = set()
         with open(self.raw_file_path, 'r', encoding='utf-8') as f:
@@ -68,10 +74,40 @@ class FinanceBenchAdapter(BaseAdapter):
             if not os.path.exists(pdf_path):
                 self.logger.warning(f"PDF not found: {pdf_path}, skipping")
                 continue
-            docs.append(StandardDoc(sample_id=doc_name, doc_path=pdf_path))
 
-        self.logger.info(f"[FinanceBench] Prepared {len(docs)} documents for ingestion (referenced only)")
+            md_path = os.path.join(doc_dir, f"{doc_name}.md")
+            if not os.path.isfile(md_path) or os.path.getsize(md_path) == 0:
+                self._pdf_to_markdown(pdf_path, md_path)
+            docs.append(StandardDoc(sample_id=doc_name, doc_path=md_path))
+
+        self.logger.info(
+            f"[FinanceBench] Prepared {len(docs)} Markdown documents for ingestion "
+            "(referenced only)"
+        )
         return docs
+
+    def _pdf_to_markdown(self, pdf_path: str, md_path: str) -> None:
+        """Extract a digital PDF as page-structured Markdown with PyMuPDF."""
+        import fitz  # pymupdf
+
+        document = fitz.open(pdf_path)
+        page_count = len(document)
+        try:
+            with open(md_path, "w", encoding="utf-8") as output:
+                for page_number, page in enumerate(document, start=1):
+                    text = page.get_text("text").strip()
+                    if not text:
+                        continue
+                    output.write(f"## Page {page_number}\n\n")
+                    output.write(text)
+                    output.write("\n\n")
+        finally:
+            document.close()
+
+        self.logger.info(
+            f"[FinanceBench] Converted PDF -> Markdown: "
+            f"{os.path.basename(pdf_path)} ({page_count} pages)"
+        )
 
     def load_and_transform(self) -> List[StandardSample]:
         """

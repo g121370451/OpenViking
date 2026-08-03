@@ -30,69 +30,6 @@ class MarkdownBlock:
     heading_level: int | None = None
 
 
-class TokenChunker:
-    """Token-aware splitter used only after Markdown has been normalized."""
-
-    def __init__(
-        self,
-        chunk_size: int = 512,
-        overlap: int = 50,
-        tokenizer: str = "cl100k_base",
-    ) -> None:
-        if chunk_size <= 0:
-            raise ValueError("Markdown chunk_size must be greater than zero")
-        if overlap < 0 or overlap >= chunk_size:
-            raise ValueError("Markdown overlap must satisfy 0 <= overlap < chunk_size")
-        self.chunk_size = chunk_size
-        self.overlap = overlap
-        self.tokenizer = tokenizer
-        try:
-            import tiktoken
-
-            self._encoding = tiktoken.get_encoding(tokenizer)
-        except (ImportError, ValueError):
-            self._encoding = None
-
-    def count(self, text: str) -> int:
-        if self._encoding is not None:
-            return len(self._encoding.encode(text or ""))
-        return len(re.findall(r"\S+", text or ""))
-
-    def split(self, text: str) -> list[str]:
-        if not text:
-            return []
-        if self._encoding is not None:
-            tokens = self._encoding.encode(text)
-            if len(tokens) <= self.chunk_size:
-                return [text]
-            chunks = []
-            start = 0
-            while start < len(tokens):
-                end = min(start + self.chunk_size, len(tokens))
-                chunk = self._encoding.decode(tokens[start:end]).strip()
-                if chunk:
-                    chunks.append(chunk)
-                if end == len(tokens):
-                    break
-                start = end - self.overlap
-            return chunks
-
-        tokens = re.findall(r"\S+\s*", text)
-        if len(tokens) <= self.chunk_size:
-            return [text]
-        chunks = []
-        start = 0
-        while start < len(tokens):
-            end = min(start + self.chunk_size, len(tokens))
-            chunk = "".join(tokens[start:end]).strip()
-            if chunk:
-                chunks.append(chunk)
-            if end == len(tokens):
-                break
-            start = end - self.overlap
-        return chunks
-
-
 def _is_table_delimiter(line: str) -> bool:
     stripped = line.strip().strip("|")
     cells = [cell.strip() for cell in stripped.split("|")]
@@ -203,14 +140,6 @@ def parse_markdown_blocks(markdown: str) -> list[MarkdownBlock]:
 class MarkdownTreeBuilder:
     """Map normalized Markdown blocks into the official BookRAG tree model."""
 
-    def __init__(
-        self,
-        chunk_size: int = 512,
-        overlap: int = 50,
-        tokenizer: str = "cl100k_base",
-    ) -> None:
-        self.chunker = TokenChunker(chunk_size, overlap, tokenizer)
-
     @staticmethod
     def _title_path(node: TreeNode | None) -> list[str]:
         titles = []
@@ -304,27 +233,21 @@ class MarkdownTreeBuilder:
                 continue
 
             parent = heading_stack[max(heading_stack)] if heading_stack else ensure_document_title()
-            chunks = self.chunker.split(block.text)
-            for chunk_number, chunk in enumerate(chunks, start=1):
-                meta_dict = {
-                    "file_name": Path(source_path).name,
-                    "file_path": source_path,
-                    "sample_id": str(sample_id),
-                    "content": chunk,
-                    "title_path": self._title_path(parent),
-                    "block_type": block.kind,
-                    "extra": {
-                        "chunk_number": chunk_number,
-                        "chunk_count": len(chunks),
-                    },
-                }
-                if block.kind == "table":
-                    meta_dict["table_body"] = chunk
-                node = TreeNode(meta_dict)
-                node.type = NodeType.TABLE if block.kind == "table" else NodeType.TEXT
-                tree.add_node(node)
-                parent.add_child(node)
-                node.meta_info.local_index_id = node.index_id
+            meta_dict = {
+                "file_name": Path(source_path).name,
+                "file_path": source_path,
+                "sample_id": str(sample_id),
+                "content": block.text,
+                "title_path": self._title_path(parent),
+                "block_type": block.kind,
+            }
+            if block.kind == "table":
+                meta_dict["table_body"] = block.text
+            node = TreeNode(meta_dict)
+            node.type = NodeType.TABLE if block.kind == "table" else NodeType.TEXT
+            tree.add_node(node)
+            parent.add_child(node)
+            node.meta_info.local_index_id = node.index_id
 
         if not blocks or not any(node.type == NodeType.TITLE for node in tree.nodes):
             ensure_document_title()
@@ -363,11 +286,7 @@ def build_tree_from_markdown(
     sample_id: str,
 ) -> DocumentTree:
     """Public Core entry for constructing one document tree from Markdown."""
-    builder = MarkdownTreeBuilder(
-        chunk_size=cfg.tree.markdown_chunk_size,
-        overlap=cfg.tree.markdown_chunk_overlap,
-        tokenizer=cfg.tree.markdown_tokenizer,
-    )
+    builder = MarkdownTreeBuilder()
     return builder.build_file(markdown_path, sample_id=str(sample_id), cfg=cfg)
 
 

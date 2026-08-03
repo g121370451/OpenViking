@@ -41,10 +41,6 @@ embedding:
 
 bookrag:
   index_dir: "ov_storage/LegalBench/.LegalBench_PrivacyQA_bookrag_index"
-  index:
-    chunk_size: 512
-    overlap: 50
-    tokenizer: "cl100k_base"
   tree:
     node_summary: true
     node_keywords: true

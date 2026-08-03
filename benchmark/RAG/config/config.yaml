@@ -75,10 +75,6 @@ llm:
 # files produced by the selected Adapter and builds one cross-document GBC index.
 bookrag:
   index_dir: "datasets/{dataset_name}/bookrag_index"
-  index:
-    chunk_size: 512
-    overlap: 50
-    tokenizer: "cl100k_base"
   tree:
     node_summary: true
     node_keywords: true

@@ -128,7 +128,6 @@ def _redact_secrets(value: Any) -> Any:
 def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
     """Translate benchmark YAML fields into the official Core configuration."""
     bookrag = config.get("bookrag") or {}
-    index = bookrag.get("index") or {}
     tree = bookrag.get("tree") or {}
     graph = bookrag.get("graph") or {}
     gbc = bookrag.get("gbc") or {}
@@ -145,13 +144,6 @@ def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
     embedding_api_key = _resolve_env_value(embedding.get("api_key"), "embedding.api_key")
     rerank_ak = _resolve_env_value(reranker.get("ak"), "bookrag.reranker.ak")
     rerank_sk = _resolve_env_value(reranker.get("sk"), "bookrag.reranker.sk")
-
-    chunk_size = int(index.get("chunk_size", 512))
-    chunk_overlap = int(index.get("overlap", 50))
-    if chunk_size < 1:
-        raise ValueError("bookrag.index.chunk_size must be positive")
-    if chunk_overlap < 0 or chunk_overlap >= chunk_size:
-        raise ValueError("bookrag.index.overlap must be non-negative and smaller than chunk_size")
 
     embedding_config = EmbeddingConfig(
         type="text",
@@ -194,9 +186,6 @@ def build_bookrag_system_config(config: dict[str, Any]) -> SystemConfig:
         node_keywords=bool(tree.get("node_keywords", True)),
         node_summary=bool(tree.get("node_summary", True)),
         use_vlm=False,
-        markdown_chunk_size=chunk_size,
-        markdown_chunk_overlap=chunk_overlap,
-        markdown_tokenizer=str(index.get("tokenizer", "cl100k_base")),
     )
     graph_config = GraphConfig(
         extractor_type=str(graph.get("extractor_type", "llm")),
