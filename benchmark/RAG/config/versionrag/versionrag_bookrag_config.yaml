@@ -10,7 +10,7 @@ adapter:
 
 execution:
   mode: "bookrag"
-  max_workers: 1
+  max_workers: 6
   ingest_workers: 6
   retrieval_topk: 5
   max_queries: null

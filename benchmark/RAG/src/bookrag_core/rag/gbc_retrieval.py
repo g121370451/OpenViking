@@ -70,10 +70,45 @@ class Retriever:
                 text = text[0]  # use the first chunk
             doc_text.append(text)
 
-        scores = self.reranker.rerank(
-            query=query, documents=doc_text, instruction=TEXT_RERANKER_PROMPT
+        # Different TreeNodes can contain identical text, especially when the
+        # same structural or reference content occurs across documents. Score
+        # each exact post-processing result once, then fan the score back out
+        # to every original node so the downstream node-level ranking remains
+        # unchanged.
+        unique_documents = []
+        document_to_unique_index = []
+        unique_index_by_document = {}
+        for document in doc_text:
+            if document not in unique_index_by_document:
+                unique_index_by_document[document] = len(unique_documents)
+                unique_documents.append(document)
+            document_to_unique_index.append(unique_index_by_document[document])
+
+        reused_count = len(doc_text) - len(unique_documents)
+        if reused_count:
+            log.info(
+                "BookRAG rerank documents: candidates=%d, unique=%d, reused=%d.",
+                len(doc_text),
+                len(unique_documents),
+                reused_count,
+            )
+
+        unique_scores = self.reranker.rerank(
+            query=query,
+            documents=unique_documents,
+            instruction=TEXT_RERANKER_PROMPT,
         )
         self.reranker.clean_cache()
+        if len(unique_scores) != len(unique_documents):
+            raise RuntimeError(
+                "BookRAG reranker returned an unexpected number of scores: "
+                f"expected={len(unique_documents)} actual={len(unique_scores)}"
+            )
+
+        scores = [
+            unique_scores[unique_index]
+            for unique_index in document_to_unique_index
+        ]
         ranked_res = sorted(zip(tree_ids, scores), key=lambda x: x[1], reverse=True)
 
         return ranked_res
