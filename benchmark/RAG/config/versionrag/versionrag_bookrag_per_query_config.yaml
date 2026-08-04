@@ -1,0 +1,96 @@
+project_name: "RAG_Benchmark"
+
+# VersionRAG BookRAG per-query experiment.  The regular dataset-level config and
+# adapter remain unchanged; this config opts into question-to-document routing.
+dataset_name: "VersionRAG"
+
+adapter:
+  module: "src.adapters.versionrag_per_query_adapter"
+  class_name: "VersionRAGPerQueryAdapter"
+
+execution:
+  mode: "bookrag"
+  max_workers: 4
+  doc_workers: 4
+  ingest_workers: 2
+  retrieval_topk: 5
+  max_queries: null
+  ingest_mode: "dataset"
+  retrieval_instruction: ""
+  use_vikingbot: false
+
+paths:
+  dataset_path: "datasets/{dataset_name}/data/test/evaluation_set.csv"
+  doc_output_dir: "ov_storage/{dataset_name}/{dataset_name}_processed_docs"
+  vector_store: "ov_storage/{dataset_name}/{dataset_name}_bookrag_per_query"
+  output_dir: "Output/{dataset_name}/experiment_bookrag_per_query_top_{retrieval_topk}"
+  log_file: "Output/{dataset_name}/experiment_bookrag_per_query_top_{retrieval_topk}/benchmark.log"
+
+llm:
+  model: "doubao-seed-2.0-lite"
+  temperature: 0
+  max_tokens: 4096
+  base_url: "https://ark.cn-beijing.volces.com/api/plan/v3"
+  api_key: "${DOUBAO_LLM_API_KEY}"
+
+embedding:
+  model: "doubao-embedding-vision-250615"
+  backend: "volcengine"
+  base_url: "https://ark.cn-beijing.volces.com/api/plan/v3"
+  api_key: "${VOLCENGINE_API_KEY}"
+  max_length: 8192
+  max_workers: 8
+
+bookrag:
+  index_layout: "per_query"
+  qa_doc_mapping_path: "datasets/{dataset_name}/data/test/qa_doc_mapping.json"
+  document_store_root: "ov_storage/{dataset_name}/{dataset_name}_bookrag_per_query"
+  document_build_policy: "lazy"
+  document_cleanup_policy: "keep"
+  max_open_document_set_runtimes: 4
+
+  pdf_preprocessing:
+    enabled: true
+  mineru:
+    backend: "pipeline"
+    method: "auto"
+    lang: "ch_lite"
+    server_url: "http://127.0.0.1:30000"
+
+  # Per-query mode replaces this path with index_sets/<document_set_id>/index.
+  # It remains present so the shared BookRAG configuration validator stays valid.
+  index_dir: "ov_storage/{dataset_name}/{dataset_name}_bookrag_per_query/_index_template"
+
+  tree:
+    node_summary: true
+    node_keywords: true
+
+  graph:
+    extractor_type: "llm"
+    refine_type: "advanced"
+    similarity_threshold: 0.6
+
+  gbc:
+    variant: "standard"
+    topk: 5
+    select_depth: 2
+    topk_ent: 5
+    sim_threshold_e: 0.3
+    alpha: 0.5
+    x_percentile: 0.85
+    max_retry: 3
+
+  reranker:
+    backend: "vikingdb"
+    ak: "${VIKINGDB_RERANK_AK}"
+    sk: "${VIKINGDB_RERANK_SK}"
+    host: "api-vikingdb.vikingdb.cn-beijing.volces.com"
+    model: "doubao-seed-rerank"
+    model_version: "251028"
+    threshold: 0.1
+    batch_size: 100
+    max_length: 8192
+
+question_rewrites:
+  enabled: false
+  cache_root: "rewrites"

@@ -122,9 +122,11 @@ def main():
             # print(f"  - {key}: {resolved}")
 
     bookrag_cfg = config.get('bookrag', {})
-    if isinstance(bookrag_cfg, dict) and bookrag_cfg.get('index_dir'):
-        rendered_path = str(bookrag_cfg['index_dir']).format(**format_vars)
-        bookrag_cfg['index_dir'] = resolve_path(rendered_path, PROJECT_ROOT)
+    if isinstance(bookrag_cfg, dict):
+        for key in ('index_dir', 'document_store_root', 'qa_doc_mapping_path'):
+            if bookrag_cfg.get(key):
+                rendered_path = str(bookrag_cfg[key]).format(**format_vars)
+                bookrag_cfg[key] = resolve_path(rendered_path, PROJECT_ROOT)
 
     # Store ov_config_path in config for vikingbot_runner to use
     config['_ov_conf_path'] = ov_config_path
@@ -169,6 +171,10 @@ def main():
             mod = importlib.import_module(module_path)
             AdapterClass = getattr(mod, class_name)
             adapter = AdapterClass(raw_file_path=config['paths']['dataset_path'])
+            qa_doc_mapping_path = bookrag_cfg.get('qa_doc_mapping_path')
+            configure_mapping = getattr(adapter, 'configure_qa_doc_mapping', None)
+            if qa_doc_mapping_path and callable(configure_mapping):
+                configure_mapping(qa_doc_mapping_path)
         except ImportError as e:
             logger.error(f"Could not import module '{module_path}'. Please check your config 'adapter.module'. Error: {e}")
             raise e
@@ -191,12 +197,32 @@ def main():
             vector_store = None
             logger.info("Nanobot mode: skipping VikingStoreWrapper initialization")
         elif mode == "bookrag":
-            from src.bookrag_runner import BookRAGStoreWrapper
+            index_layout = str(bookrag_cfg.get("index_layout", "dataset")).lower()
+            if index_layout == "per_query":
+                from src.bookrag_document_set_store import (
+                    BookRAGDocumentSetStoreManager,
+                )
 
-            vector_store = BookRAGStoreWrapper(config=config, llm=llm_client)
-            logger.info(
-                f"BookRAG mode: using dataset-level GBC index at {vector_store.index_dir}"
-            )
+                vector_store = BookRAGDocumentSetStoreManager(
+                    config=config,
+                    llm=llm_client,
+                )
+                logger.info(
+                    "BookRAG mode: using per-query document-set indices at "
+                    f"{vector_store.index_dir}"
+                )
+            elif index_layout == "dataset":
+                from src.bookrag_runner import BookRAGStoreWrapper
+
+                vector_store = BookRAGStoreWrapper(config=config, llm=llm_client)
+                logger.info(
+                    f"BookRAG mode: using dataset-level GBC index at {vector_store.index_dir}"
+                )
+            else:
+                raise ValueError(
+                    "bookrag.index_layout must be 'dataset' or 'per_query', got "
+                    f"{index_layout!r}"
+                )
         elif mode in ("ov_fallback_bot", "ov_fallback_bot_relations"):
             vector_store_path = config['paths']['vector_store']
             search_limit = config.get('vikingbot', {}).get('search_limit')

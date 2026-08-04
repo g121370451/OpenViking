@@ -611,6 +611,9 @@ class BenchmarkPipeline:
                     "dataset": dataset_name,
                     "total_queries": len(sorted_results),
                     "build_link_timing": self._summarize_build_link_timing(sorted_results),
+                    "bookrag_document_sets": self._summarize_bookrag_document_sets(
+                        sorted_results
+                    ),
                 },
                 "results": sorted_results
             }
@@ -691,6 +694,17 @@ class BenchmarkPipeline:
         }
         self.logger.info(f"Ingestion mode: {ingest_mode} ({mode_desc.get(ingest_mode, 'Unknown mode')})")
         self.logger.info(f"Number of documents: {len(doc_info)}")
+
+        if self._is_bookrag_per_query():
+            self.db.register_documents(doc_info)
+            mapped_samples = self.adapter.load_and_transform()
+            mapped_tasks = self._prepare_tasks(mapped_samples)
+            self.db.configure_document_sets(mapped_tasks)
+            self.logger.info(
+                "BookRAG per-query routing prepared: questions=%d, document_sets=%d",
+                len(mapped_tasks),
+                len({task["document_set_id"] for task in mapped_tasks}),
+            )
         
         ingest_stats = self.db.ingest(
             doc_info, 
@@ -731,6 +745,8 @@ class BenchmarkPipeline:
     def run_generation(self):
         """Stage: Generate answers for QA queries"""
         self.logger.info(">>> Stage: Generation (Retrieve + Generate)")
+        if self._is_bookrag_per_query():
+            self._prepare_and_register_per_query_documents()
         samples = self.adapter.load_and_transform()
         samples = self._apply_question_rewrites_to_samples(samples)
         tasks = self._prepare_tasks(samples)
@@ -752,6 +768,8 @@ class BenchmarkPipeline:
                         self.logger.warning(f"Failed to load previous generated results, continuing fresh: {e}")
 
         remaining_tasks = [task for task in tasks if task["id"] not in completed_tasks]
+        if self._is_bookrag_per_query():
+            self.db.configure_document_sets(remaining_tasks)
         self.logger.info(f"Total tasks: {len(tasks)}, Remaining: {len(remaining_tasks)}")
         
         mode = self.config.get("execution", {}).get("mode")
@@ -805,11 +823,13 @@ class BenchmarkPipeline:
         sorted_results = [results_map[i] for i in sorted(results_map.keys())]
         dataset_name = self.config.get('dataset_name', 'Unknown_Dataset')
         build_link_timing = self._summarize_build_link_timing(sorted_results)
+        document_set_summary = self._summarize_bookrag_document_sets(sorted_results)
         save_data = {
             "summary": {
                 "dataset": dataset_name,
                 "total_queries": len(sorted_results),
                 "build_link_timing": build_link_timing,
+                "bookrag_document_sets": document_set_summary,
             },
             "results": sorted_results
         }
@@ -831,6 +851,30 @@ class BenchmarkPipeline:
             build_link_diagnostics = self._summarize_build_link_diagnostics(sorted_results)
             if build_link_diagnostics and self._is_build_link_mode():
                 generation_report["Build Link Diagnostics"] = build_link_diagnostics
+            if document_set_summary:
+                generation_report["BookRAG Per-Query Document Sets"] = {
+                    "Unique Document Sets": document_set_summary[
+                        "unique_document_sets"
+                    ],
+                    "Cold-Built Document Sets": document_set_summary[
+                        "cold_built_document_sets"
+                    ],
+                    "Cache-Hit Questions": document_set_summary[
+                        "cache_hit_questions"
+                    ],
+                    "Total Insertion Time (s)": document_set_summary[
+                        "total_ingest_time_sec"
+                    ],
+                    "Total Input Tokens": document_set_summary[
+                        "total_ingest_input_tokens"
+                    ],
+                    "Total Output Tokens": document_set_summary[
+                        "total_ingest_output_tokens"
+                    ],
+                    "Total Embedding Tokens": document_set_summary[
+                        "total_ingest_embedding_tokens"
+                    ],
+                }
             self._update_report(generation_report)
         with open(self.generated_file, "w", encoding="utf-8") as f:
             json.dump(save_data, f, indent=2, ensure_ascii=False)
@@ -865,15 +909,39 @@ class BenchmarkPipeline:
             avg_out_tokens = (
                 sum(self._get_record_output_tokens(i) for i in items) / total_items
             )
-            self._update_report(
-                {
+            generation_report = {
                     "Query Efficiency (Average Per Query)": {
                         "Average Retrieval Time (s)": avg_latency,
                         "Average Input Tokens": avg_in_tokens,
                         "Average Output Tokens": avg_out_tokens,
                     }
                 }
-            )
+            document_set_summary = self._summarize_bookrag_document_sets(items)
+            if document_set_summary:
+                generation_report["BookRAG Per-Query Document Sets"] = {
+                    "Unique Document Sets": document_set_summary[
+                        "unique_document_sets"
+                    ],
+                    "Cold-Built Document Sets": document_set_summary[
+                        "cold_built_document_sets"
+                    ],
+                    "Cache-Hit Questions": document_set_summary[
+                        "cache_hit_questions"
+                    ],
+                    "Total Insertion Time (s)": document_set_summary[
+                        "total_ingest_time_sec"
+                    ],
+                    "Total Input Tokens": document_set_summary[
+                        "total_ingest_input_tokens"
+                    ],
+                    "Total Output Tokens": document_set_summary[
+                        "total_ingest_output_tokens"
+                    ],
+                    "Total Embedding Tokens": document_set_summary[
+                        "total_ingest_embedding_tokens"
+                    ],
+                }
+            self._update_report(generation_report)
 
         eval_items = items
         eval_results_map = {}
@@ -1176,6 +1244,48 @@ class BenchmarkPipeline:
             }
         })
 
+    def _is_bookrag_per_query(self) -> bool:
+        execution = self.config.get("execution") or {}
+        bookrag = self.config.get("bookrag") or {}
+        return (
+            execution.get("mode") == "bookrag"
+            and str(bookrag.get("index_layout", "dataset")).lower() == "per_query"
+        )
+
+    def _prepare_and_register_per_query_documents(self) -> list:
+        """Materialize and register PDFs before lazy per-query generation."""
+        doc_dir = self.config["paths"].get("doc_output_dir") or os.path.join(
+            self.output_dir,
+            "docs",
+        )
+        pdf_preprocessing = (
+            (self.config.get("bookrag") or {}).get("pdf_preprocessing") or {}
+        )
+        if not self._config_bool(pdf_preprocessing.get("enabled"), False):
+            raise ValueError(
+                "BookRAG per-query mode requires bookrag.pdf_preprocessing.enabled=true"
+            )
+        started = time.monotonic()
+        source_documents = self.adapter.prepare_pdf_sources(doc_dir)
+        pdf_output_dir = pdf_preprocessing.get("output_dir") or os.path.join(
+            doc_dir,
+            "pdfs",
+        )
+        documents, stats = PdfMaterializer(pdf_output_dir).materialize(
+            source_documents
+        )
+        stats["time"] = time.monotonic() - started
+        self.db.register_documents(documents)
+        self.metrics_summary["document_preparation"] = stats
+        self.logger.info(
+            "BookRAG per-query PDF registration ready: documents=%d, time=%.2fs, "
+            "cached=%d",
+            len(documents),
+            stats["time"],
+            int(stats.get("skipped_existing", 0) or 0),
+        )
+        return documents
+
     def _prepare_tasks(self, samples):
         tasks = []
         global_idx = 0
@@ -1194,14 +1304,38 @@ class BenchmarkPipeline:
                 f"Question rewrite enabled: max_queries={original_max_queries} original QA(s) "
                 f"-> {max_queries} rewritten task(s)"
             )
-        for sample in samples:
-            for qa in sample.qa_pairs:
+        ordered_qa = [
+            (sample, qa)
+            for sample in samples
+            for qa in sample.qa_pairs
+        ]
+        if self._is_bookrag_per_query():
+            if not all("dataset_row_index" in (qa.metadata or {}) for _, qa in ordered_qa):
+                raise ValueError(
+                    "BookRAG per-query mode requires dataset_row_index metadata for every QA"
+                )
+            ordered_qa.sort(key=lambda item: int(item[1].metadata["dataset_row_index"]))
+
+        for sample, qa in ordered_qa:
                 if max_queries is not None and global_idx >= max_queries:
                     break
-                tasks.append({"id": global_idx, "sample_id": sample.sample_id, "qa": qa})
+                task_id = global_idx
+                task = {"id": task_id, "sample_id": sample.sample_id, "qa": qa}
+                if self._is_bookrag_per_query():
+                    metadata = qa.metadata or {}
+                    document_ids = metadata.get("document_ids")
+                    if not isinstance(document_ids, list) or not document_ids:
+                        raise ValueError(
+                            "BookRAG per-query QA is missing non-empty document_ids: "
+                            f"row={metadata.get('dataset_row_index')}"
+                        )
+                    task["id"] = int(metadata["dataset_row_index"])
+                    task["document_ids"] = list(document_ids)
+                    resolved = self.db.resolve_document_set(document_ids)
+                    task["document_set_id"] = resolved["document_set_id"]
+                    task["document_set_index_dir"] = resolved["index_dir"]
+                tasks.append(task)
                 global_idx += 1
-            if max_queries is not None and global_idx >= max_queries:
-                break
         return tasks
 
     def _apply_question_rewrites_to_samples(self, samples):
@@ -1593,6 +1727,66 @@ class BenchmarkPipeline:
             "runs": summaries,
         }
 
+    @staticmethod
+    def _summarize_bookrag_document_sets(records: list[dict]) -> dict:
+        """Aggregate per-query ingestion once for each unique document set."""
+        per_set: dict[str, dict] = {}
+        cache_hit_questions = 0
+        for record in records:
+            bookrag = record.get("bookrag", {}) or {}
+            set_id = bookrag.get("document_set_id")
+            if not set_id:
+                continue
+            set_id = str(set_id)
+            current = per_set.setdefault(
+                set_id,
+                {
+                    "document_ids": list(bookrag.get("document_ids", []) or []),
+                    "questions": 0,
+                    "built": False,
+                    "ingest_time_sec": 0.0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "embedding_tokens": 0,
+                },
+            )
+            current["questions"] += 1
+            cache_hit = bookrag.get("document_set_cache_hit")
+            cache_hit_questions += int(cache_hit is True)
+            if cache_hit is False and not current["built"]:
+                current["built"] = True
+                current["ingest_time_sec"] = float(
+                    bookrag.get("document_set_ingest_time_sec", 0.0) or 0.0
+                )
+                current["input_tokens"] = int(
+                    bookrag.get("document_set_ingest_input_tokens", 0) or 0
+                )
+                current["output_tokens"] = int(
+                    bookrag.get("document_set_ingest_output_tokens", 0) or 0
+                )
+                current["embedding_tokens"] = int(
+                    bookrag.get("document_set_ingest_embedding_tokens", 0) or 0
+                )
+
+        if not per_set:
+            return {}
+        values = list(per_set.values())
+        return {
+            "unique_document_sets": len(values),
+            "cold_built_document_sets": sum(int(value["built"]) for value in values),
+            "cache_hit_questions": cache_hit_questions,
+            "total_ingest_time_sec": sum(value["ingest_time_sec"] for value in values),
+            "total_ingest_input_tokens": sum(value["input_tokens"] for value in values),
+            "total_ingest_output_tokens": sum(value["output_tokens"] for value in values),
+            "total_ingest_embedding_tokens": sum(
+                value["embedding_tokens"] for value in values
+            ),
+            "document_counts": sorted(
+                len(value["document_ids"]) for value in values
+            ),
+            "sets": per_set,
+        }
+
     def _process_bookrag_task(self, task):
         """Use BookRAG's official AnswerAgent result without a second LLM pass."""
         self.monitor.worker_start()
@@ -1613,10 +1807,20 @@ class BenchmarkPipeline:
             )
 
             started = time.time()
+            answer_kwargs = {
+                "query": query,
+                "topk": self.config["execution"]["retrieval_topk"],
+                "query_output_dir": trace_dir,
+            }
+            if self._is_bookrag_per_query():
+                answer_kwargs.update(
+                    {
+                        "document_ids": task["document_ids"],
+                        "document_set_id": task["document_set_id"],
+                    }
+                )
             result = self.db.answer(
-                query=query,
-                topk=self.config["execution"]["retrieval_topk"],
-                query_output_dir=trace_dir,
+                **answer_kwargs,
             )
             latency = time.time() - started
 
@@ -1633,12 +1837,19 @@ class BenchmarkPipeline:
                 or 0
             )
             answer = str(result.get("answer", "") or "")
+            document_set_stats = result.get("document_set", {}) or {}
 
             self.monitor.worker_end(tokens=total_tokens)
+            document_set_log = ""
+            if document_set_stats:
+                document_set_log = (
+                    f" | Set={document_set_stats.get('document_set_id')}"
+                    f" | IndexCache={bool(document_set_stats.get('cache_hit'))}"
+                )
             self.logger.info(
                 f"[Query-{task['id']}] BookRAG AnswerAgent | "
                 f"Nodes={len(result.get('retrieved_node_ids', []) or [])} | "
-                f"Recall={recall:.2f} | Time={latency:.2f}s"
+                f"Recall={recall:.2f} | Time={latency:.2f}s{document_set_log}"
             )
 
             return {
@@ -1660,6 +1871,28 @@ class BenchmarkPipeline:
                     "retrieved_node_ids": result.get("retrieved_node_ids", []),
                     "trace_dir": result.get("trace_dir", trace_dir),
                     "total_time_sec": latency,
+                    "document_ids": list(task.get("document_ids", [])),
+                    "document_set_id": task.get("document_set_id"),
+                    "document_set_index_dir": task.get("document_set_index_dir"),
+                    "document_set_cache_hit": document_set_stats.get("cache_hit"),
+                    "document_set_index_wait_sec": document_set_stats.get(
+                        "wait_seconds", 0.0
+                    ),
+                    "document_set_ingest_time_sec": document_set_stats.get(
+                        "time", 0.0
+                    ),
+                    "document_set_ingest_input_tokens": document_set_stats.get(
+                        "input_tokens", 0
+                    ),
+                    "document_set_ingest_output_tokens": document_set_stats.get(
+                        "output_tokens", 0
+                    ),
+                    "document_set_ingest_embedding_tokens": document_set_stats.get(
+                        "embedding_tokens", 0
+                    ),
+                    "answer_time_sec": document_set_stats.get(
+                        "answer_time_seconds", latency
+                    ),
                 },
                 "metrics": {"Recall": recall},
                 "token_usage": {
