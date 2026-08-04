@@ -411,13 +411,14 @@ class LLM:
         json_response: bool = False,
         progress_callback: Optional[Callable[[], None]] = None,
         executor: Optional[Executor] = None,
+        result_callback: Optional[Callable[[int, str], None]] = None,
     ) -> list:
         """Generate completions concurrently while preserving input order.
 
-        ``progress_callback`` runs in the caller thread once for every finished
-        request, including requests that finish with an error.  Keeping the
-        callback here lets callers report real progress without duplicating the
-        thread-pool implementation.
+        ``result_callback`` runs in the caller thread with the input index and
+        result as soon as each request finishes.  It runs before
+        ``progress_callback`` so a caller can durably persist the result before
+        reporting progress.
         """
         def run(active_executor: Executor) -> list:
             results = [None] * len(prompts)
@@ -437,6 +438,8 @@ class LLM:
                 except Exception as e:
                     results[idx] = f"Error: {e}"
                 finally:
+                    if result_callback is not None:
+                        result_callback(idx, results[idx])
                     if progress_callback is not None:
                         try:
                             progress_callback()

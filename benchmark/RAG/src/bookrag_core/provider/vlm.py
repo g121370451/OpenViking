@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, List, Union, Type
+from typing import Callable, Dict, Any, Optional, List, Union, Type
 from abc import ABC, abstractmethod
 import base64
 from io import BytesIO
@@ -525,13 +525,17 @@ class VLM:
         images_list: list = None,
         max_workers: int = 8,
         executor: Optional[Executor] = None,
+        result_callback: Optional[Callable[[int, str], None]] = None,
     ):
         if isinstance(self.vlm, QwenVLController):
             if len(queries) > 1:
                 raise RuntimeError(
                     "QwenVLController does not support parallel batch inference in a single process."
                 )
-            return [self.generate(queries[0], images_list[0] if images_list else None)]
+            result = self.generate(queries[0], images_list[0] if images_list else None)
+            if result_callback is not None:
+                result_callback(0, result)
+            return [result]
         def run(active_executor: Executor):
             results = [None] * len(queries)
             future_to_idx = {
@@ -549,6 +553,8 @@ class VLM:
                     results[idx] = future.result()
                 except Exception as e:
                     results[idx] = f"Error: {e}"
+                if result_callback is not None:
+                    result_callback(idx, results[idx])
             return results
 
         if executor is not None:

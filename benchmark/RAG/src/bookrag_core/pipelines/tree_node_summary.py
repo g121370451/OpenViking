@@ -3,10 +3,15 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import inspect
-from typing import Callable, Optional, List, Dict, Set
+from typing import Optional, Set
 
 from bookrag_core.Index.Tree import TreeNode, NodeType, DocumentTree
 from bookrag_core.prompts.summary_prompt import NODE_SUMMARY_PROMPT, SEC_SUMMARY_PROMPT
+from bookrag_core.pipelines.summary_journal import (
+    SummaryJournal,
+    is_valid_summary,
+    summary_prompt_fingerprint,
+)
 from bookrag_core.provider.llm import LLM
 from bookrag_core.provider.vlm import VLM
 from bookrag_core.utils.utils import num_tokens, TextProcessor
@@ -15,6 +20,16 @@ import logging
 from tqdm import tqdm
 
 log = logging.getLogger(__name__)
+
+
+def _get_nodes_by_level(node, current_level=0, level_dict=None):
+    """Get root-reachable nodes organized by depth."""
+    if level_dict is None:
+        level_dict = {}
+    level_dict.setdefault(current_level, []).append(node)
+    for child in node.children:
+        _get_nodes_by_level(child, current_level + 1, level_dict)
+    return level_dict
 
 
 def get_node_summary_prompt(tree_node: TreeNode, max_token: int) -> str:
@@ -164,39 +179,86 @@ def generate_section_summary(sec_node: TreeNode, llm: LLM) -> str:
     return summary
 
 
+def _summary_prompt_for_node(node: TreeNode, max_token: int) -> str:
+    if node.children:
+        return get_sec_summary_prompt(node, max_token)
+    return get_node_summary_prompt(node, max_token=max_token)
+
+
+def replay_tree_node_summary_journal(
+    tree_index: DocumentTree,
+    *,
+    max_token: int,
+    journal: SummaryJournal,
+) -> dict[str, int]:
+    """Replay matching per-node records from children to parents."""
+    records_by_node = journal.records_by_node()
+    if not records_by_node:
+        return {"applied": 0, "changed": 0, "invalidated_ancestors": 0}
+
+    level_dict = _get_nodes_by_level(tree_index.root_node)
+    changed_nodes: set[int] = set()
+    applied = 0
+    changed = 0
+    invalidated_ancestors = 0
+
+    for level in sorted(level_dict.keys(), reverse=True):
+        for node in level_dict[level]:
+            if node.type == NodeType.ROOT:
+                continue
+            child_changed = any(
+                child.index_id in changed_nodes for child in node.children
+            )
+            prompt = _summary_prompt_for_node(node, max_token)
+            prompt_fingerprint = summary_prompt_fingerprint(prompt)
+            matching_record = next(
+                (
+                    record
+                    for record in reversed(records_by_node.get(node.index_id, []))
+                    if record["prompt_fingerprint"] == prompt_fingerprint
+                ),
+                None,
+            )
+            if matching_record is not None:
+                summary = str(matching_record["summary"]).strip()
+                applied += 1
+                if node.summary != summary:
+                    node.summary = summary
+                    changed += 1
+                    changed_nodes.add(node.index_id)
+                continue
+
+            # A parent summary persisted before a child changed is stale unless
+            # the journal also contains a result for the parent's new prompt.
+            if child_changed and node.summary:
+                node.summary = ""
+                invalidated_ancestors += 1
+                changed_nodes.add(node.index_id)
+
+    return {
+        "applied": applied,
+        "changed": changed,
+        "invalidated_ancestors": invalidated_ancestors,
+    }
+
+
 def generate_tree_node_summary(
     tree_index: DocumentTree,
     llm: LLM,
     use_VLM: bool = False,
     vlm: Optional[VLM] = None,
     target_node_ids: Optional[Set[int]] = None,
-    checkpoint_callback: Optional[Callable[[DocumentTree], None]] = None,
-    checkpoint_batch_size: int = 250,
+    summary_journal: Optional[SummaryJournal] = None,
+    request_batch_size: int = 250,
 ) -> DocumentTree:
     """Generate summaries for each node in the tree index.
     The generating order is from the leaf nodes to the root node.
     """
-    log.info("Generating summaries for tree nodes...")
-
-    def get_nodes_by_level_bottom_up(node, current_level=0, level_dict=None):
-        """Get all nodes organized by level from bottom to top"""
-        if level_dict is None:
-            level_dict = {}
-
-        if current_level not in level_dict:
-            level_dict[current_level] = []
-
-        level_dict[current_level].append(node)
-
-        # Recursively process children
-        for child in node.children:
-            get_nodes_by_level_bottom_up(child, current_level + 1, level_dict)
-
-        return level_dict
+    # log.info("Generating summaries for tree nodes...")
 
     # Get all nodes organized by level from bottom to top
-    level_dict = get_nodes_by_level_bottom_up(tree_index.root_node)
-    log.info(f"Processing tree with {len(level_dict)} levels")
+    level_dict = _get_nodes_by_level(tree_index.root_node)
+    # log.info(f"Processing tree with {len(level_dict)} levels")
     work_levels = [
         (
             level,
@@ -219,11 +281,19 @@ def generate_tree_node_summary(
         llm.batch_get_completion
     ).parameters
     llm_accepts_executor = "executor" in llm_batch_parameters
+    llm_accepts_result_callback = "result_callback" in llm_batch_parameters
     vlm_accepts_executor = bool(
         use_VLM
         and vlm is not None
         and "executor" in inspect.signature(vlm.batch_generate).parameters
     )
+    vlm_accepts_result_callback = bool(
+        use_VLM
+        and vlm is not None
+        and "result_callback" in inspect.signature(vlm.batch_generate).parameters
+    )
+    if summary_journal is None and tree_index.save_dir:
+        summary_journal = SummaryJournal(tree_index.save_dir, tree_index)
 
     log.info(
         "Summary plan: total_tree_nodes=%d, structural_roots=%d, "
@@ -274,7 +344,6 @@ def generate_tree_node_summary(
                             log.warning(
                                 f"Image path {image_path} does not exist for node {node.index_id}."
                             )
-                            progress.update(1)
                             continue
                         vlm_prompt_list.append(summary_prompt)
                         vlm_images_list.append(image_path)
@@ -289,41 +358,56 @@ def generate_tree_node_summary(
                     llm_prompt_list.append(summary_prompt)
                     llm_node_idx_list.append(node.index_id)
 
-            # Generate bounded batches so a crash loses at most one batch of
-            # completed calls instead of every summary at the current depth.
-            if checkpoint_batch_size < 1:
-                raise ValueError("checkpoint_batch_size must be positive")
+            # Keep request submission bounded. Durability is per result through
+            # SummaryJournal and is independent of this request batch size.
+            if request_batch_size < 1:
+                raise ValueError("request_batch_size must be positive")
             if llm_prompt_list:
                 log.info(
                     f"Generating summaries for {len(llm_prompt_list)} nodes using LLM."
                 )
                 for batch_start in range(
-                    0, len(llm_prompt_list), checkpoint_batch_size
+                    0, len(llm_prompt_list), request_batch_size
                 ):
-                    batch_end = batch_start + checkpoint_batch_size
+                    batch_end = batch_start + request_batch_size
                     batch_prompts = llm_prompt_list[batch_start:batch_end]
                     batch_node_ids = llm_node_idx_list[batch_start:batch_end]
+                    def persist_llm_result(position: int, value: str) -> None:
+                        node_id = batch_node_ids[position]
+                        node = tree_index.get_node_by_index_id(node_id)
+                        if node is None:
+                            raise RuntimeError(
+                                f"Node with ID {node_id} not found in the tree index"
+                            )
+                        if not is_valid_summary(value):
+                            log.warning(
+                                "Summary result for node %d is invalid and was not persisted: %s",
+                                node_id,
+                                value,
+                            )
+                            return
+                        summary = str(value).strip()
+                        if summary_journal is not None:
+                            summary = summary_journal.append(
+                                node_id=node_id,
+                                prompt=batch_prompts[position],
+                                summary=summary,
+                            )
+                        node.summary = summary
+                        progress.update(1)
+
                     batch_kwargs = {
                         "prompts": batch_prompts,
                         "json_response": False,
-                        "progress_callback": lambda: progress.update(1),
                     }
                     if llm_accepts_executor:
                         batch_kwargs["executor"] = summary_executor
+                    if llm_accepts_result_callback:
+                        batch_kwargs["result_callback"] = persist_llm_result
                     llm_summaries = llm.batch_get_completion(**batch_kwargs)
-                    for idx, summary in zip(batch_node_ids, llm_summaries):
-                        node = tree_index.get_node_by_index_id(idx)
-                        if node:
-                            node.summary = str(summary or "").strip()
-                            log.debug(
-                                f"Node {idx} summary generated: {node.summary}"
-                            )
-                        else:
-                            log.warning(
-                                f"Node with ID {idx} not found in the tree index."
-                            )
-                    if checkpoint_callback is not None:
-                        checkpoint_callback(tree_index)
+                    if not llm_accepts_result_callback:
+                        for position, summary in enumerate(llm_summaries):
+                            persist_llm_result(position, summary)
 
             # Generate summaries using VLM if applicable. The VLM batch API does
             # not expose per-future callbacks, so this advances after the batch.
@@ -332,12 +416,36 @@ def generate_tree_node_summary(
                     f"Generating summaries for {len(vlm_prompt_list)} nodes using VLM."
                 )
                 for batch_start in range(
-                    0, len(vlm_prompt_list), checkpoint_batch_size
+                    0, len(vlm_prompt_list), request_batch_size
                 ):
-                    batch_end = batch_start + checkpoint_batch_size
+                    batch_end = batch_start + request_batch_size
                     batch_prompts = vlm_prompt_list[batch_start:batch_end]
                     batch_images = vlm_images_list[batch_start:batch_end]
                     batch_node_ids = vlm_node_idx_list[batch_start:batch_end]
+                    def persist_vlm_result(position: int, value: str) -> None:
+                        node_id = batch_node_ids[position]
+                        node = tree_index.get_node_by_index_id(node_id)
+                        if node is None:
+                            raise RuntimeError(
+                                f"Node with ID {node_id} not found in the tree index"
+                            )
+                        if not is_valid_summary(value):
+                            log.warning(
+                                "VLM summary result for node %d is invalid and was not persisted: %s",
+                                node_id,
+                                value,
+                            )
+                            return
+                        summary = str(value).strip()
+                        if summary_journal is not None:
+                            summary = summary_journal.append(
+                                node_id=node_id,
+                                prompt=batch_prompts[position],
+                                summary=summary,
+                            )
+                        node.summary = summary
+                        progress.update(1)
+
                     vlm_kwargs = {
                         "queries": batch_prompts,
                         "images_list": batch_images,
@@ -345,21 +453,12 @@ def generate_tree_node_summary(
                     }
                     if vlm_accepts_executor:
                         vlm_kwargs["executor"] = summary_executor
+                    if vlm_accepts_result_callback:
+                        vlm_kwargs["result_callback"] = persist_vlm_result
                     vlm_summaries = vlm.batch_generate(**vlm_kwargs)
-                    progress.update(len(batch_node_ids))
-                    for idx, summary in zip(batch_node_ids, vlm_summaries):
-                        node = tree_index.get_node_by_index_id(idx)
-                        if node:
-                            node.summary = str(summary or "").strip()
-                            log.debug(
-                                f"Node {idx} summary generated: {node.summary}"
-                            )
-                        else:
-                            log.warning(
-                                f"Node with ID {idx} not found in the tree index."
-                            )
-                    if checkpoint_callback is not None:
-                        checkpoint_callback(tree_index)
+                    if not vlm_accepts_result_callback:
+                        for position, summary in enumerate(vlm_summaries):
+                            persist_vlm_result(position, summary)
 
     log.info("All node summaries generated successfully.")
     # Return the updated tree index with summaries

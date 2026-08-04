@@ -24,6 +24,7 @@ def construct_GBC_index_from_tree(
     graph_only: bool = False,
     summary_node_ids: Optional[Set[int]] = None,
     summary_checkpoint_callback: Optional[Callable] = None,
+    summary_journal=None,
 ):
     """Construct the official GBC index from an already normalized tree.
 
@@ -54,6 +55,7 @@ def construct_GBC_index_from_tree(
         summary_node_ids is None or bool(summary_node_ids)
     )
     if should_generate_summaries:
+        from bookrag_core.pipelines.summary_journal import SummaryJournal
         from bookrag_core.pipelines.tree_node_summary import generate_tree_node_summary
         from bookrag_core.provider.llm import LLM
         from bookrag_core.provider.vlm import VLM
@@ -62,16 +64,16 @@ def construct_GBC_index_from_tree(
         summary_token_baseline = token_tracker.get_usage()
         llm = LLM(cfg.llm)
         vlm = VLM(cfg.vlm) if cfg.tree.use_vlm else None
+        if summary_journal is None:
+            summary_journal = SummaryJournal(cfg.save_path, tree_index)
         tree_index = generate_tree_node_summary(
             tree_index=tree_index,
             llm=llm,
             use_VLM=cfg.tree.use_vlm,
             vlm=vlm,
             target_node_ids=summary_node_ids,
-            checkpoint_callback=summary_checkpoint_callback,
+            summary_journal=summary_journal,
         )
-        if summary_checkpoint_callback is not None:
-            summary_checkpoint_callback(tree_index)
         current_run_stats["build_summary_time"] = round(
             time.time() - summary_start, 2
         )
@@ -82,6 +84,8 @@ def construct_GBC_index_from_tree(
         log.info("Tree node summary generation cost: %s", summary_cost)
 
     tree_index.save_to_file()
+    if should_generate_summaries and summary_checkpoint_callback is not None:
+        summary_checkpoint_callback(tree_index)
     if tree_only:
         current_run_stats["token_stage_history"] = token_tracker.stage_history
         save_indexing_stats(save_path=cfg.save_path, new_stats=current_run_stats)
@@ -173,7 +177,28 @@ def construct_GBC_index_from_markdown(
     log.info("Tree index construction cost: %s", tree_cost)
 
     if cfg.tree.node_summary:
+        from bookrag_core.pipelines.summary_journal import SummaryJournal
+        from bookrag_core.pipelines.tree_node_summary import (
+            replay_tree_node_summary_journal,
+        )
+
         summary_validation = checkpoint.validate_summaries(tree_index, cfg)
+        summary_journal = SummaryJournal(cfg.save_path, tree_index)
+        if not summary_validation.complete:
+            replay_stats = replay_tree_node_summary_journal(
+                tree_index,
+                max_token=cfg.llm.max_tokens,
+                journal=summary_journal,
+            )
+            if replay_stats["applied"]:
+                log.info(
+                    "[Resume] Replayed %d summary journal records (%d changed, "
+                    "%d stale ancestors invalidated).",
+                    replay_stats["applied"],
+                    replay_stats["changed"],
+                    replay_stats["invalidated_ancestors"],
+                )
+                summary_validation = checkpoint.validate_summaries(tree_index, cfg)
         summary_targets = summary_validation.target_node_ids
         if summary_validation.complete:
             log.info(
@@ -189,18 +214,19 @@ def construct_GBC_index_from_markdown(
                 node = tree_index.get_node_by_index_id(node_id)
                 if node is not None:
                     node.summary = ""
-            checkpoint.mark_summary_progress(tree_index, cfg)
+            checkpoint.mark_summary_progress(tree_index, cfg, persist_tree=False)
             log.info(
                 "[Resume] Summary incomplete: regenerating %d nodes (%d directly invalid).",
                 len(summary_targets),
                 len(summary_validation.invalid_node_ids),
             )
     else:
+        summary_journal = None
         summary_targets = set()
         checkpoint.update_stage("summary", status="disabled")
 
     def save_summary_checkpoint(updated_tree):
-        checkpoint.mark_summary_progress(updated_tree, cfg)
+        checkpoint.mark_summary_progress(updated_tree, cfg, persist_tree=False)
 
     try:
         with token_tracker.prepared_ingest_scope():
@@ -211,6 +237,7 @@ def construct_GBC_index_from_markdown(
                 graph_only=graph_only,
                 summary_node_ids=summary_targets,
                 summary_checkpoint_callback=save_summary_checkpoint,
+                summary_journal=summary_journal,
             )
     finally:
         TokenTracker.get_instance().set_persistence_path(None)
@@ -282,7 +309,28 @@ def construct_GBC_index_from_pdfs(
     log.info("Tree index construction cost: %s", tree_cost)
 
     if cfg.tree.node_summary:
+        from bookrag_core.pipelines.summary_journal import SummaryJournal
+        from bookrag_core.pipelines.tree_node_summary import (
+            replay_tree_node_summary_journal,
+        )
+
         summary_validation = checkpoint.validate_summaries(tree_index, cfg)
+        summary_journal = SummaryJournal(cfg.save_path, tree_index)
+        if not summary_validation.complete:
+            replay_stats = replay_tree_node_summary_journal(
+                tree_index,
+                max_token=cfg.llm.max_tokens,
+                journal=summary_journal,
+            )
+            if replay_stats["applied"]:
+                log.info(
+                    "[Resume] Replayed %d summary journal records (%d changed, "
+                    "%d stale ancestors invalidated).",
+                    replay_stats["applied"],
+                    replay_stats["changed"],
+                    replay_stats["invalidated_ancestors"],
+                )
+                summary_validation = checkpoint.validate_summaries(tree_index, cfg)
         summary_targets = summary_validation.target_node_ids
         if summary_validation.complete:
             log.info(
@@ -295,7 +343,7 @@ def construct_GBC_index_from_pdfs(
                 node = tree_index.get_node_by_index_id(node_id)
                 if node is not None:
                     node.summary = ""
-            checkpoint.mark_summary_progress(tree_index, cfg)
+            checkpoint.mark_summary_progress(tree_index, cfg, persist_tree=False)
             log.info(
                 "[Resume] Summary incomplete: regenerating %d nodes (%d directly invalid).",
                 len(summary_targets),
@@ -316,11 +364,12 @@ def construct_GBC_index_from_pdfs(
             len(summary_targets),
         )
     else:
+        summary_journal = None
         summary_targets = set()
         checkpoint.update_stage("summary", status="disabled")
 
     def save_summary_checkpoint(updated_tree):
-        checkpoint.mark_summary_progress(updated_tree, cfg)
+        checkpoint.mark_summary_progress(updated_tree, cfg, persist_tree=False)
 
     try:
         with token_tracker.prepared_ingest_scope():
@@ -331,6 +380,7 @@ def construct_GBC_index_from_pdfs(
                 graph_only=graph_only,
                 summary_node_ids=summary_targets,
                 summary_checkpoint_callback=save_summary_checkpoint,
+                summary_journal=summary_journal,
             )
     finally:
         TokenTracker.get_instance().set_persistence_path(None)

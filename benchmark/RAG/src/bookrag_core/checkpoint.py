@@ -214,6 +214,34 @@ def tree_content_fingerprint(tree) -> str:
     )
 
 
+def reachable_tree_nodes(tree) -> list[Any]:
+    """Return nodes visited by BookRAG's root-based tree traversals.
+
+    The original PDF outline builder can leave detached nodes in
+    ``tree.nodes`` when an outline entry references a parent that was not
+    created.  BookRAG's summary traversal starts at ``root_node`` and therefore
+    intentionally ignores those detached nodes.  Keep the same traversal
+    contract for checkpoint validation instead of treating the whole persisted
+    tree as corrupt.
+    """
+    root = getattr(tree, "root_node", None)
+    if root is None:
+        return []
+
+    reachable = []
+    visited_objects: set[int] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        object_id = id(node)
+        if object_id in visited_objects:
+            continue
+        visited_objects.add(object_id)
+        reachable.append(node)
+        stack.extend(reversed(node.children))
+    return reachable
+
+
 @dataclass
 class TreeValidation:
     valid: bool
@@ -307,6 +335,12 @@ class BuildCheckpoint:
             self.token_usage_path.unlink()
         except FileNotFoundError:
             pass
+        from bookrag_core.pipelines.summary_journal import SUMMARY_JOURNAL_FILENAME
+
+        try:
+            (self.save_path / SUMMARY_JOURNAL_FILENAME).unlink()
+        except FileNotFoundError:
+            pass
 
     def context_matches(self, documents, cfg) -> bool:
         expected = self.expected_context(documents, cfg)
@@ -396,22 +430,37 @@ class BuildCheckpoint:
         if tree.root_node.index_id not in id_set:
             return TreeValidation(False, reason="root node is not in tree.nodes")
 
-        reachable: set[int] = set()
-        stack = [tree.root_node]
-        while stack:
-            node = stack.pop()
-            if node.index_id in reachable:
-                continue
-            reachable.add(node.index_id)
+        # Validate every persisted edge, including edges inside detached
+        # components.  Detached component roots themselves are valid: the
+        # original BookRAG PDF builder may retain them in ``tree.nodes`` when
+        # the LLM-produced outline references a missing parent.
+        for node in nodes:
+            if node.parent is not None:
+                if node.parent.index_id not in id_set:
+                    return TreeValidation(
+                        False,
+                        reason=f"parent of node {node.index_id} is missing from tree.nodes",
+                    )
+                if node not in node.parent.children:
+                    return TreeValidation(
+                        False,
+                        reason=f"parent/child mismatch at node {node.index_id}",
+                    )
             for child in node.children:
+                if child.index_id not in id_set:
+                    return TreeValidation(
+                        False,
+                        reason=f"child {child.index_id} is missing from tree.nodes",
+                    )
                 if child.parent is not node:
                     return TreeValidation(
                         False,
                         reason=f"parent/child mismatch at node {child.index_id}",
                     )
-                stack.append(child)
-        if reachable != id_set:
-            return TreeValidation(False, reason="tree contains unreachable nodes")
+
+        reachable = {
+            node.index_id for node in reachable_tree_nodes(tree)
+        }
 
         expected_sources = {
             self._normalized_source_key(sample_id, path)
@@ -441,6 +490,8 @@ class BuildCheckpoint:
             "tree",
             status="complete",
             node_count=len(nodes),
+            reachable_node_count=len(reachable),
+            detached_node_count=len(id_set - reachable),
             content_fingerprint=content_fingerprint,
         )
         return TreeValidation(True, tree=tree, json_repaired=json_repaired)
@@ -479,7 +530,15 @@ class BuildCheckpoint:
     def validate_summaries(self, tree, cfg) -> SummaryValidation:
         from bookrag_core.Index.Tree import NodeType
 
-        required_nodes = [node for node in tree.nodes if node.type != NodeType.ROOT]
+        # Match generate_tree_node_summary(), which recursively starts at the
+        # root.  Detached PDF-outline artifacts remain available to the
+        # original downstream KG/VDB loops over ``tree.nodes``, but they neither
+        # receive nor require summaries.
+        required_nodes = [
+            node
+            for node in reachable_tree_nodes(tree)
+            if node.type != NodeType.ROOT
+        ]
         required_ids = {node.index_id for node in required_nodes}
         invalid_ids = {
             node.index_id
@@ -517,8 +576,15 @@ class BuildCheckpoint:
             reason=reason,
         )
 
-    def mark_summary_progress(self, tree, cfg) -> SummaryValidation:
-        tree.save_to_file()
+    def mark_summary_progress(
+        self,
+        tree,
+        cfg,
+        *,
+        persist_tree: bool = True,
+    ) -> SummaryValidation:
+        if persist_tree:
+            tree.save_to_file()
         validation = self.validate_summaries(tree, cfg)
         completed = len(validation.required_node_ids - validation.invalid_node_ids)
         self.update_stage(

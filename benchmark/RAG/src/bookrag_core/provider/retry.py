@@ -66,7 +66,7 @@ def call_with_retry(
     *,
     operation_name: str,
     logger: logging.Logger,
-    max_attempts: int = 3,
+    max_attempts: int = 8,
     rate_limit_max_attempts: int = 8,
     rate_limit_base_delay: float = 2.0,
     rate_limit_max_delay: float = 60.0,
