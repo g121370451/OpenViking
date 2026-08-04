@@ -202,11 +202,46 @@ class KGRefiner:
             # Recursively find the latest entity name
             return self.get_latest_entity_name(latest_node_name)
 
+    def request_merged_entity_identity(
+        self,
+        old_entity: Entity,
+        new_entity: Entity,
+    ) -> MergedEntitySchema:
+        """Ask the LLM for a merged identity without mutating Graph/VDB."""
+        old_entity_dict = old_entity.model_dump(exclude={"source_ids"})
+        old_entity_dict["description"] = truncate_description(
+            old_entity_dict["description"], max_words=200
+        )
+        new_entity_dict = new_entity.model_dump(exclude={"source_ids"})
+        new_entity_dict["description"] = truncate_description(
+            new_entity_dict["description"], max_words=200
+        )
+        prompt = SUMMARIZE_ENTITY.format(
+            entity_types=",".join(DEFAULT_ENTITY_TYPES),
+            input_json=json.dumps(
+                {
+                    "entity_1": old_entity_dict,
+                    "entity_2": new_entity_dict,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
+        result: MergedEntitySchema = self.llm.get_json_completion(
+            prompt=prompt,
+            schema=MergedEntitySchema,
+        )
+        result = result.model_copy(deep=True)
+        result.entity_name = result.entity_name.lower()
+        result.entity_type = result.entity_type.upper().replace(" ", "_")
+        return result
+
     def entity_merge(
         self,
         old_entity: Entity,
         new_entity: Entity,
         merged_to_old_entity: Boolean = False,
+        merged_identity: Optional[MergedEntitySchema] = None,
     ) -> Entity:
         """
         Merges two entities into one by summarizing their descriptions and updating the graph index.
@@ -216,17 +251,35 @@ class KGRefiner:
         Returns:
             Entity: The merged entity with updated description and source IDs.
         """
-        # 1. delete old entity from the vector database
+        old_node_name = self.graph_index.get_node_name_from_entity(old_entity)
+        new_node_name = self.graph_index.get_node_name_from_entity(new_entity)
+        # The merge-identity LLM call is deliberately separable from the graph
+        # mutation. Concurrent callers prepare it while not holding state_lock.
+        if (
+            old_node_name != new_node_name
+            and not merged_to_old_entity
+            and merged_identity is None
+        ):
+            merged_identity = self.request_merged_entity_identity(
+                old_entity,
+                new_entity,
+            )
 
+        # 1. delete old entity from the vector database
         self.delete_entity_from_vdb(old_entity)
 
         # 2. merge the two entities
-        old_node_name = self.graph_index.get_node_name_from_entity(old_entity)
-        new_node_name = self.graph_index.get_node_name_from_entity(new_entity)
         if (old_node_name == new_node_name) or merged_to_old_entity:
             # 2.1 if have the same node name, or merged to old entity,
             # Directly merged if the entity name and type are the same
-            log.info("merged directly")
+            log.info(
+                "Direct entity merge: existing '%s' (%s, %d source nodes) + "
+                "incoming occurrence (%s).",
+                old_entity.entity_name,
+                old_entity.entity_type,
+                len(old_entity.source_ids),
+                sorted(new_entity.source_ids),
+            )
             new_description = (
                 old_entity.description + self._DESCRIPTION_SEP_ + new_entity.description
             )
@@ -237,43 +290,18 @@ class KGRefiner:
                 source_ids=set(old_entity.source_ids).union(new_entity.source_ids),
             )
         else:
-            # 2.2 if have different node name, use LLM to create new entity
+            # 2.2 if have different node name, use the prepared LLM identity
             log.info("merged by LLM summarization")
-            old_entity_dict = old_entity.model_dump(exclude={"source_ids"})
-            old_entity_dict["description"] = truncate_description(
-                old_entity_dict["description"], max_words=200
-            )
-
-            new_entity_dict = new_entity.model_dump(exclude={"source_ids"})
-            new_entity_dict["description"] = truncate_description(
-                new_entity_dict["description"], max_words=200
-            )
-
-            prompt = SUMMARIZE_ENTITY.format(
-                entity_types=",".join(DEFAULT_ENTITY_TYPES),
-                input_json=json.dumps(
-                    {
-                        "entity_1": old_entity_dict,
-                        "entity_2": new_entity_dict,
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-            )
-            res_entity: MergedEntitySchema = self.llm.get_json_completion(
-                prompt=prompt, schema=MergedEntitySchema
-            )
-            res_entity.entity_name = res_entity.entity_name.lower()
-            res_entity.entity_type = res_entity.entity_type.upper()
-            res_entity.entity_type = res_entity.entity_type.replace(" ", "_")
+            if merged_identity is None:
+                raise RuntimeError("Merged entity identity was not prepared")
 
             description = (
                 old_entity.description + self._DESCRIPTION_SEP_ + new_entity.description
             )
 
             merged_entity = Entity(
-                entity_name=res_entity.entity_name,
-                entity_type=res_entity.entity_type,
+                entity_name=merged_identity.entity_name,
+                entity_type=merged_identity.entity_type,
                 description=description,
                 source_ids=set(old_entity.source_ids).union(new_entity.source_ids),
             )
@@ -325,10 +353,17 @@ class KGRefiner:
         )
 
         log.info(
-            f"Merged entity '{old_entity.entity_name}' with '{new_entity.entity_name}'. \n"
-            f"Old entity type: '{old_entity.entity_type}', \n"
-            f"New entity name: '{merged_entity.entity_name}', \n"
-            f"New entity type: '{merged_entity.entity_type}', \n"
+            "Merged existing entity '%s' with incoming entity occurrence '%s'.\n"
+            "Old entity type: '%s',\n"
+            "Merged entity name: '%s',\n"
+            "Merged entity type: '%s',\n"
+            "Combined source-node count: %d.",
+            old_entity.entity_name,
+            new_entity.entity_name,
+            old_entity.entity_type,
+            merged_entity.entity_name,
+            merged_entity.entity_type,
+            len(merged_entity.source_ids),
         )
 
         # Update the entity alias map
@@ -658,7 +693,83 @@ class KGRefiner:
             print(f"Warning: LLM returned an out-of-bounds ID: {select_id}")
             return None
 
-    def entity_resolution(self, new_entity: Entity) -> Entity:
+    @staticmethod
+    def _candidate_signature(candidates: List[Entity]) -> str:
+        return canonical_sha256(
+            [candidate.model_dump() for candidate in candidates]
+        )
+
+    def prepare_entity_resolution(self, new_entity: Entity) -> Optional[dict]:
+        """Prepare remote LLM decisions without mutating Graph/VDB.
+
+        Candidate discovery is protected because it reads the shared graph and
+        vector store. The slow LLM calls happen after releasing the lock. The
+        caller must validate ``candidate_signature`` again before applying this
+        result.
+        """
+        with self.state_lock:
+            node_name = self.graph_index.get_node_name_from_entity(new_entity)
+            if (
+                node_name in self.graph_index.get_all_nodes()
+                or node_name in self.entity_alias_map
+            ):
+                return None
+            candidates = [
+                candidate.model_copy(deep=True)
+                for candidate in self.search_similar_entities(new_entity)
+            ]
+            candidate_signature = self._candidate_signature(candidates)
+
+        selected = None
+        merged_identity = None
+        if candidates:
+            selected = self.er_selection_by_llm(
+                new_entity=new_entity,
+                similar_entities=candidates,
+            )
+            if selected is not None:
+                selected_name = self.graph_index.get_node_name_from_entity(selected)
+                new_name = self.graph_index.get_node_name_from_entity(new_entity)
+                if selected_name != new_name:
+                    merged_identity = self.request_merged_entity_identity(
+                        selected,
+                        new_entity,
+                    )
+
+        return {
+            "candidate_signature": candidate_signature,
+            "selected_node_name": (
+                self.graph_index.get_node_name_from_entity(selected)
+                if selected is not None
+                else None
+            ),
+            "merged_identity": merged_identity,
+        }
+
+    def prepare_advanced_kg_refinement(
+        self,
+        entities: List[Entity],
+    ) -> dict[int, dict]:
+        """Prepare normal-entity LLM decisions for one TreeNode.
+
+        UNKNOWN entities intentionally remain in the serial commit phase: the
+        original algorithm resolves them only after normal entities from the
+        same TreeNode have been added to the vector store.
+        """
+        prepared: dict[int, dict] = {}
+        for entity_index, entity in enumerate(entities):
+            if entity.entity_type == "UNKNOWN":
+                continue
+            resolution = self.prepare_entity_resolution(entity)
+            if resolution is not None:
+                prepared[entity_index] = resolution
+        return prepared
+
+    def entity_resolution(
+        self,
+        new_entity: Entity,
+        prepared_resolution: Optional[dict] = None,
+    ) -> Entity:
         """
         Resolves the new entity by comparing it with similar entities.
         Merge the new entity with the most similar one if they are true duplicated entity.
@@ -672,17 +783,13 @@ class KGRefiner:
         # 1.1 the same entity name and entity type, merge them directly
         node_name = self.graph_index.get_node_name_from_entity(entity=new_entity)
         if node_name in self.graph_index.get_all_nodes():
-            # If the entity already exists in the graph index with the same type, merge them
             existing_entity = self.graph_index.get_entity(
                 new_entity.entity_name, new_entity.entity_type
             )
+            return self.entity_merge(existing_entity, new_entity)
 
-            merged_entity = self.entity_merge(existing_entity, new_entity)
-            return merged_entity
-
-        # 1.2 If the entity have a same name with existing entity, but merged before.
-        # Merged them directly
-        if node_name in self.entity_alias_map.keys():
+        # 1.2 Follow an entity that was renamed by an earlier merge.
+        if node_name in self.entity_alias_map:
             latest_entity_name = self.get_latest_entity_name(node_name=node_name)
             log.info(
                 f"Entity '{new_entity.entity_name}' with type '{new_entity.entity_type}' "
@@ -692,40 +799,61 @@ class KGRefiner:
             existing_entity = self.graph_index.get_entity_by_node_name(
                 latest_entity_name
             )
-
-            merged_entity = self.entity_merge(
+            return self.entity_merge(
                 existing_entity, new_entity, merged_to_old_entity=True
             )
 
-            return merged_entity
-
-        # 2. search similar entities in the vector database
+        # 2. Search again at commit time. This both preserves original behavior
+        # and validates any LLM decision prepared by a worker thread.
         similar_entities = self.search_similar_entities(new_entity)
         if len(new_entity.source_ids) != 1:
             raise ValueError(
                 f"Expected exactly one source_id, but found {len(new_entity.source_ids)}."
             )
-
         source_id = next(iter(new_entity.source_ids))
 
-        if len(similar_entities) == 0:
-            # 2.1 No similar entities found, add the new entity directly
-            self.graph_index.add_and_link(tree_node_id=source_id, entities=new_entity)
-            return new_entity
-
-        # 2.2 If similar entities are found, use the LLM to determine if exist one of them is the same entity as the new one.
-        sel_existing_entity = self.er_selection_by_llm(
-            new_entity=new_entity, similar_entities=similar_entities
+        selected_entity = None
+        merged_identity = None
+        prepared_is_valid = (
+            prepared_resolution is not None
+            and prepared_resolution.get("candidate_signature")
+            == self._candidate_signature(similar_entities)
         )
-        if sel_existing_entity is None:
-            # If no similar entity is selected, add the new entity directly
-            self.graph_index.add_and_link(tree_node_id=source_id, entities=new_entity)
-            return new_entity
-        else:
-            # If a similar entity is selected, merge the new entity with it
-            merged_entity: Entity = self.entity_merge(sel_existing_entity, new_entity)
+        if prepared_is_valid:
+            selected_node_name = prepared_resolution.get("selected_node_name")
+            if selected_node_name is not None:
+                selected_entity = next(
+                    (
+                        candidate
+                        for candidate in similar_entities
+                        if self.graph_index.get_node_name_from_entity(candidate)
+                        == selected_node_name
+                    ),
+                    None,
+                )
+                if selected_entity is None:
+                    prepared_is_valid = False
+            merged_identity = prepared_resolution.get("merged_identity")
 
-            return merged_entity
+        if not prepared_is_valid and similar_entities:
+            selected_entity = self.er_selection_by_llm(
+                new_entity=new_entity,
+                similar_entities=similar_entities,
+            )
+            merged_identity = None
+
+        if selected_entity is None:
+            self.graph_index.add_and_link(
+                tree_node_id=source_id,
+                entities=new_entity,
+            )
+            return new_entity
+
+        return self.entity_merge(
+            selected_entity,
+            new_entity,
+            merged_identity=merged_identity,
+        )
 
     def process_unknown_entities(
         self, unknown_entities: List[Entity], entity_map: dict[str, Entity]
@@ -739,7 +867,7 @@ class KGRefiner:
                 new_entity: Entity = self.entity_resolution(entity)
                 entity_map[old_entity_name] = new_entity
                 unknown_vdb_entities.append(new_entity)
-            # Add the resolved unknown entities to the vector database
+            # Preserve the original per-TreeNode batch insertion semantics.
             self.add_entities_to_vdb(unknown_vdb_entities)
         return entity_map
 
@@ -800,7 +928,11 @@ class KGRefiner:
             )
 
     def advanced_kg_refiner(
-        self, entities: List[Entity], relationships: List[Relationship], source_id: int
+        self,
+        entities: List[Entity],
+        relationships: List[Relationship],
+        source_id: int,
+        prepared_resolutions: Optional[dict[int, dict]] = None,
     ) -> None:
         """
         Refines the knowledge graph by advanced entity resolution and relationship updates.
@@ -817,6 +949,8 @@ class KGRefiner:
 
         # map the old entity name to the new entity name after resolution
         entity_map: dict[str, Entity] = {}
+
+        prepared_resolutions = prepared_resolutions or {}
 
         # 1. for the first time to refine the KG, the vector database and graph index are initialized.
         if self.vdb.collection.count() <= 10:
@@ -837,7 +971,7 @@ class KGRefiner:
             self.add_entities_to_vdb(entities)
             self.graph_index.add_and_link(tree_node_id=source_id, entities=entities)
 
-            # For unknown entities, we need to resoluation them
+            # For unknown entities, we need to resolve them
             entity_map = self.process_unknown_entities(
                 unknown_entities=unknown_entities, entity_map=entity_map
             )
@@ -848,7 +982,7 @@ class KGRefiner:
             # 2. For each entity, perform resolution and update the graph index.
             new_entity_list = []
             unknown_entities = []
-            for entity in entities:
+            for entity_index, entity in enumerate(entities):
                 if entity.entity_type == "UNKNOWN":
                     # 2.1 for unknown entity type, perform resolution
                     # For unknown entities, we need to resolve them later.
@@ -857,13 +991,19 @@ class KGRefiner:
 
                 # 2.2 for other entity types, perform resolution
                 old_entity_name = entity.entity_name
-                new_entity: Entity = self.entity_resolution(entity)
+                prepared_resolution = prepared_resolutions.get(entity_index)
+                if prepared_resolution is None:
+                    new_entity: Entity = self.entity_resolution(entity)
+                else:
+                    new_entity = self.entity_resolution(
+                        entity,
+                        prepared_resolution=prepared_resolution,
+                    )
                 entity_map[old_entity_name] = new_entity
                 new_entity_list.append(new_entity)
 
-            # 2.3 Add the resolved entities to the vector database
-            # Since the ER should not be performed within the same chunk
-            # The new entities should not be in the vector database yet.
+            # Preserve BookRAG's original rule: entities from the same TreeNode
+            # are not visible in the VDB until every normal entity is resolved.
             self.add_entities_to_vdb(new_entity_list)
 
             # 2.4 Address the unknown entities

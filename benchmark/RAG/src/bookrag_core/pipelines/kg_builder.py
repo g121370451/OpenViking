@@ -12,8 +12,10 @@ from bookrag_core.provider.vlm import VLM
 from bookrag_core.provider.TokenTracker import TokenTracker
 from bookrag_core.checkpoint import BuildCheckpoint, canonical_sha256
 from bookrag_core.Index.GBCIndex import get_graph_variant
+from bookrag_core.utils.ingest_timer import submit_ingest_task
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 log = logging.getLogger(__name__)
 
@@ -284,25 +286,118 @@ def build_knowledge_graph(tree: DocumentTree, cfg: SystemConfig):
                                 "entity_resolution",
                             )
                 elif cfg.graph.refine_type == "advanced":
-                    for offset, res in enumerate(
-                        pending_results,
-                        start=start_position,
-                    ):
-                        kg_refiner.advanced_kg_refiner(
-                            entities=res.get("entities", []),
-                            relationships=res.get("relations", []),
-                            source_id=res.get("node_idx", -1),
-                        )
-                        next_position = offset + 1
-                        progress.update(1)
-                        if (
-                            next_position % checkpoint_every == 0
-                            or next_position == len(kg_extract_res)
+                    merge_workers = ingest_workers
+                    log.info(
+                        "Advanced KG refinement uses %d concurrent TreeNode LLM "
+                        "workers; shared Graph/VDB operations remain serialized.",
+                        merge_workers,
+                    )
+                    last_checkpoint_position = start_position
+                    with ThreadPoolExecutor(max_workers=merge_workers) as executor:
+                        # A completed window is the recoverable unit. Saving only
+                        # after every future in the window succeeds means the
+                        # checkpoint always describes a complete input prefix.
+                        for window_start in range(
+                            start_position,
+                            len(kg_extract_res),
+                            merge_workers,
                         ):
-                            save_refinement_checkpoint(
-                                next_position,
-                                "entity_resolution",
+                            window_end = min(
+                                window_start + merge_workers,
+                                len(kg_extract_res),
                             )
+                            window = kg_extract_res[window_start:window_end]
+                            if len(window) == 1:
+                                # With no peer LLM request to overlap, use the
+                                # original path and avoid duplicate candidate
+                                # retrieval solely for validation.
+                                result = window[0]
+                                try:
+                                    kg_refiner.advanced_kg_refiner(
+                                        entities=result.get("entities", []),
+                                        relationships=result.get("relations", []),
+                                        source_id=result.get("node_idx", -1),
+                                    )
+                                except BaseException as error:
+                                    raise RuntimeError(
+                                        "KG refinement commit failed for TreeNode "
+                                        f"{result.get('node_idx', -1)}; the previous "
+                                        "completed window checkpoint was preserved."
+                                    ) from error
+                                progress.update(1)
+                                if (
+                                    window_end - last_checkpoint_position
+                                    >= checkpoint_every
+                                    or window_end == len(kg_extract_res)
+                                ):
+                                    save_refinement_checkpoint(
+                                        window_end,
+                                        "entity_resolution",
+                                    )
+                                    last_checkpoint_position = window_end
+                                continue
+                            futures = {
+                                submit_ingest_task(
+                                    executor,
+                                    kg_refiner.prepare_advanced_kg_refinement,
+                                    res.get("entities", []),
+                                ): (position, res)
+                                for position, res in enumerate(
+                                    window,
+                                    start=window_start,
+                                )
+                            }
+                            errors = []
+                            prepared_by_position = {}
+                            for future in as_completed(futures):
+                                position, result = futures[future]
+                                try:
+                                    prepared_by_position[position] = future.result()
+                                except BaseException as error:
+                                    errors.append(
+                                        (result.get("node_idx", -1), error)
+                                    )
+                            if errors:
+                                failed_nodes = [node_id for node_id, _ in errors]
+                                raise RuntimeError(
+                                    "Concurrent KG LLM preparation failed for TreeNodes "
+                                    f"{failed_nodes}; the previous completed window "
+                                    "checkpoint was preserved."
+                                ) from errors[0][1]
+
+                            # Mutate Graph/VDB in the original input order. A
+                            # prepared decision is reused only when its current
+                            # candidate fingerprint still matches.
+                            for position, result in enumerate(
+                                window,
+                                start=window_start,
+                            ):
+                                try:
+                                    kg_refiner.advanced_kg_refiner(
+                                        entities=result.get("entities", []),
+                                        relationships=result.get("relations", []),
+                                        source_id=result.get("node_idx", -1),
+                                        prepared_resolutions=(
+                                            prepared_by_position[position]
+                                        ),
+                                    )
+                                except BaseException as error:
+                                    raise RuntimeError(
+                                        "KG refinement commit failed for TreeNode "
+                                        f"{result.get('node_idx', -1)}; the previous "
+                                        "completed window checkpoint was preserved."
+                                    ) from error
+                                progress.update(1)
+                            if (
+                                window_end - last_checkpoint_position
+                                >= checkpoint_every
+                                or window_end == len(kg_extract_res)
+                            ):
+                                save_refinement_checkpoint(
+                                    window_end,
+                                    "entity_resolution",
+                                )
+                                last_checkpoint_position = window_end
                 else:
                     raise ValueError(
                         f"Unsupported KG refine_type: {cfg.graph.refine_type}"
